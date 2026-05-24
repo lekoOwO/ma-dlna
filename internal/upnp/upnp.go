@@ -634,7 +634,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			h.maAdapter.PlayMedia(
 				h.cfg.HA.TargetEntityID,
 				active.StreamURL,
-				"music",
+				contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
 			)
 		} else {
 			slog.Warn("Play with no active session")
@@ -1086,6 +1086,25 @@ func parseRelTime(s string) (time.Duration, error) {
 		return 0, err
 	}
 	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec)*time.Second, nil
+}
+
+func contentTypeForUPnP(format string) string {
+	switch format {
+	case "mp3":
+		return "audio/mpeg"
+	case "opus":
+		return "audio/opus"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "wav":
+		return "audio/wav"
+	default:
+		return "audio/" + format
+	}
 }
 
 func formatDurationUPnP(d time.Duration) string {
