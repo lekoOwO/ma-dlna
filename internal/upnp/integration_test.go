@@ -278,6 +278,32 @@ func TestSOAPEndpoints(t *testing.T) {
 			200,
 		},
 		{
+			"Next",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "Next", "<InstanceID>0</InstanceID>"),
+			200,
+		},
+		{
+			"Previous",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "Previous", "<InstanceID>0</InstanceID>"),
+			200,
+		},
+		{
+			"SetNextAVTransportURI",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "SetNextAVTransportURI",
+				"<InstanceID>0</InstanceID><NextURI>http://next.local/track.mp3</NextURI><NextURIMetaData></NextURIMetaData>"),
+			200,
+		},
+		{
+			"SetPlayMode",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "SetPlayMode",
+				"<InstanceID>0</InstanceID><NewPlayMode>NORMAL</NewPlayMode>"),
+			200,
+		},
+		{
 			"GetDeviceCapabilities",
 			"/avtransport/control",
 			soapEnvelope("AVTransport", "GetDeviceCapabilities",
@@ -883,7 +909,30 @@ func TestFullDLNALifecycle(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	t.Log("Step 15: Seek OK")
 
-	t.Logf("Full DLNA lifecycle test PASSED (15 steps)")
+	// ---- Step 16: SetNextAVTransportURI + Next + Previous + SetPlayMode ----
+	nextBody := soapEnvelope("AVTransport", "SetNextAVTransportURI",
+		"<InstanceID>0</InstanceID><NextURI>http://next.local/track2.mp3</NextURI><NextURIMetaData></NextURIMetaData>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(nextBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	nextBody2 := soapEnvelope("AVTransport", "Next", "<InstanceID>0</InstanceID>")
+	resp, _ = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(nextBody2))
+	resp.Body.Close()
+
+	prevBody := soapEnvelope("AVTransport", "Previous", "<InstanceID>0</InstanceID>")
+	resp, _ = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(prevBody))
+	resp.Body.Close()
+
+	modeBody := soapEnvelope("AVTransport", "SetPlayMode",
+		"<InstanceID>0</InstanceID><NewPlayMode>NORMAL</NewPlayMode>")
+	resp, _ = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(modeBody))
+	resp.Body.Close()
+	t.Logf("Step 16: SetNextAVTransportURI + Next + Previous + SetPlayMode OK")
+
+	t.Logf("Full DLNA lifecycle test PASSED (16 steps)")
 }
 
 func extractXMLField(xml, field string) string {

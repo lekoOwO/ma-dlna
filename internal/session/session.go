@@ -41,6 +41,8 @@ type Session struct {
 	State         State     `json:"state"`
 	StreamURL     string    `json:"stream_url"`
 	StreamToken   string    `json:"-"`
+	NextURI       string    `json:"-"`
+	PlayMode      string    `json:"-"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	Error         string    `json:"error,omitempty"`

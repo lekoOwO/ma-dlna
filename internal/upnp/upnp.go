@@ -748,6 +748,40 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
+	case "Next":
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:NextResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+
+	case "Previous":
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:PreviousResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+
+	case "SetNextAVTransportURI":
+		instanceID := extractSOAPField(body, "InstanceID")
+		nextURI := extractSOAPField(body, "NextURI")
+		metadata := extractSOAPField(body, "NextURIMetaData")
+		_ = instanceID
+		if h.sessionMgr != nil {
+			if active := h.sessionMgr.ActiveSession(); active != nil {
+				active.NextURI = nextURI
+				slog.Debug("SetNextAVTransportURI", "session_id", active.ID, "next_uri", safeURL(nextURI))
+			}
+		}
+		_ = metadata
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:SetNextAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+
+	case "SetPlayMode":
+		newMode := extractSOAPField(body, "NewPlayMode")
+		if h.sessionMgr != nil {
+			if active := h.sessionMgr.ActiveSession(); active != nil {
+				active.PlayMode = newMode
+			}
+		}
+		slog.Debug("SetPlayMode", "mode", newMode)
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:SetPlayModeResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+
 	case "GetCurrentTransportActions":
 		var actions string
 		if h.sessionMgr != nil {
