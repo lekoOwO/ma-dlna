@@ -335,7 +335,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (st *stream) run(ctx context.Context) {
-	defer st.active.Store(false)
+	defer func() {
+		// Only mark inactive if the context was NOT cancelled (natural exit).
+		// When we cancel the context (Stop/Pause), restartWithOffset/Resume
+		// manage the active flag directly — we must not overwrite it.
+		if ctx.Err() == nil {
+			st.active.Store(false)
+		}
+	}()
 
 	args := st.buildFFmpegArgs()
 	slog.Debug("ffmpeg command", "args", args)
