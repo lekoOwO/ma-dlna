@@ -226,6 +226,49 @@ func TestParseSOAPRequestMethodCheck(t *testing.T) {
 	}
 }
 
+func TestMatchingIPSubnetMatch(t *testing.T) {
+	_, nw1, _ := net.ParseCIDR("192.168.10.0/24")
+	_, nw2, _ := net.ParseCIDR("10.121.0.0/16")
+	_, nw3, _ := net.ParseCIDR("172.17.0.0/16")
+
+	networks := []ipNet{
+		{ip: net.ParseIP("192.168.10.5"), nw: nw1},
+		{ip: net.ParseIP("10.121.124.1"), nw: nw2},
+		{ip: net.ParseIP("172.17.0.1"), nw: nw3},
+	}
+
+	// Client on 192.168.10.x → should get 192.168.10.5
+	got := matchingIPWith(net.ParseIP("192.168.10.27"), networks)
+	if got == nil || got.String() != "192.168.10.5" {
+		t.Errorf("expected 192.168.10.5, got %v", got)
+	}
+
+	// Client on 10.121.x.x → should get 10.121.124.1
+	got = matchingIPWith(net.ParseIP("10.121.124.93"), networks)
+	if got == nil || got.String() != "10.121.124.1" {
+		t.Errorf("expected 10.121.124.1, got %v", got)
+	}
+
+	// Client on 172.17.x.x → should get 172.17.0.1
+	got = matchingIPWith(net.ParseIP("172.17.0.5"), networks)
+	if got == nil || got.String() != "172.17.0.1" {
+		t.Errorf("expected 172.17.0.1, got %v", got)
+	}
+
+	// Unmatched client → fall back to first network
+	got = matchingIPWith(net.ParseIP("8.8.8.8"), networks)
+	if got == nil || got.String() != "192.168.10.5" {
+		t.Errorf("expected fallback 192.168.10.5, got %v", got)
+	}
+}
+
+func TestMatchingIPEmpty(t *testing.T) {
+	got := matchingIPWith(net.ParseIP("192.168.1.1"), nil)
+	if got != nil {
+		t.Errorf("expected nil for empty networks, got %v", got)
+	}
+}
+
 type testRespWriter struct {
 	header http.Header
 	status int

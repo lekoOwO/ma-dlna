@@ -116,6 +116,49 @@ func firstIPv4(iface net.Interface) net.IP {
 	return nil
 }
 
+// localIPNetworks returns all (IP, *net.IPNet) for non-loopback IPv4 addresses.
+func localIPNetworks() []ipNet {
+	var out []ipNet
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok || ipn.IP.To4() == nil || ipn.IP.IsLoopback() {
+				continue
+			}
+			out = append(out, ipNet{ip: ipn.IP, nw: ipn})
+		}
+	}
+	return out
+}
+
+type ipNet struct {
+	ip net.IP
+	nw *net.IPNet
+}
+
+// matchingIP finds a local IPv4 address that shares a subnet with remote.
+// The networks parameter allows injection for testing.
+func matchingIPWith(remote net.IP, networks []ipNet) net.IP {
+	for _, n := range networks {
+		if n.nw.Contains(remote) {
+			return n.ip
+		}
+	}
+	for _, n := range networks {
+		return n.ip
+	}
+	return nil
+}
+
+func matchingIP(remote net.IP) net.IP {
+	return matchingIPWith(remote, localIPNetworks())
+}
+
 // ---- M-SEARCH ----
 
 type msearchKey struct {
@@ -123,16 +166,11 @@ type msearchKey struct {
 	st string
 }
 
-type connInfo struct {
-	conn *net.UDPConn
-	ip   net.IP
-}
-
 func (h *Handler) mserve(ctx context.Context) {
-	var infos []connInfo
+	conns := make([]*net.UDPConn, 0)
 	defer func() {
-		for _, ci := range infos {
-			ci.conn.Close()
+		for _, c := range conns {
+			c.Close()
 		}
 	}()
 
@@ -142,30 +180,24 @@ func (h *Handler) mserve(ctx context.Context) {
 			slog.Warn("M-SEARCH listen failed", "iface", iface.Name, "error", err)
 			continue
 		}
-		ip := firstIPv4(iface)
-		if ip == nil {
-			conn.Close()
-			continue
-		}
-		infos = append(infos, connInfo{conn: conn, ip: ip})
+		conns = append(conns, conn)
 	}
 
-	if len(infos) == 0 {
+	if len(conns) == 0 {
 		slog.Warn("No multicast interfaces available for M-SEARCH")
 		return
 	}
-	slog.Info("M-SEARCH listening", "interfaces", len(infos))
+	slog.Info("M-SEARCH listening", "interfaces", len(conns))
 
 	type msg struct {
 		data       []byte
 		remoteAddr *net.UDPAddr
-		ifaceIP    net.IP
 		conn       *net.UDPConn
 	}
 	ch := make(chan msg, 8)
 
-	for _, ci := range infos {
-		go func(c *net.UDPConn, ifaceIP net.IP) {
+	for _, conn := range conns {
+		go func(c *net.UDPConn) {
 			buf := make([]byte, 4096)
 			for {
 				select {
@@ -186,9 +218,9 @@ func (h *Handler) mserve(ctx context.Context) {
 				}
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				ch <- msg{data: data, remoteAddr: remoteAddr, ifaceIP: ifaceIP, conn: c}
+				ch <- msg{data: data, remoteAddr: remoteAddr, conn: c}
 			}
-		}(ci.conn, ci.ip)
+		}(conn)
 	}
 
 	history := map[msearchKey]time.Time{}
@@ -221,8 +253,9 @@ func (h *Handler) mserve(ctx context.Context) {
 			}
 			history[key] = time.Now()
 
-			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "base", h.baseURLForIP(m.ifaceIP))
-			resp := h.mserveResponse(h.baseURLForIP(m.ifaceIP))
+			localIP := matchingIP(m.remoteAddr.IP)
+			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "local_ip", localIP)
+			resp := h.mserveResponse(h.baseURLForIP(localIP))
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
 		}
 	}
