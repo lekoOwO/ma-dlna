@@ -527,22 +527,26 @@ func contentTypeForFormat(format string) string {
 }
 
 func (st *stream) broadcast(data []byte) {
+	if !st.active.Load() {
+		return
+	}
 	st.clientsMu.Lock()
 	defer st.clientsMu.Unlock()
 
 	for id, cw := range st.clients {
 		select {
 		case <-cw.ctx.Done():
-			continue
+			delete(st.clients, id)
 		default:
 			_, err := cw.w.Write(data)
 			if err != nil {
 				slog.Debug("Write error to client, disconnecting", "client_id", id, "error", err)
 				cw.cancel()
-				continue
-			}
-			if cw.flusher != nil {
-				cw.flusher.Flush()
+				delete(st.clients, id)
+			} else {
+				if cw.flusher != nil {
+					cw.flusher.Flush()
+				}
 			}
 		}
 	}
