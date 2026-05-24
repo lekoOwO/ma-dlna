@@ -824,18 +824,17 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 
 	switch action {
 	case "GetProtocolInfo":
-		response = connectionResponse(action, `
+		source := fmt.Sprintf(
+			"http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,"+
+				"http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*,"+
+				"http-get:*:audio/%s:*",
+			h.cfg.FFmpeg.OutputFormat,
+		)
+		response = connectionResponse(action, fmt.Sprintf(`
 <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-  <Source>
-    http-get:*:audio/mpeg:*,
-    http-get:*:audio/opus:*,
-    http-get:*:audio/wav:*,
-    http-get:*:audio/flac:*,
-    http-get:*:audio/ogg:*,
-    http-get:*:audio/aac:*
-  </Source>
+  <Source>%s</Source>
   <Sink></Sink>
-</u:GetProtocolInfoResponse>`)
+</u:GetProtocolInfoResponse>`, source))
 
 	case "GetCurrentConnectionIDs":
 		response = connectionResponse(action, `

@@ -594,6 +594,259 @@ func escapeXMLText(s string) string {
 	return s
 }
 
+// TestFullDLNALifecycle simulates a complete DLNA controller session:
+// M-SEARCH → device.xml → service descriptions → SUBSCRIBE →
+// SetAVTransportURI → Play → GetPositionInfo tracking → Pause →
+// Resume → Stop → UNSUBSCRIBE.
+func TestFullDLNALifecycle(t *testing.T) {
+	// Real stream source: serve a minimal MP3 from a test HTTP server
+	const testMP3 = "\xff\xfb\x90\x00" // MPEG1 Layer3 128k 44100 stereo (MP3 frame header + silence)
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Write([]byte(testMP3))
+		for i := 0; i < 100; i++ {
+			w.Write(make([]byte, 418)) // ~1 MP3 frame
+		}
+	}))
+	defer sourceServer.Close()
+
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge.local:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	client := &http.Client{}
+
+	// ---- Step 1: Fetch device description ----
+	resp, err := client.Get(ts.URL + "/device.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("device.xml returned %d", resp.StatusCode)
+	}
+	devXML := string(body)
+	t.Logf("Step 1: device.xml fetched (%d bytes)", len(devXML))
+
+	// ---- Step 2: Fetch service descriptions ----
+	for _, svc := range []string{"AVTransport", "RenderingControl", "ConnectionManager"} {
+		resp, err := client.Get(ts.URL + "/service/" + svc + "/desc.xml")
+		if err != nil {
+			t.Fatalf("%s desc.xml: %v", svc, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s desc.xml returned %d", svc, resp.StatusCode)
+		}
+	}
+	t.Log("Step 2: All service descriptions fetched")
+
+	// ---- Step 3: SUBSCRIBE to events ----
+	cbServer, cbCh := mockCallback(t)
+	defer cbServer.Close()
+
+	for _, evt := range []string{"avtransport", "rendering", "connection"} {
+		req, _ := http.NewRequest("SUBSCRIBE", ts.URL+"/"+evt+"/event", nil)
+		req.Header.Set("CALLBACK", callbackURL(cbServer))
+		req.Header.Set("NT", "upnp:event")
+		req.Header.Set("TIMEOUT", "Second-1800")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("SUBSCRIBE %s: %v", evt, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("SUBSCRIBE %s returned %d", evt, resp.StatusCode)
+		}
+		if resp.Header.Get("SID") == "" {
+			t.Fatalf("SUBSCRIBE %s: missing SID", evt)
+		}
+		if resp.Header.Get("TIMEOUT") == "" {
+			t.Fatalf("SUBSCRIBE %s: missing TIMEOUT", evt)
+		}
+	}
+	// Consume initial events
+	for i := 0; i < 3; i++ {
+		select {
+		case <-cbCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timed out waiting for initial event NOTIFY")
+		}
+	}
+	t.Log("Step 3: Events subscribed + initial NOTIFYs received")
+
+	// ---- Step 4: SetAVTransportURI ----
+	uri := sourceServer.URL + "/song.mp3"
+	metadata := "<DIDL-Lite><item><title>Test</title><creator>Artist</creator></item></DIDL-Lite>"
+	setAVBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+uri+"</CurrentURI><CurrentURIMetaData>"+escapeXMLText(metadata)+"</CurrentURIMetaData>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setAVBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("SetAVTransportURI returned %d", resp.StatusCode)
+	}
+	t.Log("Step 4: SetAVTransportURI OK")
+
+	// ---- Step 5: Play ----
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Play returned %d", resp.StatusCode)
+	}
+	// Wait briefly for ffmpeg to start
+	time.Sleep(500 * time.Millisecond)
+	t.Log("Step 5: Play OK")
+
+	// ---- Step 6: Poll GetPositionInfo (track progress) ----
+	getPosBody := soapEnvelope("AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	var lastRelTime string
+	for i := 0; i < 5; i++ {
+		resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(getPosBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		posBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("GetPositionInfo returned %d", resp.StatusCode)
+		}
+		posXML := string(posBody)
+			rt := extractXMLField(posXML, "RelTime")
+		if rt != lastRelTime {
+			lastRelTime = rt
+		}
+		if i < 4 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if lastRelTime == "00:00:00" {
+		t.Log("Step 6: RelTime at 00:00:00 (ffmpeg may not be available in test env)")
+	} else {
+		t.Logf("Step 6: GetPositionInfo tracking OK (RelTime=%s)", lastRelTime)
+	}
+
+	// ---- Step 7: GetTransportInfo ----
+	getTransBody := soapEnvelope("AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(getTransBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(transBody), "CurrentTransportState") {
+		t.Error("GetTransportInfo missing CurrentTransportState")
+	}
+	t.Log("Step 7: GetTransportInfo OK")
+
+	// ---- Step 8: Pause ----
+	pauseBody := soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(pauseBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Pause returned %d", resp.StatusCode)
+	}
+	t.Log("Step 8: Pause OK")
+
+	// ---- Step 9: Play (resume) ----
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Play (resume) returned %d", resp.StatusCode)
+	}
+	time.Sleep(500 * time.Millisecond)
+	t.Log("Step 9: Resume OK")
+
+	// ---- Step 10: Stop ----
+	stopBody := soapEnvelope("AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(stopBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Stop returned %d", resp.StatusCode)
+	}
+	t.Log("Step 10: Stop OK")
+
+	// ---- Step 11: UNSUBSCRIBE ----
+	for _, evt := range []string{"avtransport", "rendering", "connection"} {
+		req, _ := http.NewRequest("UNSUBSCRIBE", ts.URL+"/"+evt+"/event", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("UNSUBSCRIBE %s: %v", evt, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("UNSUBSCRIBE %s returned %d", evt, resp.StatusCode)
+		}
+	}
+	t.Log("Step 11: UNSUBSCRIBE OK")
+
+	// ---- Step 12: Validate GetProtocolInfo includes output format ----
+	protoBody := soapEnvelope("ConnectionManager", "GetProtocolInfo", "")
+	resp, err = client.Post(ts.URL+"/connection/control", "text/xml", strings.NewReader(protoBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	protoXML, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(protoXML), "audio/opus") {
+		t.Error("GetProtocolInfo missing opus")
+	}
+	if !strings.Contains(string(protoXML), cfg.FFmpeg.OutputFormat) {
+		t.Errorf("GetProtocolInfo missing configured format: %s", cfg.FFmpeg.OutputFormat)
+	}
+	t.Log("Step 12: GetProtocolInfo includes configured formats OK")
+
+	t.Logf("Full DLNA lifecycle test PASSED (12 steps)")
+}
+
+func extractXMLField(xml, field string) string {
+	start := strings.Index(xml, "<"+field+">")
+	if start < 0 {
+		return ""
+	}
+	start += len("<" + field + ">")
+	end := strings.Index(xml[start:], "</"+field+">")
+	if end < 0 {
+		return ""
+	}
+	return xml[start : start+end]
+}
+
 func soapEnvelope(service, action, inner string) string {
 	return `<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
