@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,12 @@ import (
 	"github.com/leko/ma-dlna/internal/maadapter"
 	"github.com/leko/ma-dlna/internal/session"
 )
+
+const bridgeVersion = "0.1.0"
+
+func serverString() string {
+	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + bridgeVersion
+}
 
 type Handler struct {
 	cfg        *config.Config
@@ -254,7 +261,7 @@ func (h *Handler) mserve(ctx context.Context) {
 			history[key] = time.Now()
 
 			localIP := matchingIP(m.remoteAddr.IP)
-			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "local_ip", localIP)
+			slog.Debug("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "local_ip", localIP)
 			resp := h.mserveResponse(h.baseURLForIP(localIP), st)
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
 		}
@@ -290,12 +297,13 @@ func (h *Handler) mserveResponse(base, st string) string {
 			"CACHE-CONTROL: max-age=%d\r\n"+
 			"EXT:\r\n"+
 			"LOCATION: %s/device.xml\r\n"+
-			"SERVER: Linux/6.8 UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
+			"SERVER: %s\r\n"+
 			"ST: %s\r\n"+
 			"USN: %s::%s\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
+		serverString(),
 		st,
 		h.deviceUUID,
 		st,
@@ -328,7 +336,7 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 
 func (h *Handler) broadcastSSDP(msgFn func(string) string) {
 	ifaces := multicastInterfaces()
-	slog.Info("SSDP broadcast", "interfaces", len(ifaces))
+	slog.Debug("SSDP broadcast", "interfaces", len(ifaces))
 	for _, iface := range ifaces {
 		ip := firstIPv4(iface)
 		if ip == nil {
@@ -352,11 +360,12 @@ func (h *Handler) ssdpAliveMsg(base string) string {
 			"LOCATION: %s/device.xml\r\n"+
 			"NT: %s\r\n"+
 			"NTS: ssdp:alive\r\n"+
-			"SERVER: Linux/6.8 UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
+			"SERVER: %s\r\n"+
 			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
+		serverString(),
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
 		h.deviceUUID,
 	)
@@ -439,6 +448,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	action := extractSOAPAction(body)
 
+	slog.Debug("AVTransport SOAP request", "body", string(body))
 	slog.Info("AVTransport action", "action", action)
 
 	var response string
