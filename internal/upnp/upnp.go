@@ -24,6 +24,13 @@ func serverString() string {
 	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + version.Version
 }
 
+type eventSubscriber struct {
+	sid      string
+	callback string
+	service  string
+	seq      int
+}
+
 type Handler struct {
 	cfg        *config.Config
 	sessionMgr *session.Manager
@@ -32,7 +39,8 @@ type Handler struct {
 	volume     int
 	muted      bool
 	ssdpCancel context.CancelFunc
-	deviceUUID string
+	deviceUUID  string
+	subscribers map[string]*eventSubscriber
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maadapter.Adapter) *Handler {
@@ -41,7 +49,8 @@ func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maad
 		sessionMgr: sessionMgr,
 		maAdapter:  maAdapter,
 		volume:     50,
-		deviceUUID: cfg.UPnP.UUID,
+		deviceUUID:  cfg.UPnP.UUID,
+		subscribers: make(map[string]*eventSubscriber),
 	}
 }
 
@@ -471,6 +480,7 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 	cb := r.Header.Get("CALLBACK")
+	svc := eventServiceFromPath(r.URL.Path)
 	slog.Debug("Event subscription", "method", r.Method, "path", r.URL.Path,
 		"remote", r.RemoteAddr, "sid", r.Header.Get("SID"), "callback", cb)
 
@@ -492,10 +502,21 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 		if cb != "" {
-			go h.sendInitialEvent(cb, sid, eventServiceFromPath(r.URL.Path))
+			if h.subscribers != nil {
+				h.mu.Lock()
+				h.subscribers[sid] = &eventSubscriber{sid: sid, callback: cb, service: svc}
+				h.mu.Unlock()
+			}
+			go h.sendInitialEvent(cb, sid, svc)
 		}
 
 	case "UNSUBSCRIBE":
+		sid := r.Header.Get("SID")
+		if h.subscribers != nil {
+			h.mu.Lock()
+			delete(h.subscribers, sid)
+			h.mu.Unlock()
+		}
 		w.WriteHeader(http.StatusOK)
 
 	default:
@@ -586,6 +607,73 @@ func initialEventBody(service string) string {
 	}
 }
 
+func (h *Handler) notifySubscribers(service, lastChangeXML string) {
+	if h.subscribers == nil {
+		return
+	}
+	h.mu.Lock()
+	subs := make([]*eventSubscriber, 0)
+	for _, sub := range h.subscribers {
+		if sub.service == service {
+			sub.seq++
+			subs = append(subs, sub)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, sub := range subs {
+		go h.sendStateChange(sub, sub.seq, lastChangeXML)
+	}
+}
+
+func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML string) {
+	body := fmt.Sprintf(`<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>%s</LastChange>
+  </e:property>
+</e:propertyset>`, escapeXML(lastChangeXML))
+
+	for _, u := range extractCallbackURLs(sub.callback) {
+		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
+		if err != nil {
+			slog.Debug("Event NOTIFY create failed", "url", u, "error", err)
+			continue
+		}
+		parsed, _ := neturl.Parse(u)
+		if parsed != nil {
+			req.Host = parsed.Host
+		}
+		req.Header.Set("Content-Type", "text/xml; charset=utf-8")
+		req.Header.Set("NT", "upnp:event")
+		req.Header.Set("NTS", "upnp:propchange")
+		req.Header.Set("SID", sub.sid)
+		req.Header.Set("SEQ", fmt.Sprintf("%d", sub.seq))
+		req.Header.Set("SERVER", serverString())
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("State change NOTIFY error", "url", u, "error", err)
+			continue
+		}
+		resp.Body.Close()
+		slog.Debug("State change NOTIFY sent", "service", sub.service, "url", u, "seq", sub.seq)
+	}
+}
+
+func avTransportLastChange(state string) string {
+	return fmt.Sprintf(`<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="%s"/><TransportStatus val="OK"/><CurrentPlayMode val="NORMAL"/><TransportPlaySpeed val="1"/></InstanceID></Event>`, state)
+}
+
+func renderingControlLastChange(vol int, muted bool) string {
+	muteVal := "0"
+	if muted {
+		muteVal = "1"
+	}
+	return fmt.Sprintf(`<Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"><InstanceID val="0"><Volume val="%d" channel="Master"/><Mute val="%s" channel="Master"/></InstanceID></Event>`, vol, muteVal)
+}
+
 func extractCallbackURLs(callback string) []string {
 	// CALLBACK format: <http://host:port/path> or multiple
 	var urls []string
@@ -648,11 +736,16 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", active.StreamURL)
 			h.sessionMgr.Play(active.ID)
 			h.sessionMgr.StartStream(active.ID, active.SourceURI)
-			h.maAdapter.PlayMedia(
+			if err := h.maAdapter.PlayMedia(
 				h.cfg.HA.TargetEntityID,
 				active.StreamURL,
 				contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-			)
+			); err != nil {
+				slog.Error("PlayMedia failed, setting session error", "session_id", active.ID, "error", err)
+				h.sessionMgr.SetError(active.ID, err.Error())
+			} else {
+				go h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+			}
 		} else {
 			slog.Warn("Play with no active session")
 		}
@@ -664,8 +757,13 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
-			h.sessionMgr.Stop(active.ID)
-			h.maAdapter.Stop(h.cfg.HA.TargetEntityID)
+			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
+				slog.Error("Stop failed, setting session error", "session_id", active.ID, "error", err)
+				h.sessionMgr.SetError(active.ID, err.Error())
+			} else {
+				h.sessionMgr.Stop(active.ID)
+				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -675,8 +773,13 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
-			h.sessionMgr.Pause(active.ID)
-			h.maAdapter.Pause(h.cfg.HA.TargetEntityID)
+			if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
+				slog.Error("Pause failed, setting session error", "session_id", active.ID, "error", err)
+				h.sessionMgr.SetError(active.ID, err.Error())
+			} else {
+				h.sessionMgr.Pause(active.ID)
+				go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
+			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -696,6 +799,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				state = "TRANSITIONING"
 			case session.StateStopped:
 				state = "STOPPED"
+			case session.StateError:
+				state = "STOPPED"
+				status = "ERROR_OCCURRED"
 			default:
 				state = "STOPPED"
 			}
@@ -873,7 +979,11 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		h.volume = vol
 		h.mu.Unlock()
 
-		h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol)
+		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
+			slog.Error("SetVolume failed", "error", err)
+		} else {
+			go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, h.muted))
+		}
 
 		response = renderingResponse(action, `
 <u:SetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)

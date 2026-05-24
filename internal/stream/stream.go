@@ -44,6 +44,7 @@ type stream struct {
 	clients       map[string]*clientWriter
 	clientsMu     sync.Mutex
 	started       chan struct{}
+	done          chan struct{}
 	err           error
 	ffmpegCfg     config.FFmpegConfig
 	startTime     time.Time
@@ -95,6 +96,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 	st.active.Store(true)
 	st.startTime = time.Now()
 	st.resumeOffset = 0
+		st.done = make(chan struct{})
 	s.streams[sessionID] = st
 
 	go st.run(ctx)
@@ -162,12 +164,16 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		}
 		st.clientsMu.Unlock()
 	}
+	if st.done != nil {
+		<-st.done
+	}
 	st.active.Store(true)
 	_, cancel := context.WithCancel(context.Background())
 	st.cancel = cancel
 	st.resumeOffset = offset
 	st.started = make(chan struct{})
 	st.clients = make(map[string]*clientWriter)
+	st.done = make(chan struct{})
 }
 
 func (s *Streamer) Resume(sessionID string) {
@@ -180,6 +186,7 @@ func (s *Streamer) Resume(sessionID string) {
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
 	st.cancel = resumeCancel
 	st.startTime = time.Now()
+	st.done = make(chan struct{})
 	go st.run(resumeCtx)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
 }
@@ -358,6 +365,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (st *stream) run(ctx context.Context) {
 	defer func() {
+			close(st.done)
 		// Only mark inactive if the context was NOT cancelled (natural exit).
 		// When we cancel the context (Stop/Pause), restartWithOffset/Resume
 		// manage the active flag directly — we must not overwrite it.

@@ -959,3 +959,297 @@ func soapEnvelope(service, action, inner string) string {
   </s:Body>
 </s:Envelope>`
 }
+
+// TestStateChangeNotify verifies that Play/Stop/Pause trigger state change NOTIFY to subscribers.
+func TestStateChangeNotify(t *testing.T) {
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+	streamer.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cbServer, cbCh := mockCallback(t)
+	defer cbServer.Close()
+
+	// Subscribe to AVTransport events
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r.Header.Set("CALLBACK", callbackURL(cbServer))
+	r.Header.Set("NT", "upnp:event")
+	r.Header.Set("TIMEOUT", "Second-1800")
+	h.serveEvent(w, r)
+
+	if w.status != 200 {
+		t.Fatalf("SUBSCRIBE failed: %d", w.status)
+	}
+
+	// Consume initial NOTIFY
+	select {
+	case <-cbCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for initial NOTIFY")
+	}
+
+	// SetAVTransportURI
+	setBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Play → should trigger state change NOTIFY with PLAYING
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var playNotify *http.Request
+	select {
+	case playNotify = <-cbCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for Play state change NOTIFY")
+	}
+
+	playBody2, _ := io.ReadAll(playNotify.Body)
+	playBodyStr := string(playBody2)
+	if !strings.Contains(playBodyStr, "PLAYING") {
+		t.Errorf("Play NOTIFY should contain PLAYING, got: %s", playBodyStr)
+	}
+	if playNotify.Header.Get("NT") != "upnp:event" {
+		t.Error("Play NOTIFY missing NT header")
+	}
+	if playNotify.Header.Get("NTS") != "upnp:propchange" {
+		t.Error("Play NOTIFY missing NTS header")
+	}
+	seq := playNotify.Header.Get("SEQ")
+	if seq != "1" {
+		t.Logf("Play NOTIFY SEQ: expected 1, got %s", seq)
+	}
+	t.Logf("Play state change NOTIFY received, SEQ=%s", seq)
+
+	// Pause
+	pauseBody := soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(pauseBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	select {
+	case pauseNotify := <-cbCh:
+		pauseBody2, _ := io.ReadAll(pauseNotify.Body)
+		pauseBodyStr := string(pauseBody2)
+		if !strings.Contains(pauseBodyStr, "PAUSED_PLAYBACK") {
+			t.Errorf("Pause NOTIFY should contain PAUSED_PLAYBACK, got: %s", pauseBodyStr)
+		}
+		t.Logf("Pause state change NOTIFY received, SEQ=%s", pauseNotify.Header.Get("SEQ"))
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for Pause state change NOTIFY")
+	}
+
+	// Stop
+	stopBody := soapEnvelope("AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(stopBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	select {
+	case stopNotify := <-cbCh:
+		stopBody2, _ := io.ReadAll(stopNotify.Body)
+		stopBodyStr := string(stopBody2)
+		if !strings.Contains(stopBodyStr, "STOPPED") {
+			t.Errorf("Stop NOTIFY should contain STOPPED, got: %s", stopBodyStr)
+		}
+		t.Logf("Stop state change NOTIFY received, SEQ=%s", stopNotify.Header.Get("SEQ"))
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for Stop state change NOTIFY")
+	}
+}
+
+// TestHAErrorSetsSessionError verifies that when HA returns an error,
+// the session is set to error state and GetTransportInfo reports ERROR_OCCURRED.
+func TestHAErrorSetsSessionError(t *testing.T) {
+	// HA server that returns errors for play_media
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "service unavailable"}`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+	streamer.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// SetAVTransportURI
+	setBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Play — HA will return error
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Session should be in error state
+	sessions := sm.AllSessions()
+	if len(sessions) == 0 {
+		t.Fatal("No session created")
+	}
+	s := sessions[0]
+	if s.State != session.StateError {
+		t.Errorf("expected session error state, got %s", s.State)
+	}
+	if s.Error == "" {
+		t.Error("session should have error message")
+	}
+	t.Logf("Session error state: %s, message: %s", s.State, s.Error)
+
+	// GetTransportInfo should report ERROR_OCCURRED
+	infoBody := soapEnvelope("AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(infoBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoXML, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(infoXML), "ERROR_OCCURRED") {
+		t.Errorf("GetTransportInfo should report ERROR_OCCURRED, got: %s", string(infoXML))
+	}
+	t.Logf("GetTransportInfo returned ERROR_OCCURRED")
+}
+
+// TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
+// sends SetAVTransportURI twice then Play, it plays the LAST URI.
+func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+		// Log the media_id so we can inspect it
+		_ = body
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	strm := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, strm)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	strm.SetTokenValidator(sm.ValidateToken)
+	strm.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// First SetAVTransportURI
+	firstURI := "http://192.168.1.10/first_song.mp3"
+	body1 := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+firstURI+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Second SetAVTransportURI (should replace the first)
+	secondURI := "http://192.168.1.10/second_song.mp3"
+	body2 := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+secondURI+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// There should be exactly 2 sessions: first=stopped, second=loaded
+	allSessions := sm.AllSessions()
+	if len(allSessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(allSessions))
+	}
+
+	// Find the loaded one — it should be the second URI
+	var active *session.Session
+	for _, s := range allSessions {
+		if s.State == session.StateLoaded {
+			active = s
+			break
+		}
+	}
+	if active == nil {
+		t.Fatal("No loaded session found")
+	}
+	if active.SourceURI != secondURI {
+		t.Errorf("Active session should have second URI (%s), got %s", secondURI, active.SourceURI)
+	}
+	t.Logf("Active session URI: %s (expected second)", active.SourceURI)
+
+	// Play and verify the correct session is played
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The active session should now be in "starting" state
+	active = sm.Get(active.ID)
+	if active.State != session.StateStarting {
+		t.Errorf("expected starting state after Play, got %s", active.State)
+	}
+	t.Logf("Correct session played: %s with URI %s", active.ID, active.SourceURI)
+}

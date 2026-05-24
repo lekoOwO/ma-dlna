@@ -121,6 +121,78 @@ func TestStreamDefaults(t *testing.T) {
 	}
 }
 
+func TestValidateSourceURI(t *testing.T) {
+	sec := SecurityConfig{
+		AllowedSourceCIDRs: []string{"192.168.0.0/16", "10.0.0.0/8"},
+		BlockedSourceCIDRs: []string{"127.0.0.0/8"},
+		AllowPublicSources: false,
+	}
+
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"private IP v4 allowed", "http://192.168.1.10/song.mp3", false},
+		{"private IP v4 allowed 2", "http://10.0.0.5/song.mp3", false},
+		{"localhost blocked", "http://127.0.0.1/song.mp3", true},
+		{"loopback blocked", "http://localhost/song.mp3", true},
+		{"invalid scheme", "ftp://192.168.1.1/song.mp3", true},
+		{"public IP blocked by default", "http://8.8.8.8/song.mp3", true},
+		{"private not in allowed CIDRs", "http://172.16.5.5/song.mp3", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sec.ValidateSourceURI(tc.url)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ValidateSourceURI(%q) error=%v, wantErr=%v", tc.url, err, tc.wantErr)
+			}
+		})
+	}
+
+	// Test with public sources allowed (no allowed CIDRs, allow public)
+	sec2 := SecurityConfig{
+		AllowPublicSources: true,
+	}
+	if err := sec2.ValidateSourceURI("http://8.8.8.8/song.mp3"); err != nil {
+		t.Errorf("public IP should be allowed when AllowPublicSources=true with no CIDR restrictions: %v", err)
+	}
+
+	// Test that AllowedSourceCIDRs takes precedence over AllowPublicSources
+	sec3 := SecurityConfig{
+		AllowedSourceCIDRs: []string{"192.168.0.0/16"},
+		AllowPublicSources: true,
+	}
+	if err := sec3.ValidateSourceURI("http://8.8.8.8/song.mp3"); err == nil {
+		t.Error("public IP should be rejected when not in AllowedSourceCIDRs")
+	}
+}
+
+func TestValidateSourceURILinkLocal(t *testing.T) {
+	sec := SecurityConfig{
+		AllowedSourceCIDRs: []string{"0.0.0.0/0"},
+		AllowPublicSources: true,
+	}
+
+	// Link-local and multicast should always be blocked regardless of config
+	err := sec.ValidateSourceURI("http://169.254.1.1/song.mp3")
+	if err == nil {
+		t.Error("link-local IP should be blocked")
+	}
+}
+
+func TestValidateSourceURINoDNS(t *testing.T) {
+	sec := SecurityConfig{
+		AllowPublicSources: true,
+	}
+
+	err := sec.ValidateSourceURI("http://nonexistent.invalid/song.mp3")
+	if err == nil {
+		t.Error("unresolvable hostname should return error")
+	}
+}
+
 func LoadConfig(data string) (*Config, error) {
 	tmpfile, err := os.CreateTemp("", "config-*.yaml")
 	if err != nil {

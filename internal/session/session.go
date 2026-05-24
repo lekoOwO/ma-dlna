@@ -70,7 +70,7 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 	defer m.mu.Unlock()
 
 	for _, s := range m.sessions {
-		if s.State == StatePlaying || s.State == StateStarting || s.State == StatePaused {
+		if s.State == StatePlaying || s.State == StateStarting || s.State == StatePaused || s.State == StateLoaded {
 			slog.Info("Stopping existing active session", "session_id", s.ID)
 			m.streamer.Stop(s.ID)
 			s.State = StateStopped
@@ -173,6 +173,9 @@ func (m *Manager) SetPlaying(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
+		if s.State == StateError {
+			return
+		}
 		s.State = StatePlaying
 		s.UpdatedAt = time.Now()
 	}
@@ -198,7 +201,7 @@ func (m *Manager) ActiveSession() *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, s := range m.sessions {
-		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded || s.State == StatePaused {
+		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded || s.State == StatePaused || s.State == StateError {
 			return s
 		}
 	}

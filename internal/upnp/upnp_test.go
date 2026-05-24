@@ -623,3 +623,107 @@ func TestSCPDHasRequiredActions(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractSOAPActionNamespaceVariants(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		expect string
+	}{
+		{
+			"soap-env prefix",
+			`<soap-env:Envelope xmlns:soap-env="http://schemas.xmlsoap.org/soap/envelope/"><soap-env:Body><u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"></u:Play></soap-env:Body></soap-env:Envelope>`,
+			"Play",
+		},
+		{
+			"SOAP-ENV prefix",
+			`<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/></SOAP-ENV:Body></SOAP-ENV:Envelope>`,
+			"Stop",
+		},
+		{
+			"default namespace on envelope",
+			`<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/"><Body><u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:SetAVTransportURI></Body></Envelope>`,
+			"SetAVTransportURI",
+		},
+		{
+			"no namespace on action",
+			`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><Play>0</Play></s:Body></s:Envelope>`,
+			"Play",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractSOAPAction([]byte(tc.body))
+			if got != tc.expect {
+				t.Errorf("expected '%s', got '%s'", tc.expect, got)
+			}
+		})
+	}
+}
+
+func TestSSDPAliveMessageFields(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.UPnP.AdvertiseIntervalSecs = 1800
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-ssdp"}
+
+	targets := []string{
+		"upnp:rootdevice",
+		"uuid:test-ssdp",
+		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1",
+	}
+
+	for _, nt := range targets {
+		t.Run("target="+nt, func(t *testing.T) {
+			msg := h.ssdpAliveMsg("http://192.168.1.1:8787", nt)
+			if !strings.Contains(msg, "NOTIFY * HTTP/1.1") {
+				t.Error("missing NOTIFY start line")
+			}
+			if !strings.Contains(msg, "HOST: 239.255.255.250:1900") {
+				t.Error("missing HOST header")
+			}
+			if !strings.Contains(msg, "NTS: ssdp:alive") {
+				t.Error("missing NTS: ssdp:alive")
+			}
+			if !strings.Contains(msg, "NT: "+nt) {
+				t.Errorf("missing NT: %s", nt)
+			}
+			if !strings.Contains(msg, "USN: uuid:test-ssdp::"+nt) {
+				t.Errorf("missing USN for target %s", nt)
+			}
+			if !strings.Contains(msg, "LOCATION: http://192.168.1.1:8787/device.xml") {
+				t.Error("missing LOCATION header")
+			}
+			if !strings.Contains(msg, "CACHE-CONTROL: max-age=1800") {
+				t.Error("missing CACHE-CONTROL")
+			}
+			if !strings.Contains(msg, "SERVER:") {
+				t.Error("missing SERVER header")
+			}
+		})
+	}
+}
+
+func TestByeByeMessageFields(t *testing.T) {
+	h := &Handler{deviceUUID: "uuid:test-bye"}
+	msg := h.ssdpByeByeMsg("", "urn:schemas-upnp-org:device:MediaRenderer:1")
+
+	if !strings.Contains(msg, "NTS: ssdp:byebye") {
+		t.Error("byebye missing NTS")
+	}
+	if !strings.Contains(msg, "NT: urn:schemas-upnp-org:device:MediaRenderer:1") {
+		t.Error("byebye missing NT")
+	}
+	if !strings.Contains(msg, "USN: uuid:test-bye::urn:schemas-upnp-org:device:MediaRenderer:1") {
+		t.Error("byebye missing USN")
+	}
+	if strings.Contains(msg, "LOCATION") {
+		t.Error("byebye should NOT contain LOCATION")
+	}
+	if strings.Contains(msg, "CACHE-CONTROL") {
+		t.Error("byebye should NOT contain CACHE-CONTROL")
+	}
+}

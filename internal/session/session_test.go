@@ -213,6 +213,110 @@ func TestSessionEviction(t *testing.T) {
 	}
 }
 
+func TestCreateStopsLoadedSessions(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	// Create two loaded sessions — second Create should stop the first
+	s1 := mgr.Create("http://source.local/first", "")
+	if s1.State != StateLoaded {
+		t.Fatalf("s1 should be loaded, got %s", s1.State)
+	}
+
+	s2 := mgr.Create("http://source.local/second", "")
+	if s2.State != StateLoaded {
+		t.Fatalf("s2 should be loaded, got %s", s2.State)
+	}
+
+	// s1 should be stopped when s2 was created
+	if mgr.Get(s1.ID).State != StateStopped {
+		t.Errorf("s1 should be stopped after second Create, got %s", mgr.Get(s1.ID).State)
+	}
+
+	// ActiveSession should return s2 (the only loaded one)
+	active := mgr.ActiveSession()
+	if active == nil {
+		t.Fatal("ActiveSession should not be nil")
+	}
+	if active.ID != s2.ID {
+		t.Errorf("ActiveSession should return s2 (%s), got %s", s2.ID, active.ID)
+	}
+}
+
+func TestMultipleSetAVTransportURIPlaysCorrectSession(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	// Simulate: controller sends SetAVTransportURI twice, then Play
+	s1 := mgr.Create("http://source.local/first", "")
+	s2 := mgr.Create("http://source.local/second", "")
+
+	// s1 should be stopped, s2 loaded
+	if mgr.Get(s1.ID).State != StateStopped {
+		t.Errorf("s1 should be stopped, got %s", mgr.Get(s1.ID).State)
+	}
+
+	// Play should find s2 as the active session
+	active := mgr.ActiveSession()
+	if active == nil || active.ID != s2.ID {
+		t.Fatalf("ActiveSession should return s2, got %v", active)
+	}
+
+	mgr.Play(active.ID)
+	if mgr.Get(s2.ID).State != StateStarting {
+		t.Errorf("s2 should be starting, got %s", mgr.Get(s2.ID).State)
+	}
+	if mgr.Get(s1.ID).State != StateStopped {
+		t.Errorf("s1 should remain stopped, got %s", mgr.Get(s1.ID).State)
+	}
+}
+
+func TestActiveSessionReturnsOnlyValidStates(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	// Create a loaded session, play it, then stop it to get a stopped session
+	loaded := mgr.Create("http://source.local/loaded", "")
+	mgr.Play(loaded.ID)
+
+	// Create another that replaces the first (first is now stopped, second is loaded)
+	second := mgr.Create("http://source.local/second", "")
+
+	// ActiveSession should return the second (loaded), not the first (stopped)
+	active := mgr.ActiveSession()
+	if active == nil {
+		t.Fatal("ActiveSession should return loaded session")
+	}
+	if active.ID != second.ID {
+		t.Errorf("expected second session %s, got %s", second.ID, active.ID)
+	}
+
+	// Stop it — no active session
+	mgr.Stop(second.ID)
+	active = mgr.ActiveSession()
+	if active != nil {
+		t.Errorf("expected no active session, got %s", active.ID)
+	}
+}
+
+func TestSetPlayingDoesNotOverrideError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test", "")
+	mgr.SetError(s.ID, "some error")
+
+	// SetPlaying should NOT override the error state
+	mgr.SetPlaying(s.ID)
+	got := mgr.Get(s.ID)
+	if got.State != StateError {
+		t.Errorf("SetPlaying should not override error state, got %s", got.State)
+	}
+	if got.Error != "some error" {
+		t.Errorf("error message should be preserved, got %s", got.Error)
+	}
+}
+
 func TestSetError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
