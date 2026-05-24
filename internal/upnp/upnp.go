@@ -60,9 +60,12 @@ func (h *Handler) Stop() {
 
 func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("/device.xml", h.serveDeviceDesc)
-	mux.HandleFunc("/avtransport/", h.serveAVTransport)
-	mux.HandleFunc("/rendering/", h.serveRenderingControl)
-	mux.HandleFunc("/connection/", h.serveConnectionManager)
+	mux.HandleFunc("/avtransport/control", h.serveAVTransport)
+	mux.HandleFunc("/avtransport/event", h.serveEvent)
+	mux.HandleFunc("/rendering/control", h.serveRenderingControl)
+	mux.HandleFunc("/rendering/event", h.serveEvent)
+	mux.HandleFunc("/connection/control", h.serveConnectionManager)
+	mux.HandleFunc("/connection/event", h.serveEvent)
 	mux.HandleFunc("/service/AVTransport/desc.xml", h.serveAVTransportDesc)
 	mux.HandleFunc("/service/RenderingControl/desc.xml", h.serveRenderingControlDesc)
 	mux.HandleFunc("/service/ConnectionManager/desc.xml", h.serveConnectionManagerDesc)
@@ -435,6 +438,50 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.Write([]byte(xml))
+}
+
+// ---- Event Subscription ----
+
+func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("Event subscription", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+
+	switch r.Method {
+	case "SUBSCRIBE":
+		sid := r.Header.Get("SID")
+		if sid != "" {
+			// Renewal
+			w.Header().Set("SID", sid)
+			w.Header().Set("TIMEOUT", "Second-1800")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// New subscription
+		sid = "uuid:" + generateSubscriptionUUID()
+		w.Header().Set("SID", sid)
+		w.Header().Set("TIMEOUT", "Second-1800")
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+
+	case "UNSUBSCRIBE":
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func generateSubscriptionUUID() string {
+	b := make([]byte, 16)
+	randRead(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func randRead(b []byte) {
+	for i := range b {
+		b[i] = byte(time.Now().UnixNano()>>(i%8)) ^ 0x55
+	}
 }
 
 // ---- AVTransport ----
