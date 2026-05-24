@@ -493,7 +493,7 @@ func (h *Handler) sendInitialEvent(callback, sid string) {
 	body := `<?xml version="1.0"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
-    <LastChange></LastChange>
+    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;STOPPED&quot;/&gt;&lt;TransportStatus val=&quot;OK&quot;/&gt;&lt;CurrentPlayMode val=&quot;NORMAL&quot;/&gt;&lt;TransportPlaySpeed val=&quot;1&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
   </e:property>
 </e:propertyset>`
 
