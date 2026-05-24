@@ -1,0 +1,16 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ma-dlna-dev
+    network_mode: host
+    volumes:
+      - .:/app
+      - go-mod-cache:/go/pkg/mod
+    working_dir: /app
+    environment:
+      CGO_ENABLED: "0"
+
+volumes:
+  go-mod-cache:

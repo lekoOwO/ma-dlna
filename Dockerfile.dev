@@ -1,0 +1,13 @@
+FROM golang:1.22-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV CGO_ENABLED=0
+
+CMD ["sleep", "infinity"]

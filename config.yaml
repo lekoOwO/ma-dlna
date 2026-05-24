@@ -1,0 +1,56 @@
+server:
+  bind_host: "0.0.0.0"
+  http_port: 8787
+  public_base_url: "http://192.168.1.10:8787"
+
+upnp:
+  friendly_name: "Music Assistant Whole Home"
+  manufacturer: "dlna-ma-bridge"
+  model_name: "DLNA to Music Assistant Bridge"
+  uuid: "auto"
+  advertise_interval_seconds: 1800
+
+ha:
+  url: "http://homeassistant.local:8123"
+  token: "${HA_TOKEN}"
+  target_entity_id: "media_player.whole_home"
+
+ma_adapter:
+  mode: "ha_service"
+  play_service: "music_assistant.play_media"
+  fallback_play_service: "media_player.play_media"
+  stop_service: "media_player.media_stop"
+  pause_service: "media_player.media_pause"
+  volume_service: "media_player.volume_set"
+
+ffmpeg:
+  binary: "ffmpeg"
+  output_format: "mp3"
+  codec: "libmp3lame"
+  bitrate: "192k"
+  sample_rate: 44100
+  channels: 2
+  reconnect: true
+  extra_input_args: []
+  extra_output_args: []
+
+stream:
+  prebuffer_bytes: 524288
+  ring_buffer_bytes: 8388608
+  max_clients_per_session: 16
+  no_client_grace_seconds: 10
+  startup_timeout_seconds: 15
+
+security:
+  require_stream_token: true
+  allowed_source_cidrs:
+    - "192.168.0.0/16"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+  blocked_source_cidrs:
+    - "127.0.0.0/8"
+    - "169.254.0.0/16"
+  allow_public_sources: true
+
+logging:
+  level: "info"

@@ -1,0 +1,15 @@
+# Binaries
+/dlna-ma-bridge
+*.exe
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+*.env.local
+
+# OS
+.DS_Store
+Thumbs.db
