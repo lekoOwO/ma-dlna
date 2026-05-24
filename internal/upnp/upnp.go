@@ -443,13 +443,15 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 // ---- Event Subscription ----
 
 func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("Event subscription", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+	cb := r.Header.Get("CALLBACK")
+	slog.Debug("Event subscription", "method", r.Method, "path", r.URL.Path,
+		"remote", r.RemoteAddr, "sid", r.Header.Get("SID"), "callback", cb)
 
 	switch r.Method {
 	case "SUBSCRIBE":
 		sid := r.Header.Get("SID")
 		if sid != "" {
-			// Renewal
+			// Renewal — echo back the same SID
 			w.Header().Set("SID", sid)
 			w.Header().Set("TIMEOUT", "Second-1800")
 			w.WriteHeader(http.StatusOK)
@@ -459,8 +461,13 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 		sid = "uuid:" + generateSubscriptionUUID()
 		w.Header().Set("SID", sid)
 		w.Header().Set("TIMEOUT", "Second-1800")
-		w.Header().Set("Content-Length", "0")
+		w.Header().Set("SERVER", serverString())
 		w.WriteHeader(http.StatusOK)
+
+		// Send initial event NOTIFY to CALLBACK URL — required by UPnP spec
+		if cb != "" {
+			go h.sendInitialEvent(cb, sid)
+		}
 
 	case "UNSUBSCRIBE":
 		w.WriteHeader(http.StatusOK)
@@ -468,6 +475,55 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *Handler) sendInitialEvent(callback, sid string) {
+	urls := extractCallbackURLs(callback)
+	if len(urls) == 0 {
+		return
+	}
+
+	body := `<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange></LastChange>
+  </e:property>
+</e:propertyset>`
+
+	for _, u := range urls {
+		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
+		if err != nil {
+			slog.Debug("Event NOTIFY create failed", "url", u, "error", err)
+			continue
+		}
+		req.Header.Set("CONTENT-TYPE", "text/xml; charset=utf-8")
+		req.Header.Set("NT", "upnp:event")
+		req.Header.Set("NTS", "upnp:propchange")
+		req.Header.Set("SID", sid)
+		req.Header.Set("SEQ", "0")
+		req.Header.Set("SERVER", serverString())
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Debug("Event NOTIFY failed", "url", u, "error", err)
+			continue
+		}
+		resp.Body.Close()
+		slog.Debug("Initial event sent", "url", u, "sid", sid)
+	}
+}
+
+func extractCallbackURLs(callback string) []string {
+	// CALLBACK format: <http://host:port/path> or multiple
+	var urls []string
+	for _, part := range strings.Split(callback, ">") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "<") {
+			urls = append(urls, strings.TrimPrefix(part, "<"))
+		}
+	}
+	return urls
 }
 
 func generateSubscriptionUUID() string {
