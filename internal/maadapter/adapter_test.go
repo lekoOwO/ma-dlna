@@ -52,8 +52,13 @@ func TestServiceURLConstruction(t *testing.T) {
 		if payload["entity_id"] != "media_player.test" {
 			t.Errorf("expected entity_id media_player.test, got %v", payload["entity_id"])
 		}
-		if payload["media_content_id"] != "http://bridge:8787/live/test.opus?token=abc" {
-			t.Errorf("unexpected media_content_id: %v", payload["media_content_id"])
+		// Check either MA-style or HA-native field names
+		cid := payload["media_id"]
+		if cid == nil {
+			cid = payload["media_content_id"]
+		}
+		if cid != "http://bridge:8787/live/test.opus?token=abc" {
+			t.Errorf("unexpected media id: %v", cid)
 		}
 
 		w.WriteHeader(http.StatusOK)

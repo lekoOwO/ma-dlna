@@ -27,12 +27,36 @@ func New(cfg *config.Config) *Adapter {
 }
 
 func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
-	payload := map[string]any{
-		"entity_id":          targetEntity,
-		"media_content_id":   contentID,
-		"media_content_type": contentType,
+	// Try primary service with MA-style payload first, then fallback with HA-native payload.
+	if a.cfg.MAAdapter.PlayService != "" {
+		maPayload := map[string]any{
+			"entity_id":  targetEntity,
+			"media_id":   contentID,
+			"media_type": contentType,
+		}
+		if err := a.callHAService(a.cfg.MAAdapter.PlayService, maPayload); err == nil {
+			return nil
+		}
+		slog.Warn("Primary play_media failed, trying with HA-native field names")
+		// Also try primary with HA-native field names
+		haPayload := map[string]any{
+			"entity_id":          targetEntity,
+			"media_content_id":   contentID,
+			"media_content_type": contentType,
+		}
+		if err := a.callHAService(a.cfg.MAAdapter.PlayService, haPayload); err == nil {
+			return nil
+		}
 	}
-	return a.callWithFallback(a.cfg.MAAdapter.PlayService, a.cfg.MAAdapter.FallbackPlayService, payload)
+	if a.cfg.MAAdapter.FallbackPlayService != "" {
+		haPayload := map[string]any{
+			"entity_id":          targetEntity,
+			"media_content_id":   contentID,
+			"media_content_type": contentType,
+		}
+		return a.callHAService(a.cfg.MAAdapter.FallbackPlayService, haPayload)
+	}
+	return fmt.Errorf("no play service configured")
 }
 
 func (a *Adapter) Stop(targetEntity string) error {
@@ -52,20 +76,6 @@ func (a *Adapter) SetVolume(targetEntity string, volume int) error {
 		"entity_id":    targetEntity,
 		"volume_level": float64(volume) / 100.0,
 	})
-}
-
-func (a *Adapter) callWithFallback(primary, fallback string, payload map[string]any) error {
-	if primary != "" {
-		err := a.callHAService(primary, payload)
-		if err == nil {
-			return nil
-		}
-		slog.Warn("Primary service failed, trying fallback", "primary", primary, "fallback", fallback)
-	}
-	if fallback != "" {
-		return a.callHAService(fallback, payload)
-	}
-	return fmt.Errorf("no service configured")
 }
 
 func (a *Adapter) callHAService(service string, payload map[string]any) error {
