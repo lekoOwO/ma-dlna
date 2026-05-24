@@ -341,9 +341,18 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 	}
 }
 
-func (h *Handler) broadcastSSDP(msgFn func(string) string) {
+func (h *Handler) broadcastSSDP(msgFn func(string, string) string) {
 	ifaces := multicastInterfaces()
 	slog.Debug("SSDP broadcast", "interfaces", len(ifaces))
+	// UPnP spec requires alive for rootdevice, uuid, device type, and each service
+	targets := []string{
+		"upnp:rootdevice",
+		"uuid:" + h.deviceUUID,
+		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1",
+	}
 	for _, iface := range ifaces {
 		ip := firstIPv4(iface)
 		if ip == nil {
@@ -354,12 +363,15 @@ func (h *Handler) broadcastSSDP(msgFn func(string) string) {
 			slog.Warn("SSDP dial failed", "iface", iface.Name, "ip", ip, "error", err)
 			continue
 		}
-		conn.Write([]byte(msgFn(h.baseURLForIP(ip))))
+		base := h.baseURLForIP(ip)
+		for _, nt := range targets {
+			conn.Write([]byte(msgFn(base, nt)))
+		}
 		conn.Close()
 	}
 }
 
-func (h *Handler) ssdpAliveMsg(base string) string {
+func (h *Handler) ssdpAliveMsg(base, nt string) string {
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
@@ -368,25 +380,28 @@ func (h *Handler) ssdpAliveMsg(base string) string {
 			"NT: %s\r\n"+
 			"NTS: ssdp:alive\r\n"+
 			"SERVER: %s\r\n"+
-			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"USN: %s::%s\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
-		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		nt,
 		serverString(),
 		h.deviceUUID,
+		nt,
 	)
 }
 
-func (h *Handler) ssdpByeByeMsg(_ string) string {
+func (h *Handler) ssdpByeByeMsg(_ string, nt string) string {
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
-			"NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"NT: %s\r\n"+
 			"NTS: ssdp:byebye\r\n"+
-			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"USN: %s::%s\r\n"+
 			"\r\n",
+		nt,
 		h.deviceUUID,
+		nt,
 	)
 }
 
@@ -763,7 +778,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		_ = instanceID
 		if h.sessionMgr != nil {
 			if active := h.sessionMgr.ActiveSession(); active != nil {
-				active.NextURI = nextURI
+				h.sessionMgr.SetNextURI(active.ID, nextURI)
 				slog.Debug("SetNextAVTransportURI", "session_id", active.ID, "next_uri", safeURL(nextURI))
 			}
 		}
@@ -775,7 +790,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		newMode := extractSOAPField(body, "NewPlayMode")
 		if h.sessionMgr != nil {
 			if active := h.sessionMgr.ActiveSession(); active != nil {
-				active.PlayMode = newMode
+				h.sessionMgr.SetPlayMode(active.ID, newMode)
 			}
 		}
 		slog.Debug("SetPlayMode", "mode", newMode)
@@ -811,7 +826,10 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		slog.Warn("Unknown AVTransport action", "action", action)
-		response = soapFaultResponse("401", "Invalid Action")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -881,7 +899,10 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 <u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
 
 	default:
-		response = soapFaultResponse("401", "Invalid Action")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -912,8 +933,8 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 		)
 		response = connectionResponse(action, fmt.Sprintf(`
 <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-  <Source>%s</Source>
-  <Sink></Sink>
+  <Sink>%s</Sink>
+  <Source></Source>
 </u:GetProtocolInfoResponse>`, source))
 
 	case "GetCurrentConnectionIDs":

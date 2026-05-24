@@ -46,6 +46,9 @@ func main() {
 	streamer.SetFirstClientCallback(func(sessionID string) {
 		sessionMgr.SetPlaying(sessionID)
 	})
+	streamer.SetErrorCallback(func(sessionID string, err error) {
+		sessionMgr.SetError(sessionID, err.Error())
+	})
 	maAdapter := maadapter.New(cfg)
 	upnpHandler := upnp.NewHandler(cfg, sessionMgr, maAdapter)
 

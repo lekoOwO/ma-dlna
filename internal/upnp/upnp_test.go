@@ -124,7 +124,7 @@ func TestSSDPMessageFormat(t *testing.T) {
 		deviceUUID: "uuid:test-1234",
 	}
 
-	msg := h.ssdpAliveMsg("http://192.168.1.10:8787")
+	msg := h.ssdpAliveMsg("http://192.168.1.10:8787", "urn:schemas-upnp-org:device:MediaRenderer:1")
 
 	if !strings.Contains(msg, "NOTIFY * HTTP/1.1") {
 		t.Error("SSDP message should start with NOTIFY")
@@ -299,7 +299,7 @@ func TestServerString(t *testing.T) {
 
 func TestSSDPByeByeMessage(t *testing.T) {
 	h := &Handler{deviceUUID: "uuid:test-bye"}
-	msg := h.ssdpByeByeMsg("")
+	msg := h.ssdpByeByeMsg("", "urn:schemas-upnp-org:device:MediaRenderer:1")
 	if !strings.Contains(msg, "ssdp:byebye") {
 		t.Error("byebye should contain ssdp:byebye")
 	}

@@ -73,7 +73,6 @@ const avTransportSCPD = `<?xml version="1.0"?>
       </argumentList>
     </action>
     <action>
-    <action>
       <name>Seek</name>
       <argumentList>
         <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
@@ -81,6 +80,7 @@ const avTransportSCPD = `<?xml version="1.0"?>
         <argument><name>Target</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SeekTarget</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <action>
       <name>GetCurrentTransportActions</name>
       <argumentList>
         <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
@@ -193,6 +193,7 @@ const renderingControlSCPD = `<?xml version="1.0"?>
       </argumentList>
     </action>
     <action>
+    <action>
       <name>GetCurrentTransportActions</name>
       <argumentList>
         <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
@@ -264,6 +265,7 @@ const connectionManagerSCPD = `<?xml version="1.0"?>
         <argument><name>Status</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <action>
     <action>
       <name>GetCurrentTransportActions</name>
       <argumentList>

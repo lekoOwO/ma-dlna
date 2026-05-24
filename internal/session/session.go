@@ -237,6 +237,22 @@ func (m *Manager) Resume(sessionID string) {
 	m.streamer.Resume(sessionID)
 }
 
+func (m *Manager) SetNextURI(sessionID, uri string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		s.NextURI = uri
+	}
+}
+
+func (m *Manager) SetPlayMode(sessionID, mode string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		s.PlayMode = mode
+	}
+}
+
 func (m *Manager) ValidateToken(sessionID, token string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

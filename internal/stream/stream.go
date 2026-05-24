@@ -23,12 +23,15 @@ type TokenValidator func(sessionID, token string) bool
 
 type FirstClientCallback func(sessionID string)
 
+type ErrorCallback func(sessionID string, err error)
+
 type Streamer struct {
 	cfg              *config.Config
 	mu               sync.Mutex
 	streams          map[string]*stream
 	tokenValidator   TokenValidator
 	firstClientCB    FirstClientCallback
+	errorCB          ErrorCallback
 }
 
 type stream struct {
@@ -45,7 +48,8 @@ type stream struct {
 	ffmpegCfg     config.FFmpegConfig
 	startTime     time.Time
 	resumeOffset  time.Duration
-	ffmpegTime    atomic.Int64 // output media time in nanoseconds (from ffmpeg progress)
+	ffmpegTime    atomic.Int64
+	errorCB       ErrorCallback
 }
 
 type clientWriter struct {
@@ -86,6 +90,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		started:   make(chan struct{}),
 		cancel:    cancel,
 		ffmpegCfg: s.cfg.FFmpeg,
+		errorCB:   s.errorCB,
 	}
 	st.active.Store(true)
 	st.startTime = time.Now()
@@ -207,6 +212,10 @@ func (s *Streamer) IsRunning(sessionID string) bool {
 
 func (s *Streamer) SetFirstClientCallback(cb FirstClientCallback) {
 	s.firstClientCB = cb
+}
+
+func (s *Streamer) SetErrorCallback(cb ErrorCallback) {
+	s.errorCB = cb
 }
 
 func (s *Streamer) TotalClients() int {
@@ -376,6 +385,9 @@ func (st *stream) run(ctx context.Context) {
 		st.err = err
 		slog.Error("Failed to start ffmpeg", "error", err)
 		close(st.started)
+		if st.errorCB != nil {
+			st.errorCB(st.sessionID, err)
+		}
 		return
 	}
 

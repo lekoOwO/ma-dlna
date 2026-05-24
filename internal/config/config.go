@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"log/slog"
 
 	"gopkg.in/yaml.v3"
 )
@@ -97,6 +98,9 @@ func Load(path string) (*Config, error) {
 
 	if cfg.Server.PublicBaseURL == "" {
 		cfg.Server.PublicBaseURL = fmt.Sprintf("http://%s:%d", cfg.Server.BindHost, cfg.Server.HTTPPort)
+	}
+	if strings.Contains(cfg.Server.PublicBaseURL, "0.0.0.0") {
+		slog.Warn("public_base_url resolves to 0.0.0.0 — HA/MA won't be able to reach the stream. Set public_base_url to the bridge's LAN IP.")
 	}
 
 	if cfg.UPnP.UUID == "" || cfg.UPnP.UUID == "auto" {
