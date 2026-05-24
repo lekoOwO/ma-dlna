@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -110,7 +111,8 @@ func (a *Adapter) callHAService(service string, payload map[string]any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Error("HA service returned error status", "service", service, "status", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		slog.Error("HA service error", "service", service, "status", resp.StatusCode, "body", string(body))
 		return fmt.Errorf("HA service %s returned status %d", service, resp.StatusCode)
 	}
 
