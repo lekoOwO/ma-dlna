@@ -19,11 +19,14 @@ import (
 
 type TokenValidator func(sessionID, token string) bool
 
+type FirstClientCallback func(sessionID string)
+
 type Streamer struct {
-	cfg            *config.Config
-	mu             sync.Mutex
-	streams        map[string]*stream
-	tokenValidator TokenValidator
+	cfg              *config.Config
+	mu               sync.Mutex
+	streams          map[string]*stream
+	tokenValidator   TokenValidator
+	firstClientCB    FirstClientCallback
 }
 
 type stream struct {
@@ -189,6 +192,10 @@ func (s *Streamer) IsRunning(sessionID string) bool {
 	return false
 }
 
+func (s *Streamer) SetFirstClientCallback(cb FirstClientCallback) {
+	s.firstClientCB = cb
+}
+
 func (s *Streamer) TotalClients() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,7 +279,12 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.clients[clientID] = cw
+	isFirst := len(st.clients) == 1
 	st.clientsMu.Unlock()
+
+	if isFirst && s.firstClientCB != nil {
+		s.firstClientCB(sessionID)
+	}
 
 	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
 
