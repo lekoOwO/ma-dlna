@@ -314,7 +314,7 @@ func TestSOAPEndpoints(t *testing.T) {
 			"InvalidAction",
 			"/avtransport/control",
 			soapEnvelope("AVTransport", "NonExistentAction", ""),
-			200,
+			500,
 		},
 	}
 
