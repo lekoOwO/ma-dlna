@@ -46,6 +46,8 @@ type Session struct {
 	Error         string    `json:"error,omitempty"`
 }
 
+const maxSessions = 64
+
 type Manager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
@@ -72,6 +74,10 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 			s.State = StateStopped
 			s.UpdatedAt = time.Now()
 		}
+	}
+
+	if len(m.sessions) >= maxSessions {
+		m.evictLocked()
 	}
 
 	id := generateID()
@@ -224,6 +230,41 @@ func (m *Manager) ValidateToken(sessionID, token string) bool {
 		return false
 	}
 	return true
+}
+
+func (m *Manager) evictLocked() {
+	// Evict in order: stopped/error → paused. Never evict active sessions.
+	evictByState := func(states ...State) bool {
+		var oldest *Session
+		for _, s := range m.sessions {
+			for _, st := range states {
+				if s.State == st {
+					if oldest == nil || s.UpdatedAt.Before(oldest.UpdatedAt) {
+						oldest = s
+					}
+				}
+			}
+		}
+		if oldest != nil {
+			delete(m.sessions, oldest.ID)
+			slog.Debug("Evicted session", "session_id", oldest.ID, "state", string(oldest.State))
+			return true
+		}
+		return false
+	}
+
+	// Try stopped and error sessions first
+	for evictByState(StateStopped, StateError) {
+		if len(m.sessions) < maxSessions {
+			return
+		}
+	}
+	// Then paused
+	for evictByState(StatePaused) {
+		if len(m.sessions) < maxSessions {
+			return
+		}
+	}
 }
 
 func (m *Manager) Shutdown() {

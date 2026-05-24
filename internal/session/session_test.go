@@ -198,6 +198,21 @@ func TestCountAndAllSessions(t *testing.T) {
 	}
 }
 
+func TestSessionEviction(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	// Fill past maxSessions with stopped sessions — triggers eviction
+	for i := 0; i < maxSessions+5; i++ {
+		s := mgr.Create("http://source.local/test", "")
+		mgr.Stop(s.ID)
+	}
+
+	if mgr.Count() > maxSessions {
+		t.Errorf("should not exceed maxSessions, got %d", mgr.Count())
+	}
+}
+
 func TestSetError(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
