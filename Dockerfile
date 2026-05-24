@@ -2,6 +2,8 @@ FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
 
 WORKDIR /src
 
@@ -14,7 +16,9 @@ ENV CGO_ENABLED=0
 ENV GOOS=$TARGETOS
 ENV GOARCH=$TARGETARCH
 
-RUN go build -ldflags="-s -w" -o /dlna-ma-bridge ./cmd/dlna-ma-bridge
+RUN go build \
+    -ldflags="-s -w -X github.com/leko/ma-dlna/internal/version.Version=${VERSION} -X github.com/leko/ma-dlna/internal/version.Commit=${COMMIT}" \
+    -o /dlna-ma-bridge ./cmd/dlna-ma-bridge
 
 FROM alpine:3.20
 

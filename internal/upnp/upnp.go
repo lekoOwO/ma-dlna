@@ -15,12 +15,11 @@ import (
 	"github.com/leko/ma-dlna/internal/config"
 	"github.com/leko/ma-dlna/internal/maadapter"
 	"github.com/leko/ma-dlna/internal/session"
+	"github.com/leko/ma-dlna/internal/version"
 )
 
-const bridgeVersion = "0.1.0"
-
 func serverString() string {
-	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + bridgeVersion
+	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + version.Version
 }
 
 type Handler struct {

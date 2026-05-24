@@ -35,7 +35,7 @@ jobs:
       - name: Build ${{ matrix.arch }}
         run: |
           GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
-            go build -ldflags="-s -w" -o dlna-ma-bridge-linux-${{ matrix.arch }} ./cmd/dlna-ma-bridge
+            go build -ldflags="-s -w -X github.com/leko/ma-dlna/internal/version.Version=ci -X github.com/leko/ma-dlna/internal/version.Commit=${{ github.sha }}" -o dlna-ma-bridge-linux-${{ matrix.arch }} ./cmd/dlna-ma-bridge
       - uses: actions/upload-artifact@v4
         with:
           name: binary-linux-${{ matrix.arch }}
@@ -74,5 +74,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

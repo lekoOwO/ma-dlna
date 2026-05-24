@@ -18,6 +18,7 @@ import (
 	"github.com/leko/ma-dlna/internal/session"
 	"github.com/leko/ma-dlna/internal/stream"
 	"github.com/leko/ma-dlna/internal/upnp"
+	"github.com/leko/ma-dlna/internal/version"
 )
 
 func main() {
@@ -32,7 +33,7 @@ func main() {
 
 	setupLogging(cfg)
 
-	slog.Info("Starting dlna-ma-bridge", "version", "0.1.0")
+	slog.Info("Starting dlna-ma-bridge", "version", version.Version, "commit", version.Commit)
 	slog.Debug("Config", "ha_url", cfg.HA.URL, "target", cfg.HA.TargetEntityID,
 		"output", cfg.FFmpeg.OutputFormat, "codec", cfg.FFmpeg.Codec, "bitrate", cfg.FFmpeg.Bitrate,
 		"auto_base_url", cfg.UPnP.AutoBaseURL, "public_base_url", cfg.Server.PublicBaseURL)
