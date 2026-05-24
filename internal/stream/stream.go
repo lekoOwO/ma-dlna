@@ -33,6 +33,7 @@ type stream struct {
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
 	active    atomic.Bool
+	paused    atomic.Bool
 	clients   map[string]*clientWriter
 	clientsMu sync.Mutex
 	started   chan struct{}
@@ -109,6 +110,33 @@ func (s *Streamer) Stop(sessionID string) {
 	}
 }
 
+func (s *Streamer) Pause(sessionID string) {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	st.paused.Store(true)
+	st.clientsMu.Lock()
+	for _, c := range st.clients {
+		c.cancel()
+	}
+	st.clientsMu.Unlock()
+	slog.Info("Stream paused (ffmpeg kept alive)", "session_id", sessionID)
+}
+
+func (s *Streamer) Resume(sessionID string) {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	st.paused.Store(false)
+	slog.Info("Stream resumed", "session_id", sessionID)
+}
+
 func (s *Streamer) IsRunning(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,6 +183,12 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !ok || !st.active.Load() {
 		http.Error(w, "Stream not available", http.StatusNotFound)
+		return
+	}
+
+	if st.paused.Load() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "Stream paused", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -371,6 +405,9 @@ func contentTypeForFormat(format string) string {
 }
 
 func (st *stream) broadcast(data []byte) {
+	if st.paused.Load() {
+		return
+	}
 	st.clientsMu.Lock()
 	defer st.clientsMu.Unlock()
 

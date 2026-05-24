@@ -48,13 +48,13 @@ func TestStateTransitions(t *testing.T) {
 		t.Errorf("expected paused state, got %s", mgr.Get(s.ID).State)
 	}
 
-	// Play from paused
+	// Play from paused — resumes directly to playing (ffmpeg kept alive)
 	err = mgr.Play(s.ID)
 	if err != nil {
 		t.Fatalf("play from paused failed: %v", err)
 	}
-	if mgr.Get(s.ID).State != StateStarting {
-		t.Errorf("expected starting state after play from paused, got %s", mgr.Get(s.ID).State)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected playing state after play from paused, got %s", mgr.Get(s.ID).State)
 	}
 
 	// Stop

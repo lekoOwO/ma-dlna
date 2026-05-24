@@ -416,20 +416,21 @@ If HA volume call fails, do not fail the whole session.
 
 ### 8.8 Pause Behavior
 
-For MVP, pause may be implemented as:
+Pause keeps ffmpeg running and stops broadcasting to downstream clients.
+The ring buffer continues to fill during pause.
 
 ```text
-Pause = call MA pause + terminate ffmpeg
-Resume/Play = restart ffmpeg from source URI
+Pause = call MA pause + stop downstream broadcast (ffmpeg keeps running)
+Resume/Play = call MA play + resume downstream broadcast from ring buffer
 ```
 
-This may not resume at the exact original position. That is acceptable for MVP and should be documented.
+This preserves the approximate playback position because ffmpeg continues
+ingesting the source. Position accuracy depends on buffer fill level.
 
-Alternative future behavior:
-
-* Keep ffmpeg running for live radio streams.
-* Pause downstream only.
-* Add source-specific buffering.
+* For sources that don't expect long-lived connections (some HTTP servers),
+  ffmpeg's reconnect flags handle reconnection if the source drops.
+* The ring buffer may overflow during long pauses; resuming after overflow
+  starts from the current buffer write position (near-live).
 
 ## 9. Configuration
 

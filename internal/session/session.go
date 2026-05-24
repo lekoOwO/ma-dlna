@@ -107,7 +107,16 @@ func (m *Manager) Play(sessionID string) error {
 		return ErrNotFound
 	}
 
-	if s.State != StateLoaded && s.State != StatePaused && s.State != StateStopped {
+	if s.State == StatePaused {
+		s.State = StatePlaying
+		s.UpdatedAt = time.Now()
+		m.mu.Unlock()
+		m.streamer.Resume(sessionID)
+		slog.Info("Session resumed from pause", "session_id", sessionID)
+		return nil
+	}
+
+	if s.State != StateLoaded && s.State != StateStopped {
 		m.mu.Unlock()
 		return nil
 	}
@@ -147,7 +156,7 @@ func (m *Manager) Pause(sessionID string) error {
 	s.UpdatedAt = time.Now()
 	m.mu.Unlock()
 
-	m.streamer.Stop(sessionID)
+	m.streamer.Pause(sessionID)
 	slog.Info("Session paused", "session_id", sessionID)
 	return nil
 }
