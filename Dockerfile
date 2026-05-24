@@ -1,19 +1,28 @@
-FROM golang:1.22-bookworm
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+ARG TARGETOS
+ARG TARGETARCH
 
-WORKDIR /app
+WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
-RUN go build -o /dlna-ma-bridge ./cmd/dlna-ma-bridge
+ENV CGO_ENABLED=0
+ENV GOOS=$TARGETOS
+ENV GOARCH=$TARGETARCH
+
+RUN go build -ldflags="-s -w" -o /dlna-ma-bridge ./cmd/dlna-ma-bridge
+
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    ffmpeg \
+    ca-certificates
+
+COPY --from=builder /dlna-ma-bridge /dlna-ma-bridge
 
 EXPOSE 8787
 
