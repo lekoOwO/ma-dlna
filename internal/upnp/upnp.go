@@ -68,9 +68,9 @@ func (h *Handler) baseURL() string {
 
 var ssdpAddr = &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
 
-// multicastInterfaces returns all IPv4 addresses on multicast-capable UP interfaces.
-func multicastInterfaces() []*net.UDPAddr {
-	var out []*net.UDPAddr
+// multicastInterfaces returns all UP interfaces that support multicast.
+func multicastInterfaces() []net.Interface {
+	var out []net.Interface
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return out
@@ -80,21 +80,38 @@ func multicastInterfaces() []*net.UDPAddr {
 			continue
 		}
 		addrs, err := iface.Addrs()
-		if err != nil {
+		if err != nil || len(addrs) == 0 {
 			continue
 		}
+		hasIPv4 := false
 		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok || ipn.IP.To4() == nil || ipn.IP.IsLoopback() {
-				continue
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() {
+				hasIPv4 = true
+				break
 			}
-			out = append(out, &net.UDPAddr{IP: ipn.IP})
+		}
+		if hasIPv4 {
+			out = append(out, iface)
 		}
 	}
 	return out
 }
 
-// M-SEARCH listener on all interfaces.
+// firstIPv4 returns the first non-loopback IPv4 address on the interface.
+func firstIPv4(iface net.Interface) net.IP {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() {
+			return ipn.IP
+		}
+	}
+	return nil
+}
+
+// M-SEARCH listener joins the multicast group on every multicast interface.
 func (h *Handler) mserve(ctx context.Context) {
 	conns := make([]*net.UDPConn, 0)
 	defer func() {
@@ -103,10 +120,10 @@ func (h *Handler) mserve(ctx context.Context) {
 		}
 	}()
 
-	for _, laddr := range multicastInterfaces() {
-		conn, err := net.ListenMulticastUDP("udp4", nil, &net.UDPAddr{IP: laddr.IP, Port: ssdpAddr.Port})
+	for _, iface := range multicastInterfaces() {
+		conn, err := net.ListenMulticastUDP("udp4", &iface, ssdpAddr)
 		if err != nil {
-			slog.Warn("M-SEARCH listen failed on interface", "ip", laddr.IP, "error", err)
+			slog.Warn("M-SEARCH listen failed", "iface", iface.Name, "error", err)
 			continue
 		}
 		conns = append(conns, conn)
@@ -118,7 +135,6 @@ func (h *Handler) mserve(ctx context.Context) {
 	}
 	slog.Info("M-SEARCH listening", "interfaces", len(conns))
 
-	// Unified receive loop across all connections.
 	buf := make([]byte, 4096)
 	type msg struct {
 		data       []byte
@@ -214,16 +230,20 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 }
 
 func (h *Handler) broadcastSSDP(msg string) {
-	for _, laddr := range multicastInterfaces() {
-		conn, err := net.DialUDP("udp4", laddr, ssdpAddr)
+	for _, iface := range multicastInterfaces() {
+		ip := firstIPv4(iface)
+		if ip == nil {
+			continue
+		}
+		conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: ip}, ssdpAddr)
 		if err != nil {
-			slog.Debug("SSDP dial failed", "iface", laddr.IP, "error", err)
+			slog.Debug("SSDP dial failed", "iface", iface.Name, "error", err)
 			continue
 		}
 		conn.Write([]byte(msg))
 		conn.Close()
 	}
-	slog.Debug("SSDP broadcast done")
+	slog.Debug("SSDP broadcast done", "interfaces", len(multicastInterfaces()))
 }
 
 func (h *Handler) ssdpAliveMessage() string {
