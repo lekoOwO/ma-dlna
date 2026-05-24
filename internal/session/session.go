@@ -196,7 +196,7 @@ func (m *Manager) ActiveSession() *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, s := range m.sessions {
-		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded {
+		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded || s.State == StatePaused {
 			return s
 		}
 	}
@@ -217,6 +217,10 @@ func (m *Manager) AllSessions() []*Session {
 		result = append(result, s)
 	}
 	return result
+}
+
+func (m *Manager) StartStream(sessionID, sourceURI string) {
+	m.streamer.Start(sessionID, sourceURI)
 }
 
 func (m *Manager) ValidateToken(sessionID, token string) bool {

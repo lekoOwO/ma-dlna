@@ -630,6 +630,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if active != nil {
 			slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", active.StreamURL)
 			h.sessionMgr.Play(active.ID)
+			h.sessionMgr.StartStream(active.ID, active.SourceURI)
 			h.maAdapter.PlayMedia(
 				h.cfg.HA.TargetEntityID,
 				active.StreamURL,
