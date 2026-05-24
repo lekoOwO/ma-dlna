@@ -262,6 +262,242 @@ func TestMatchingIPSubnetMatch(t *testing.T) {
 	}
 }
 
+func TestServerString(t *testing.T) {
+	s := serverString()
+	if s == "" {
+		t.Error("serverString must not be empty")
+	}
+	if !strings.Contains(s, "UPnP/1.0 dlna-ma-bridge/") {
+		t.Errorf("serverString bad format: %s", s)
+	}
+}
+
+func TestSSDPByeByeMessage(t *testing.T) {
+	h := &Handler{deviceUUID: "uuid:test-bye"}
+	msg := h.ssdpByeByeMsg("")
+	if !strings.Contains(msg, "ssdp:byebye") {
+		t.Error("byebye should contain ssdp:byebye")
+	}
+	if !strings.Contains(msg, "uuid:test-bye") {
+		t.Error("byebye should contain UUID")
+	}
+}
+
+func TestExtractST(t *testing.T) {
+	tests := []struct {
+		body   string
+		expect string
+	}{
+		{"ST: upnp:rootdevice\r\n", "upnp:rootdevice"},
+		{"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n", "urn:schemas-upnp-org:device:MediaRenderer:1"},
+		{"ST:ssdp:all\r\n", "ssdp:all"},
+		{"NO ST HERE\r\n", ""},
+	}
+	for _, tc := range tests {
+		got := extractST(tc.body)
+		if got != tc.expect {
+			t.Errorf("extractST(%q): expected %q, got %q", tc.body, tc.expect, got)
+		}
+	}
+}
+
+func TestMatchesSearchTarget(t *testing.T) {
+	tests := []struct {
+		body   string
+		expect bool
+	}{
+		{"ST: urn:schemas-upnp-org:device:MediaRenderer:1", true},
+		{"ST: ssdp:all", true},
+		{"ST: upnp:rootdevice", true},
+		{"ST: urn:schemas-upnp-org:service:AVTransport:1", true},
+		{"ST: urn:schemas-upnp-org:device:MediaServer:1", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := matchesSearchTarget(tc.body); got != tc.expect {
+			t.Errorf("matchesSearchTarget(%q): expected %v, got %v", tc.body, tc.expect, got)
+		}
+	}
+}
+
+func TestMServeResponseEchoST(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Server.PublicBaseURL = "http://10.0.0.1:8080"
+	cfg.UPnP.AdvertiseIntervalSecs = 1800
+
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-msearch"}
+
+	resp := h.mserveResponse("http://10.0.0.1:8080", "upnp:rootdevice")
+
+	if !strings.Contains(resp, "ST: upnp:rootdevice") {
+		t.Error("mserveResponse must echo request ST")
+	}
+	if !strings.Contains(resp, "USN: uuid:test-msearch::upnp:rootdevice") {
+		t.Error("mserveResponse USN must contain echoed ST")
+	}
+	if !strings.Contains(resp, "LOCATION: http://10.0.0.1:8080/device.xml") {
+		t.Error("mserveResponse must contain LOCATION")
+	}
+}
+
+func TestExtractCallbackURLs(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect int
+		first  string
+	}{
+		{"<http://192.168.1.1:12345/>", 1, "http://192.168.1.1:12345/"},
+		{"<http://10.0.0.1:8000/cb> <http://10.0.0.2:8000/cb>", 2, "http://10.0.0.1:8000/cb"},
+		{"", 0, ""},
+		{"no-brackets", 0, ""},
+	}
+	for _, tc := range tests {
+		urls := extractCallbackURLs(tc.input)
+		if len(urls) != tc.expect {
+			t.Errorf("extractCallbackURLs(%q): expected %d urls, got %d", tc.input, tc.expect, len(urls))
+		}
+		if tc.first != "" && (len(urls) == 0 || urls[0] != tc.first) {
+			t.Errorf("extractCallbackURLs(%q): expected first url %q, got %v", tc.input, tc.first, urls)
+		}
+	}
+}
+
+func TestSubscriptionNew(t *testing.T) {
+	cfg := config.DefaultConfig()
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-sub"}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r.Header.Set("CALLBACK", "<http://127.0.0.1:12345/>")
+	r.Header.Set("NT", "upnp:event")
+	r.Header.Set("TIMEOUT", "Second-1800")
+
+	h.serveEvent(w, r)
+
+	if w.status != http.StatusOK {
+		t.Errorf("new SUBSCRIBE expected 200, got %d", w.status)
+	}
+	sid := w.header.Get("SID")
+	if !strings.HasPrefix(sid, "uuid:") {
+		t.Errorf("new SUBSCRIBE SID must start with uuid:, got %s", sid)
+	}
+	if w.header.Get("TIMEOUT") != "Second-1800" {
+		t.Error("new SUBSCRIBE must return TIMEOUT")
+	}
+	if w.header.Get("SERVER") == "" {
+		t.Error("new SUBSCRIBE must return SERVER header")
+	}
+}
+
+func TestSubscriptionRenewal(t *testing.T) {
+	cfg := config.DefaultConfig()
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-sub"}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r.Header.Set("SID", "uuid:existing-sid")
+
+	h.serveEvent(w, r)
+
+	if w.status != http.StatusOK {
+		t.Errorf("renewal SUBSCRIBE expected 200, got %d", w.status)
+	}
+	if w.header.Get("SID") != "uuid:existing-sid" {
+		t.Errorf("renewal must echo existing SID, got %s", w.header.Get("SID"))
+	}
+}
+
+func TestUnsubscribe(t *testing.T) {
+	cfg := config.DefaultConfig()
+	h := &Handler{cfg: &cfg}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("UNSUBSCRIBE", "/avtransport/event", nil)
+	r.Header.Set("SID", "uuid:some-sid")
+
+	h.serveEvent(w, r)
+
+	if w.status != http.StatusOK {
+		t.Errorf("UNSUBSCRIBE expected 200, got %d", w.status)
+	}
+}
+
+func TestEventInvalidMethod(t *testing.T) {
+	cfg := config.DefaultConfig()
+	h := &Handler{cfg: &cfg}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("POST", "/avtransport/event", nil)
+
+	h.serveEvent(w, r)
+
+	if w.status != http.StatusMethodNotAllowed {
+		t.Errorf("POST on event endpoint expected 405, got %d", w.status)
+	}
+}
+
+func TestGenerateSubscriptionUUID(t *testing.T) {
+	// Generate multiple UUIDs and ensure they are unique and well-formed
+	uuids := make(map[string]bool)
+	for i := 0; i < 10; i++ {
+		u := generateSubscriptionUUID()
+		if u == "" {
+			t.Fatal("UUID must not be empty")
+		}
+		if uuids[u] {
+			t.Errorf("duplicate UUID: %s", u)
+		}
+		uuids[u] = true
+		// UUID format: 8-4-4-4-12 hex digits
+		parts := strings.Split(u, "-")
+		if len(parts) != 5 {
+			t.Errorf("UUID %s: expected 5 dash-separated parts, got %d", u, len(parts))
+		}
+		if len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 || len(parts[3]) != 4 || len(parts[4]) != 12 {
+			t.Errorf("UUID %s: wrong segment lengths", u)
+		}
+	}
+}
+
+func TestDeviceDescriptionServiceURLs(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.UPnP.FriendlyName = "Test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-desc"}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("GET", "/device.xml", nil)
+	h.serveDeviceDesc(w, r)
+
+	body := string(w.body)
+	// All service URLs should use the same base
+	if !strings.Contains(body, "http://bridge:8787/service/AVTransport/desc.xml") {
+		t.Error("AVTransport SCPDURL missing")
+	}
+	if !strings.Contains(body, "http://bridge:8787/avtransport/control") {
+		t.Error("AVTransport controlURL missing")
+	}
+}
+
+func TestDeviceDescriptionUsesRequestHost(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.UPnP.AutoBaseURL = true
+	cfg.UPnP.FriendlyName = "Test"
+
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-auto"}
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("GET", "/device.xml", nil)
+	r.Host = "10.0.0.5:8080"
+	h.serveDeviceDesc(w, r)
+
+	body := string(w.body)
+	if !strings.Contains(body, "http://10.0.0.5:8080/service/AVTransport/desc.xml") {
+		t.Error("device desc should use request Host for service URLs")
+	}
+}
+
 func TestMatchingIPEmpty(t *testing.T) {
 	got := matchingIPWith(net.ParseIP("192.168.1.1"), nil)
 	if got != nil {
