@@ -33,6 +33,7 @@ type UPnPConfig struct {
 	ModelName              string `yaml:"model_name"`
 	UUID                   string `yaml:"uuid"`
 	AdvertiseIntervalSecs  int    `yaml:"advertise_interval_seconds"`
+	AutoBaseURL            bool   `yaml:"auto_base_url"`
 }
 
 type HAConfig struct {
@@ -117,6 +118,7 @@ func DefaultConfig() Config {
 			ModelName:             "DLNA to Music Assistant Bridge",
 			UUID:                  "auto",
 			AdvertiseIntervalSecs: 1800,
+			AutoBaseURL:           true,
 		},
 		HA: HAConfig{
 			URL:            "http://homeassistant.local:8123",

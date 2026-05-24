@@ -1,6 +1,7 @@
 package upnp
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -67,7 +68,7 @@ func TestExtractSOAPField(t *testing.T) {
 
 func TestSOAPResponse(t *testing.T) {
 	inner := `<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`
-	resp := soapResponse("", "", inner)
+	resp := soapResponse("", inner)
 
 	if !strings.Contains(resp, "s:Envelope") {
 		t.Error("response should contain Envelope")
@@ -122,7 +123,7 @@ func TestSSDPMessageFormat(t *testing.T) {
 		deviceUUID: "uuid:test-1234",
 	}
 
-	msg := h.ssdpAliveMessage()
+	msg := h.ssdpAliveMsg("http://192.168.1.10:8787")
 
 	if !strings.Contains(msg, "NOTIFY * HTTP/1.1") {
 		t.Error("SSDP message should start with NOTIFY")
@@ -135,6 +136,51 @@ func TestSSDPMessageFormat(t *testing.T) {
 	}
 	if !strings.Contains(msg, "LOCATION: http://192.168.1.10:8787/device.xml") {
 		t.Error("SSDP should include device.xml location")
+	}
+}
+
+func TestBaseURLForRequest(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.UPnP.AutoBaseURL = true
+
+	h := &Handler{cfg: &cfg}
+
+	r, _ := http.NewRequest("GET", "/device.xml", nil)
+	r.Host = "10.0.0.1:8787"
+
+	base := h.baseURLForRequest(r)
+	if base != "http://10.0.0.1:8787" {
+		t.Errorf("expected http://10.0.0.1:8787, got %s", base)
+	}
+
+	// Auto disabled — fall back to config
+	cfg.UPnP.AutoBaseURL = false
+	cfg.Server.PublicBaseURL = "http://manual.local:8787"
+	base = h.baseURLForRequest(r)
+	if base != "http://manual.local:8787" {
+		t.Errorf("expected fallback URL, got %s", base)
+	}
+}
+
+func TestBaseURLForIP(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.UPnP.AutoBaseURL = true
+	cfg.Server.HTTPPort = 8787
+
+	h := &Handler{cfg: &cfg}
+
+	ip := net.ParseIP("192.168.1.5")
+	base := h.baseURLForIP(ip)
+	if base != "http://192.168.1.5:8787" {
+		t.Errorf("expected per-interface URL, got %s", base)
+	}
+
+	// Auto disabled — fall back to config
+	cfg.UPnP.AutoBaseURL = false
+	cfg.Server.PublicBaseURL = "http://manual.local:8787"
+	base = h.baseURLForIP(ip)
+	if base != "http://manual.local:8787" {
+		t.Errorf("expected fallback URL, got %s", base)
 	}
 }
 

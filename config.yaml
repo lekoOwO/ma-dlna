@@ -9,6 +9,7 @@ upnp:
   model_name: "DLNA to Music Assistant Bridge"
   uuid: "auto"
   advertise_interval_seconds: 1800
+  auto_base_url: true
 
 ha:
   url: "http://homeassistant.local:8123"

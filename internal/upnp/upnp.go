@@ -62,13 +62,26 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("/service/ConnectionManager/desc.xml", h.serveConnectionManagerDesc)
 }
 
-func (h *Handler) baseURL() string {
+// ---- Base URL helpers ----
+
+func (h *Handler) baseURLForRequest(r *http.Request) string {
+	if h.cfg.UPnP.AutoBaseURL && r.Host != "" {
+		return "http://" + r.Host
+	}
 	return h.cfg.Server.PublicBaseURL
 }
 
+func (h *Handler) baseURLForIP(ip net.IP) string {
+	if h.cfg.UPnP.AutoBaseURL && ip != nil {
+		return fmt.Sprintf("http://%s:%d", ip.String(), h.cfg.Server.HTTPPort)
+	}
+	return h.cfg.Server.PublicBaseURL
+}
+
+// ---- Multicast helpers ----
+
 var ssdpAddr = &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
 
-// multicastInterfaces returns all UP interfaces that support multicast.
 func multicastInterfaces() []net.Interface {
 	var out []net.Interface
 	ifaces, err := net.Interfaces()
@@ -79,25 +92,17 @@ func multicastInterfaces() []net.Interface {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
 			continue
 		}
-		addrs, err := iface.Addrs()
-		if err != nil || len(addrs) == 0 {
-			continue
-		}
-		hasIPv4 := false
+		addrs, _ := iface.Addrs()
 		for _, a := range addrs {
 			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() {
-				hasIPv4 = true
+				out = append(out, iface)
 				break
 			}
-		}
-		if hasIPv4 {
-			out = append(out, iface)
 		}
 	}
 	return out
 }
 
-// firstIPv4 returns the first non-loopback IPv4 address on the interface.
 func firstIPv4(iface net.Interface) net.IP {
 	addrs, err := iface.Addrs()
 	if err != nil {
@@ -111,20 +116,23 @@ func firstIPv4(iface net.Interface) net.IP {
 	return nil
 }
 
-// msearchHistory serves as a lightweight dedup for M-SEARCH responses.
-// Each M-SEARCH packet arrives on every multicast interface, so we must
-// respond only once per (remote IP, ST) combination.
+// ---- M-SEARCH ----
+
 type msearchKey struct {
 	ip string
 	st string
 }
 
-// M-SEARCH listener joins the multicast group on every multicast interface.
+type connInfo struct {
+	conn *net.UDPConn
+	ip   net.IP
+}
+
 func (h *Handler) mserve(ctx context.Context) {
-	conns := make([]*net.UDPConn, 0)
+	var infos []connInfo
 	defer func() {
-		for _, c := range conns {
-			c.Close()
+		for _, ci := range infos {
+			ci.conn.Close()
 		}
 	}()
 
@@ -134,24 +142,30 @@ func (h *Handler) mserve(ctx context.Context) {
 			slog.Warn("M-SEARCH listen failed", "iface", iface.Name, "error", err)
 			continue
 		}
-		conns = append(conns, conn)
+		ip := firstIPv4(iface)
+		if ip == nil {
+			conn.Close()
+			continue
+		}
+		infos = append(infos, connInfo{conn: conn, ip: ip})
 	}
 
-	if len(conns) == 0 {
+	if len(infos) == 0 {
 		slog.Warn("No multicast interfaces available for M-SEARCH")
 		return
 	}
-	slog.Info("M-SEARCH listening", "interfaces", len(conns))
+	slog.Info("M-SEARCH listening", "interfaces", len(infos))
 
 	type msg struct {
 		data       []byte
 		remoteAddr *net.UDPAddr
+		ifaceIP    net.IP
 		conn       *net.UDPConn
 	}
 	ch := make(chan msg, 8)
 
-	for _, conn := range conns {
-		go func(c *net.UDPConn) {
+	for _, ci := range infos {
+		go func(c *net.UDPConn, ifaceIP net.IP) {
 			buf := make([]byte, 4096)
 			for {
 				select {
@@ -172,9 +186,9 @@ func (h *Handler) mserve(ctx context.Context) {
 				}
 				data := make([]byte, n)
 				copy(data, buf[:n])
-				ch <- msg{data: data, remoteAddr: remoteAddr, conn: c}
+				ch <- msg{data: data, remoteAddr: remoteAddr, ifaceIP: ifaceIP, conn: c}
 			}
-		}(conn)
+		}(ci.conn, ci.ip)
 	}
 
 	history := map[msearchKey]time.Time{}
@@ -207,8 +221,8 @@ func (h *Handler) mserve(ctx context.Context) {
 			}
 			history[key] = time.Now()
 
-			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st)
-			resp := h.mserveResponse()
+			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "base", h.baseURLForIP(m.ifaceIP))
+			resp := h.mserveResponse(h.baseURLForIP(m.ifaceIP))
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
 		}
 	}
@@ -237,8 +251,7 @@ func matchesSearchTarget(body string) bool {
 	return false
 }
 
-func (h *Handler) mserveResponse() string {
-	base := h.baseURL()
+func (h *Handler) mserveResponse(base string) string {
 	return fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"CACHE-CONTROL: max-age=%d\r\n"+
@@ -254,7 +267,8 @@ func (h *Handler) mserveResponse() string {
 	)
 }
 
-// SSDP Advertisement
+// ---- SSDP Advertisement ----
+
 func (h *Handler) ssdpLoop(ctx context.Context) {
 	interval := time.Duration(h.cfg.UPnP.AdvertiseIntervalSecs) * time.Second
 	if interval <= 0 {
@@ -264,20 +278,20 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	h.broadcastSSDP(h.ssdpAliveMessage())
+	h.broadcastSSDP(h.ssdpAliveMsg)
 
 	for {
 		select {
 		case <-ctx.Done():
-			h.broadcastSSDP(h.ssdpByeByeMessage())
+			h.broadcastSSDP(h.ssdpByeByeMsg)
 			return
 		case <-ticker.C:
-			h.broadcastSSDP(h.ssdpAliveMessage())
+			h.broadcastSSDP(h.ssdpAliveMsg)
 		}
 	}
 }
 
-func (h *Handler) broadcastSSDP(msg string) {
+func (h *Handler) broadcastSSDP(msgFn func(string) string) {
 	ifaces := multicastInterfaces()
 	slog.Info("SSDP broadcast", "interfaces", len(ifaces))
 	for _, iface := range ifaces {
@@ -290,13 +304,12 @@ func (h *Handler) broadcastSSDP(msg string) {
 			slog.Warn("SSDP dial failed", "iface", iface.Name, "ip", ip, "error", err)
 			continue
 		}
-		conn.Write([]byte(msg))
+		conn.Write([]byte(msgFn(h.baseURLForIP(ip))))
 		conn.Close()
 	}
 }
 
-func (h *Handler) ssdpAliveMessage() string {
-	base := h.baseURL()
+func (h *Handler) ssdpAliveMsg(base string) string {
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
@@ -304,18 +317,17 @@ func (h *Handler) ssdpAliveMessage() string {
 			"LOCATION: %s/device.xml\r\n"+
 			"NT: %s\r\n"+
 			"NTS: ssdp:alive\r\n"+
-			"SERVER: %s/%s UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
+			"SERVER: Linux/6.8 UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
 			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
-		"Linux", "6.8",
 		h.deviceUUID,
 	)
 }
 
-func (h *Handler) ssdpByeByeMessage() string {
+func (h *Handler) ssdpByeByeMsg(_ string) string {
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
@@ -327,9 +339,10 @@ func (h *Handler) ssdpByeByeMessage() string {
 	)
 }
 
-// Device Description XML
+// ---- Device Description XML ----
+
 func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
-	base := h.baseURL()
+	base := h.baseURLForRequest(r)
 	xml := fmt.Sprintf(`<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
   <specVersion>
@@ -380,7 +393,8 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(xml))
 }
 
-// AVTransport Service
+// ---- AVTransport ----
+
 func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	body, err := parseSOAPRequest(r)
 	if err != nil {
@@ -508,7 +522,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(response))
 }
 
-// RenderingControl Service
+// ---- RenderingControl ----
+
 func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) {
 	body, err := parseSOAPRequest(r)
 	if err != nil {
@@ -577,7 +592,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 	w.Write([]byte(response))
 }
 
-// ConnectionManager Service
+// ---- ConnectionManager ----
+
 func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request) {
 	body, err := parseSOAPRequest(r)
 	if err != nil {
@@ -600,7 +616,7 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
     http-get:*:audio/wav:*,
     http-get:*:audio/flac:*,
     http-get:*:audio/ogg:*,
-    http-get:*:audio/aac:*,
+    http-get:*:audio/aac:*
   </Source>
   <Sink></Sink>
 </u:GetProtocolInfoResponse>`)
@@ -631,7 +647,8 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 	w.Write([]byte(response))
 }
 
-// Service Description XMLs
+// ---- Service Descriptions ----
+
 func (h *Handler) serveAVTransportDesc(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.Write([]byte(avTransportSCPD))
@@ -647,7 +664,8 @@ func (h *Handler) serveConnectionManagerDesc(w http.ResponseWriter, r *http.Requ
 	w.Write([]byte(connectionManagerSCPD))
 }
 
-// SOAP Helpers
+// ---- SOAP Helpers ----
+
 func parseSOAPRequest(r *http.Request) ([]byte, error) {
 	if r.Method != http.MethodPost {
 		return nil, fmt.Errorf("method not POST")
@@ -673,17 +691,14 @@ func extractSOAPAction(body []byte) string {
 	}
 	afterBody := s[bodyIdx+gt+1:]
 
-	// Find first element tag after <s:Body>
 	start := strings.Index(afterBody, "<")
 	if start < 0 {
 		return ""
 	}
-	tagPart := afterBody[start+1:] // skip '<'
+	tagPart := afterBody[start+1:]
 
-	// Check for namespace prefix
 	tagPart = strings.TrimPrefix(tagPart, "u:")
 
-	// Find end of tag name (space, >, or />)
 	end := strings.IndexAny(tagPart, " >/\r\n")
 	if end < 0 {
 		return ""
@@ -707,18 +722,18 @@ func extractSOAPField(body []byte, field string) string {
 }
 
 func avTransportResponse(action, innerXML string) string {
-	return soapResponse("AVTransport", action, innerXML)
+	return soapResponse(action, innerXML)
 }
 
 func renderingResponse(action, innerXML string) string {
-	return soapResponse("RenderingControl", action, innerXML)
+	return soapResponse(action, innerXML)
 }
 
 func connectionResponse(action, innerXML string) string {
-	return soapResponse("ConnectionManager", action, innerXML)
+	return soapResponse(action, innerXML)
 }
 
-func soapResponse(_, _ string, innerXML string) string {
+func soapResponse(_, innerXML string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
