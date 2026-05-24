@@ -711,10 +711,11 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 </u:GetPositionInfoResponse>`, relTime))
 
 	case "GetMediaInfo":
-		active := h.sessionMgr.ActiveSession()
 		uri := ""
-		if active != nil {
-			uri = active.StreamURL
+		if h.sessionMgr != nil {
+			if active := h.sessionMgr.ActiveSession(); active != nil {
+				uri = active.StreamURL
+			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
@@ -728,6 +729,33 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
   <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
   <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
 </u:GetMediaInfoResponse>`, escapeXML(uri)))
+
+	case "GetCurrentTransportActions":
+		var actions string
+		if h.sessionMgr != nil {
+			if active := h.sessionMgr.ActiveSession(); active != nil {
+				actions = transportActionsForState(active.State)
+			}
+		}
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:GetCurrentTransportActionsResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <Actions>%s</Actions>
+</u:GetCurrentTransportActionsResponse>`, actions))
+
+	case "GetDeviceCapabilities":
+		response = avTransportResponse(action, `
+<u:GetDeviceCapabilitiesResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <PlayMedia>NETWORK</PlayMedia>
+  <RecMedia>NOT_IMPLEMENTED</RecMedia>
+  <RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>
+</u:GetDeviceCapabilitiesResponse>`)
+
+	case "GetTransportSettings":
+		response = avTransportResponse(action, `
+<u:GetTransportSettingsResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+  <PlayMode>NORMAL</PlayMode>
+  <RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>
+</u:GetTransportSettingsResponse>`)
 
 	default:
 		slog.Warn("Unknown AVTransport action", "action", action)
@@ -982,6 +1010,21 @@ func soapFaultResponse(errorCode, errorDescription string) string {
     </s:Fault>
   </s:Body>
 </s:Envelope>`, errorCode, errorDescription)
+}
+
+func transportActionsForState(s session.State) string {
+	switch s {
+	case session.StatePlaying:
+		return "Play,Stop,Pause,Seek"
+	case session.StatePaused:
+		return "Play,Stop"
+	case session.StateStarting:
+		return "Stop"
+	case session.StateLoaded:
+		return "Play"
+	default:
+		return ""
+	}
 }
 
 func formatDurationUPnP(d time.Duration) string {

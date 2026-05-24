@@ -831,7 +831,32 @@ func TestFullDLNALifecycle(t *testing.T) {
 	}
 	t.Log("Step 12: GetProtocolInfo includes configured formats OK")
 
-	t.Logf("Full DLNA lifecycle test PASSED (12 steps)")
+	// ---- Step 13: GetCurrentTransportActions ----
+	actionsBody := soapEnvelope("AVTransport", "GetCurrentTransportActions", "<InstanceID>0</InstanceID>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(actionsBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionsXML, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(actionsXML), "Actions") {
+		t.Error("GetCurrentTransportActions missing Actions field")
+	}
+	t.Logf("Step 13: GetCurrentTransportActions OK")
+
+	// ---- Step 14: GetDeviceCapabilities ----
+	capBody := soapEnvelope("AVTransport", "GetDeviceCapabilities", "<InstanceID>0</InstanceID>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(capBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GetDeviceCapabilities returned %d", resp.StatusCode)
+	}
+	t.Log("Step 14: GetDeviceCapabilities OK")
+
+	t.Logf("Full DLNA lifecycle test PASSED (14 steps)")
 }
 
 func extractXMLField(xml, field string) string {
