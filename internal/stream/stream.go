@@ -313,6 +313,13 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
 
+	// Replay prebuffer data so late clients get stream headers
+	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
+	n, _ := st.ringBuf.Read(st.ringBuf.WritePosition()-int64(s.cfg.Stream.PrebufferBytes), prebuf)
+	if n > 0 {
+		cw.ch <- prebuf[:n]
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -333,17 +340,19 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Client disconnected from stream", "session_id", sessionID, "client_id", clientID, "remaining", remaining)
 
 	if remaining == 0 {
-		go func() {
+		go func(snapshot *stream) {
 			time.Sleep(time.Duration(s.cfg.Stream.NoClientGraceSeconds) * time.Second)
-			st.clientsMu.Lock()
-			if len(st.clients) == 0 {
-				st.clientsMu.Unlock()
+			s.mu.Lock()
+			current := s.streams[sessionID]
+			s.mu.Unlock()
+			snapshot.clientsMu.Lock()
+			empty := len(snapshot.clients) == 0
+			snapshot.clientsMu.Unlock()
+			if current == snapshot && empty {
 				slog.Info("No clients remaining, stopping stream", "session_id", sessionID)
 				s.Stop(sessionID)
-				return
 			}
-			st.clientsMu.Unlock()
-		}()
+		}(st)
 	}
 }
 

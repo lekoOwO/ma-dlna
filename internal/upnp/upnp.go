@@ -3,6 +3,7 @@ package upnp
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
 	"log/slog"
 	"net"
@@ -993,48 +994,45 @@ func parseSOAPRequest(r *http.Request) ([]byte, error) {
 }
 
 func extractSOAPAction(body []byte) string {
-	s := string(body)
-	bodyIdx := strings.Index(s, "<s:Body")
-	if bodyIdx < 0 {
-		bodyIdx = strings.Index(s, "<Body")
-		if bodyIdx < 0 {
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
 			return ""
 		}
+		if se, ok := tok.(xml.StartElement); ok {
+			// Find first element inside <s:Body> or <Body>
+			if se.Name.Local == "Body" {
+				// Next element is the action
+				for {
+					tok2, err2 := decoder.Token()
+					if err2 != nil {
+						return ""
+					}
+					if se2, ok2 := tok2.(xml.StartElement); ok2 {
+						return se2.Name.Local
+					}
+				}
+			}
+		}
 	}
-	gt := strings.Index(s[bodyIdx:], ">")
-	if gt < 0 {
-		return ""
-	}
-	afterBody := s[bodyIdx+gt+1:]
-
-	start := strings.Index(afterBody, "<")
-	if start < 0 {
-		return ""
-	}
-	tagPart := afterBody[start+1:]
-
-	tagPart = strings.TrimPrefix(tagPart, "u:")
-
-	end := strings.IndexAny(tagPart, " >/\r\n")
-	if end < 0 {
-		return ""
-	}
-	return tagPart[:end]
 }
 
 func extractSOAPField(body []byte, field string) string {
-	s := string(body)
-	tag := "<" + field + ">"
-	start := strings.Index(s, tag)
-	if start < 0 {
-		return ""
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		if se, ok := tok.(xml.StartElement); ok {
+			if se.Name.Local == field {
+				var val string
+				decoder.DecodeElement(&val, &se)
+				return unescapeXML(val)
+			}
+		}
 	}
-	start += len(tag)
-	end := strings.Index(s[start:], "</"+field+">")
-	if end < 0 {
-		return ""
-	}
-	return unescapeXML(s[start : start+end])
 }
 
 func unescapeXML(s string) string {
