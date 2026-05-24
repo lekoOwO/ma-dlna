@@ -372,8 +372,8 @@ func (h *Handler) ssdpAliveMsg(base string) string {
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
-		serverString(),
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		serverString(),
 		h.deviceUUID,
 	)
 }

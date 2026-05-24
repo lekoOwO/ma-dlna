@@ -49,11 +49,12 @@ type stream struct {
 }
 
 type clientWriter struct {
-	id     string
-	w      http.ResponseWriter
+	id      string
+	w       http.ResponseWriter
 	flusher http.Flusher
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	ch      chan []byte
 }
 
 func NewStreamer(cfg *config.Config) *Streamer {
@@ -278,11 +279,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w:      w,
 		ctx:    ctx,
 		cancel: cancel,
+		ch:     make(chan []byte, 64),
 	}
 
 	if f, ok := w.(http.Flusher); ok {
 		cw.flusher = f
 	}
+
+	go cw.writeLoop()
 
 	st.clientsMu.Lock()
 	if len(st.clients) >= s.cfg.Stream.MaxClientsPerSession {
@@ -348,7 +352,11 @@ func (st *stream) run(ctx context.Context) {
 	slog.Debug("ffmpeg command", "args", args)
 	slog.Info("Starting ffmpeg", "session_id", st.sessionID)
 
-	st.cmd = exec.CommandContext(ctx, "ffmpeg", args...)
+	bin := st.ffmpegCfg.Binary
+	if bin == "" {
+		bin = "ffmpeg"
+	}
+	st.cmd = exec.CommandContext(ctx, bin, args...)
 	stdout, err := st.cmd.StdoutPipe()
 	if err != nil {
 		st.err = err
@@ -531,22 +539,36 @@ func (st *stream) broadcast(data []byte) {
 		return
 	}
 	st.clientsMu.Lock()
-	defer st.clientsMu.Unlock()
-
 	for id, cw := range st.clients {
 		select {
 		case <-cw.ctx.Done():
 			delete(st.clients, id)
+		case cw.ch <- data:
 		default:
-			_, err := cw.w.Write(data)
-			if err != nil {
-				slog.Debug("Write error to client, disconnecting", "client_id", id, "error", err)
+			// client too slow, drop it
+			slog.Debug("Client too slow, disconnecting", "client_id", id)
+			cw.cancel()
+			delete(st.clients, id)
+		}
+	}
+	st.clientsMu.Unlock()
+}
+
+func (cw *clientWriter) writeLoop() {
+	for {
+		select {
+		case <-cw.ctx.Done():
+			return
+		case data, ok := <-cw.ch:
+			if !ok {
+				return
+			}
+			if _, err := cw.w.Write(data); err != nil {
 				cw.cancel()
-				delete(st.clients, id)
-			} else {
-				if cw.flusher != nil {
-					cw.flusher.Flush()
-				}
+				return
+			}
+			if cw.flusher != nil {
+				cw.flusher.Flush()
 			}
 		}
 	}
