@@ -242,46 +242,51 @@ func parseDIDL(xmlStr string) *Metadata {
 		return &Metadata{}
 	}
 
-	decoder := xml.NewDecoder(strings.NewReader(xmlStr))
-	var md Metadata
-	var inItem bool
-
-	for {
-		tok, err := decoder.Token()
-		if err != nil {
-			break
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "item" {
-				inItem = true
-			}
-			if inItem {
-				switch t.Name.Local {
-				case "title":
-					decoder.DecodeElement(&md.Title, &t)
-				case "creator":
-					var v string
-					decoder.DecodeElement(&v, &t)
-					if md.Artist == "" {
-						md.Artist = v
-					}
-				case "artist":
-					decoder.DecodeElement(&md.Artist, &t)
-				case "album":
-					decoder.DecodeElement(&md.Album, &t)
-				case "albumArtURI":
-					decoder.DecodeElement(&md.AlbumArtURI, &t)
-				}
-			}
-		case xml.EndElement:
-			if t.Name.Local == "item" {
-				inItem = false
-			}
-		}
+	// DIDL-Lite element hierarchy:
+	//   <DIDL-Lite>
+	//     <item>   <title/>  <creator/>  <artist/>  <album/>  <albumArtURI/>   </item>
+	//   </DIDL-Lite>
+	type didlItem struct {
+		XMLName     xml.Name `xml:"item"`
+		Title       string   `xml:"title"`
+		Creator     string   `xml:"creator"`
+		Artist      string   `xml:"artist"`
+		Album       string   `xml:"album"`
+		AlbumArtURI string   `xml:"albumArtURI"`
 	}
 
-	return &md
+	// Try with DIDL-Lite wrapper (full UPnP format)
+	type didlDoc struct {
+		XMLName xml.Name   `xml:"DIDL-Lite"`
+		Items   []didlItem `xml:"item"`
+	}
+	var doc didlDoc
+	if err := xml.Unmarshal([]byte(xmlStr), &doc); err == nil && len(doc.Items) > 0 {
+		it := doc.Items[0]
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI)
+	}
+
+	// Fallback: bare <item>
+	var it didlItem
+	if err := xml.Unmarshal([]byte(xmlStr), &it); err == nil {
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI)
+	}
+
+	return &Metadata{}
+}
+
+func buildMetadata(title, creator, artist, album, albumArtURI string) *Metadata {
+	md := &Metadata{
+		Title:       title,
+		Album:       album,
+		AlbumArtURI: albumArtURI,
+	}
+	if artist != "" {
+		md.Artist = artist
+	} else if creator != "" {
+		md.Artist = creator
+	}
+	return md
 }
 
 var ErrNotFound = errors.New("session not found")
