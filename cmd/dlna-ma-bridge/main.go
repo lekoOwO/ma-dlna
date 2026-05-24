@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -148,7 +150,15 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 
 func httpLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		if r.Method == "POST" || r.Method == "NOTIFY" {
+			body, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr,
+				"body", string(body)[:min(len(body), 512)])
+		} else {
+			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		}
 		next.ServeHTTP(w, r)
 	})
 }

@@ -76,7 +76,11 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 
 func (h *Handler) baseURLForRequest(r *http.Request) string {
 	if h.cfg.UPnP.AutoBaseURL && r.Host != "" {
-		return "http://" + r.Host
+		host := r.Host
+		if !strings.Contains(host, ":") {
+			host = fmt.Sprintf("%s:%d", host, h.cfg.Server.HTTPPort)
+		}
+		return "http://" + host
 	}
 	return h.cfg.Server.PublicBaseURL
 }
