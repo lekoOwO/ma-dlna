@@ -40,6 +40,7 @@ func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maad
 func (h *Handler) Start(ctx context.Context) error {
 	ctx, h.ssdpCancel = context.WithCancel(ctx)
 	go h.ssdpLoop(ctx)
+	go h.mserve(ctx)
 	slog.Info("UPnP handler started", "friendly_name", h.cfg.UPnP.FriendlyName, "uuid", h.deviceUUID)
 	return nil
 }
@@ -63,6 +64,65 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 
 func (h *Handler) baseURL() string {
 	return h.cfg.Server.PublicBaseURL
+}
+
+// M-SEARCH listener
+func (h *Handler) mserve(ctx context.Context) {
+	addr := &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
+	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	if err != nil {
+		slog.Warn("Failed to listen for M-SEARCH", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			continue
+		}
+
+		msg := string(buf[:n])
+		if !strings.Contains(msg, "M-SEARCH") {
+			continue
+		}
+		if !strings.Contains(msg, "urn:schemas-upnp-org:device:MediaRenderer:1") {
+			continue
+		}
+
+		slog.Debug("Received M-SEARCH", "from", remoteAddr.String())
+		resp := h.mserveResponse()
+		conn.WriteToUDP([]byte(resp), remoteAddr)
+		slog.Debug("Sent M-SEARCH response", "to", remoteAddr.String())
+	}
+}
+
+func (h *Handler) mserveResponse() string {
+	base := h.baseURL()
+	return fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"CACHE-CONTROL: max-age=%d\r\n"+
+			"EXT:\r\n"+
+			"LOCATION: %s/device.xml\r\n"+
+			"SERVER: Linux/6.8 UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
+			"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"\r\n",
+		h.cfg.UPnP.AdvertiseIntervalSecs,
+		base,
+		h.deviceUUID,
+	)
 }
 
 // SSDP Advertisement
@@ -321,7 +381,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		slog.Warn("Unknown AVTransport action", "action", action)
-		response = soapFaultResponse("UPnPError", "401", "Invalid Action")
+		response = soapFaultResponse("401", "Invalid Action")
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -354,7 +414,9 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 	case "SetVolume":
 		desired := extractSOAPField(body, "DesiredVolume")
 		vol := 50
-		fmt.Sscanf(desired, "%d", &vol)
+		if _, err := fmt.Sscanf(desired, "%d", &vol); err != nil {
+			vol = 50
+		}
 
 		h.mu.Lock()
 		h.volume = vol
@@ -388,7 +450,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 <u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
 
 	default:
-		response = soapFaultResponse("UPnPError", "401", "Invalid Action")
+		response = soapFaultResponse("401", "Invalid Action")
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -414,14 +476,11 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
   <Source>
     http-get:*:audio/mpeg:*,
-    http-get:*:audio/mp3:*,
+    http-get:*:audio/opus:*,
     http-get:*:audio/wav:*,
     http-get:*:audio/flac:*,
-    http-get:*:audio/x-flac:*,
     http-get:*:audio/ogg:*,
     http-get:*:audio/aac:*,
-    http-get:*:audio/x-ms-wma:*,
-    http-get:*:application/ogg:*
   </Source>
   <Sink></Sink>
 </u:GetProtocolInfoResponse>`)
@@ -445,7 +504,7 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 </u:GetCurrentConnectionInfoResponse>`)
 
 	default:
-		response = soapFaultResponse("UPnPError", "401", "Invalid Action")
+		response = soapFaultResponse("401", "Invalid Action")
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -481,26 +540,35 @@ func parseSOAPRequest(r *http.Request) ([]byte, error) {
 
 func extractSOAPAction(body []byte) string {
 	s := string(body)
-	start := strings.Index(s, "<u:")
-	if start < 0 {
-		start = strings.Index(s, "<")
-		if start < 0 {
+	bodyIdx := strings.Index(s, "<s:Body")
+	if bodyIdx < 0 {
+		bodyIdx = strings.Index(s, "<Body")
+		if bodyIdx < 0 {
 			return ""
 		}
 	}
-	startTag := s[start:]
-	end := strings.Index(startTag, " ")
-	if end < 0 {
-		end = strings.Index(startTag, ">")
+	gt := strings.Index(s[bodyIdx:], ">")
+	if gt < 0 {
+		return ""
 	}
+	afterBody := s[bodyIdx+gt+1:]
+
+	// Find first element tag after <s:Body>
+	start := strings.Index(afterBody, "<")
+	if start < 0 {
+		return ""
+	}
+	tagPart := afterBody[start+1:] // skip '<'
+
+	// Check for namespace prefix
+	tagPart = strings.TrimPrefix(tagPart, "u:")
+
+	// Find end of tag name (space, >, or />)
+	end := strings.IndexAny(tagPart, " >/\r\n")
 	if end < 0 {
 		return ""
 	}
-	tag := startTag[:end]
-	tag = strings.TrimPrefix(tag, "<u:")
-	tag = strings.TrimPrefix(tag, "<")
-	tag = strings.TrimSuffix(tag, "/")
-	return tag
+	return tagPart[:end]
 }
 
 func extractSOAPField(body []byte, field string) string {
@@ -530,18 +598,16 @@ func connectionResponse(action, innerXML string) string {
 	return soapResponse("ConnectionManager", action, innerXML)
 }
 
-func soapResponse(service, action, innerXML string) string {
+func soapResponse(_, _ string, innerXML string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
-    <u:%sResponse xmlns:u="urn:schemas-upnp-org:service:%s:1">
 %s
-    </u:%sResponse>
   </s:Body>
-</s:Envelope>`, action, service, innerXML, action)
+</s:Envelope>`, innerXML)
 }
 
-func soapFaultResponse(faultCode, faultString, detail string) string {
+func soapFaultResponse(errorCode, errorDescription string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
@@ -556,7 +622,7 @@ func soapFaultResponse(faultCode, faultString, detail string) string {
       </detail>
     </s:Fault>
   </s:Body>
-</s:Envelope>`, faultString, detail)
+</s:Envelope>`, errorCode, errorDescription)
 }
 
 func escapeXML(s string) string {

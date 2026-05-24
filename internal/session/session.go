@@ -89,7 +89,8 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 	}
 
 	baseURL := m.cfg.Server.PublicBaseURL
-	s.StreamURL = baseURL + "/live/" + id + ".mp3?token=" + token
+	ext := m.cfg.FFmpeg.OutputFormat
+	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
 	m.sessions[id] = s
 

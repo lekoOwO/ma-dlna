@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,16 +27,17 @@ type Streamer struct {
 }
 
 type stream struct {
-	sessionID  string
-	sourceURI  string
-	ringBuf    *RingBuffer
-	cmd        *exec.Cmd
-	cancel     context.CancelFunc
-	active     atomic.Bool
-	clients    map[string]*clientWriter
-	clientsMu  sync.Mutex
-	started    chan struct{}
-	err        error
+	sessionID string
+	sourceURI string
+	ringBuf   *RingBuffer
+	cmd       *exec.Cmd
+	cancel    context.CancelFunc
+	active    atomic.Bool
+	clients   map[string]*clientWriter
+	clientsMu sync.Mutex
+	started   chan struct{}
+	err       error
+	ffmpegCfg config.FFmpegConfig
 }
 
 type clientWriter struct {
@@ -74,6 +76,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		clients:   make(map[string]*clientWriter),
 		started:   make(chan struct{}),
 		cancel:    cancel,
+		ffmpegCfg: s.cfg.FFmpeg,
 	}
 	st.active.Store(true)
 	s.streams[sessionID] = st
@@ -134,12 +137,11 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/live/")
-	parts := strings.SplitN(path, ".mp3", 2)
-	if len(parts) == 0 {
+	sessionID := extractSessionID(path)
+	if sessionID == "" {
 		http.Error(w, "Invalid stream path", http.StatusBadRequest)
 		return
 	}
-	sessionID := parts[0]
 	token := r.URL.Query().Get("token")
 
 	if s.tokenValidator != nil && !s.tokenValidator(sessionID, token) {
@@ -156,8 +158,10 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	contentType := contentTypeForFormat(st.ffmpegCfg.OutputFormat)
+
 	if r.Method == http.MethodHead {
-		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Accept-Ranges", "none")
 		w.WriteHeader(http.StatusOK)
@@ -201,7 +205,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
 
-	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Accept-Ranges", "none")
@@ -302,29 +306,67 @@ func (st *stream) run(ctx context.Context) {
 }
 
 func (st *stream) buildFFmpegArgs() []string {
+	cfg := st.ffmpegCfg
+
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
 	}
 
-	args = append(args,
-		"-reconnect", "1",
-		"-reconnect_streamed", "1",
-		"-reconnect_delay_max", "5",
-	)
+	if cfg.Reconnect {
+		args = append(args,
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+		)
+	}
+
+	if len(cfg.ExtraInputArgs) > 0 {
+		args = append(args, cfg.ExtraInputArgs...)
+	}
 
 	args = append(args, "-i", st.sourceURI)
 
-	args = append(args,
-		"-vn",
-		"-ac", "2",
-		"-ar", "44100",
-		"-codec:a", "libmp3lame",
-		"-b:a", "192k",
-		"-f", "mp3",
-		"pipe:1",
-	)
+	args = append(args, "-vn")
+
+	if cfg.Channels > 0 {
+		args = append(args, "-ac", fmt.Sprintf("%d", cfg.Channels))
+	}
+	if cfg.SampleRate > 0 {
+		args = append(args, "-ar", fmt.Sprintf("%d", cfg.SampleRate))
+	}
+	if cfg.Codec != "" {
+		args = append(args, "-codec:a", cfg.Codec)
+	}
+	if cfg.Bitrate != "" {
+		args = append(args, "-b:a", cfg.Bitrate)
+	}
+
+	if len(cfg.ExtraOutputArgs) > 0 {
+		args = append(args, cfg.ExtraOutputArgs...)
+	}
+
+	args = append(args, "-f", cfg.OutputFormat, "pipe:1")
 
 	return args
+}
+
+func contentTypeForFormat(format string) string {
+	switch format {
+	case "mp3":
+		return "audio/mpeg"
+	case "opus":
+		return "audio/opus"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "wav":
+		return "audio/wav"
+	default:
+		return "audio/" + format
+	}
 }
 
 func (st *stream) broadcast(data []byte) {
@@ -353,4 +395,12 @@ func generateClientID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func extractSessionID(path string) string {
+	dot := strings.LastIndexByte(path, '.')
+	if dot < 0 {
+		return path
+	}
+	return path[:dot]
 }

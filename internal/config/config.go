@@ -132,10 +132,10 @@ func DefaultConfig() Config {
 		},
 		FFmpeg: FFmpegConfig{
 			Binary:       "ffmpeg",
-			OutputFormat: "mp3",
-			Codec:        "libmp3lame",
+			OutputFormat: "opus",
+			Codec:        "libopus",
 			Bitrate:      "192k",
-			SampleRate:   44100,
+			SampleRate:   48000,
 			Channels:     2,
 			Reconnect:    true,
 		},

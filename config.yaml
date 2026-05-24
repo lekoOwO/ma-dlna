@@ -25,10 +25,10 @@ ma_adapter:
 
 ffmpeg:
   binary: "ffmpeg"
-  output_format: "mp3"
-  codec: "libmp3lame"
+  output_format: "opus"
+  codec: "libopus"
   bitrate: "192k"
-  sample_rate: 44100
+  sample_rate: 48000
   channels: 2
   reconnect: true
   extra_input_args: []
