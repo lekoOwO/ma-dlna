@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -391,7 +392,8 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 	base := h.baseURLForRequest(r)
 	slog.Debug("Device description served", "remote", r.RemoteAddr, "base", base)
 	xml := fmt.Sprintf(`<?xml version="1.0"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0"
+      xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion>
     <major>1</major>
     <minor>0</minor>
@@ -400,8 +402,12 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
     <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
     <friendlyName>%s</friendlyName>
     <manufacturer>%s</manufacturer>
+    <manufacturerURL>https://github.com/lekoOwO/ma-dlna</manufacturerURL>
+    <modelDescription>DLNA to Music Assistant Bridge</modelDescription>
     <modelName>%s</modelName>
+    <modelNumber>%s</modelNumber>
     <UDN>%s</UDN>
+    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
     <serviceList>
       <service>
         <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
@@ -430,6 +436,7 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 		h.cfg.UPnP.FriendlyName,
 		h.cfg.UPnP.Manufacturer,
 		h.cfg.UPnP.ModelName,
+		version.Version,
 		h.deviceUUID,
 		base, base, base,
 		base, base, base,
@@ -496,7 +503,11 @@ func (h *Handler) sendInitialEvent(callback, sid string) {
 			slog.Debug("Event NOTIFY create failed", "url", u, "error", err)
 			continue
 		}
-		req.Header.Set("CONTENT-TYPE", "text/xml; charset=utf-8")
+		parsed, _ := neturl.Parse(u)
+		if parsed != nil {
+			req.Host = parsed.Host
+		}
+		req.Header.Set("Content-Type", "text/xml; charset=utf-8")
 		req.Header.Set("NT", "upnp:event")
 		req.Header.Set("NTS", "upnp:propchange")
 		req.Header.Set("SID", sid)
