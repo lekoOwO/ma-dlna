@@ -33,11 +33,6 @@ func (c *SecurityConfig) ValidateSourceURI(rawURL string) error {
 }
 
 func (c *SecurityConfig) validateIP(ip net.IP) error {
-	// Block loopback and link-local
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return fmt.Errorf("source IP blocked: %s (loopback/link-local)", ip)
-	}
-
 	// Check blocked CIDRs first
 	for _, cidr := range c.BlockedSourceCIDRs {
 		_, nw, err := net.ParseCIDR(cidr)
@@ -49,8 +44,9 @@ func (c *SecurityConfig) validateIP(ip net.IP) error {
 		}
 	}
 
-	// If allowed CIDRs are set, check against them
-	if len(c.AllowedSourceCIDRs) > 0 {
+	// If allowed CIDRs are set, check private IPs against them.
+	// Public IPs are gated by AllowPublicSources below.
+	if len(c.AllowedSourceCIDRs) > 0 && ip.IsPrivate() {
 		allowed := false
 		for _, cidr := range c.AllowedSourceCIDRs {
 			_, nw, err := net.ParseCIDR(cidr)
@@ -67,18 +63,28 @@ func (c *SecurityConfig) validateIP(ip net.IP) error {
 		}
 	}
 
+	// Block loopback and link-local (unless explicitly allowed)
+	if ip.IsLoopback() && !c.AllowLoopbackSources {
+		return fmt.Errorf("source IP blocked: %s (loopback)", ip)
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("source IP blocked: %s (link-local)", ip)
+	}
+
 	// Block public IPs if not allowed
-	if !c.AllowPublicSources && !ip.IsPrivate() {
+	if !ip.IsPrivate() && !c.AllowPublicSources {
 		return fmt.Errorf("public source IP blocked: %s", ip)
 	}
 
 	return nil
 }
 
-func (c *SecurityConfig) ValidateOrLog(rawURL string) {
+func (c *SecurityConfig) ValidateOrReject(rawURL string) error {
 	if err := c.ValidateSourceURI(rawURL); err != nil {
 		slog.Warn("Source URI rejected by security policy", "uri", safeURL(rawURL), "error", err)
+		return err
 	}
+	return nil
 }
 
 func safeURL(raw string) string {

@@ -18,6 +18,8 @@ import (
 func startTestServer(t *testing.T) (*httptest.Server, *Handler) {
 	t.Helper()
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.UPnP.AutoBaseURL = false
 	cfg.Server.PublicBaseURL = "http://test.local:8787"
 
@@ -407,6 +409,8 @@ func TestPlaybackActions(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -525,8 +529,10 @@ func TestPlaybackActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	allSessions := sm.AllSessions()
-	s2 := allSessions[len(allSessions)-1]
+	s2 := sm.ActiveSession()
+	if s2 == nil {
+		t.Fatal("expected active session after SetAVTransportURI")
+	}
 	body = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, _ = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
 	resp.Body.Close()
@@ -565,6 +571,8 @@ func TestVolumeControl(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.UPnP.AutoBaseURL = false
@@ -657,6 +665,8 @@ func TestFullDLNALifecycle(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -778,7 +788,7 @@ func TestFullDLNALifecycle(t *testing.T) {
 			t.Fatalf("GetPositionInfo returned %d", resp.StatusCode)
 		}
 		posXML := string(posBody)
-			rt := extractXMLField(posXML, "RelTime")
+		rt := extractXMLField(posXML, "RelTime")
 		if rt != lastRelTime {
 			lastRelTime = rt
 		}
@@ -969,6 +979,8 @@ func TestStateChangeNotify(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -1102,6 +1114,8 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -1178,6 +1192,8 @@ func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"

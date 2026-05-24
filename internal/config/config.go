@@ -4,22 +4,22 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
-	"log/slog"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	UPnP       UPnPConfig       `yaml:"upnp"`
-	HA         HAConfig         `yaml:"ha"`
-	MAAdapter  MAAdapterConfig  `yaml:"ma_adapter"`
-	FFmpeg     FFmpegConfig     `yaml:"ffmpeg"`
-	Stream     StreamConfig     `yaml:"stream"`
-	Security   SecurityConfig   `yaml:"security"`
-	Logging    LoggingConfig    `yaml:"logging"`
+	Server    ServerConfig    `yaml:"server"`
+	UPnP      UPnPConfig      `yaml:"upnp"`
+	HA        HAConfig        `yaml:"ha"`
+	MAAdapter MAAdapterConfig `yaml:"ma_adapter"`
+	FFmpeg    FFmpegConfig    `yaml:"ffmpeg"`
+	Stream    StreamConfig    `yaml:"stream"`
+	Security  SecurityConfig  `yaml:"security"`
+	Logging   LoggingConfig   `yaml:"logging"`
 }
 
 type ServerConfig struct {
@@ -29,18 +29,18 @@ type ServerConfig struct {
 }
 
 type UPnPConfig struct {
-	FriendlyName           string `yaml:"friendly_name"`
-	Manufacturer           string `yaml:"manufacturer"`
-	ModelName              string `yaml:"model_name"`
-	UUID                   string `yaml:"uuid"`
-	AdvertiseIntervalSecs  int    `yaml:"advertise_interval_seconds"`
-	AutoBaseURL            bool   `yaml:"auto_base_url"`
+	FriendlyName          string `yaml:"friendly_name"`
+	Manufacturer          string `yaml:"manufacturer"`
+	ModelName             string `yaml:"model_name"`
+	UUID                  string `yaml:"uuid"`
+	AdvertiseIntervalSecs int    `yaml:"advertise_interval_seconds"`
+	AutoBaseURL           bool   `yaml:"auto_base_url"`
 }
 
 type HAConfig struct {
-	URL             string `yaml:"url"`
-	Token           string `yaml:"token"`
-	TargetEntityID  string `yaml:"target_entity_id"`
+	URL            string `yaml:"url"`
+	Token          string `yaml:"token"`
+	TargetEntityID string `yaml:"target_entity_id"`
 }
 
 type MAAdapterConfig struct {
@@ -73,10 +73,11 @@ type StreamConfig struct {
 }
 
 type SecurityConfig struct {
-	RequireStreamToken  bool     `yaml:"require_stream_token"`
-	AllowedSourceCIDRs  []string `yaml:"allowed_source_cidrs"`
-	BlockedSourceCIDRs  []string `yaml:"blocked_source_cidrs"`
-	AllowPublicSources  bool     `yaml:"allow_public_sources"`
+	RequireStreamToken   bool     `yaml:"require_stream_token"`
+	AllowedSourceCIDRs   []string `yaml:"allowed_source_cidrs"`
+	BlockedSourceCIDRs   []string `yaml:"blocked_source_cidrs"`
+	AllowPublicSources   bool     `yaml:"allow_public_sources"`
+	AllowLoopbackSources bool     `yaml:"allow_loopback_sources"`
 }
 
 type LoggingConfig struct {
@@ -160,7 +161,7 @@ func DefaultConfig() Config {
 				"172.16.0.0/12",
 			},
 			BlockedSourceCIDRs: []string{
-				"127.0.0.0/8",
+
 				"169.254.0.0/16",
 			},
 			AllowPublicSources: true,

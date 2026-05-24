@@ -3,10 +3,10 @@ package stream
 import "sync"
 
 type RingBuffer struct {
-	buf    []byte
-	size   int
-	write  int
-	mu     sync.RWMutex
+	buf   []byte
+	size  int
+	write int
+	mu    sync.RWMutex
 }
 
 func NewRingBuffer(size int) *RingBuffer {
@@ -29,7 +29,17 @@ func (rb *RingBuffer) Read(offset int64, buf []byte) (int, error) {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 
+	if offset < 0 {
+		offset = 0
+	}
 	totalWritten := rb.write
+	oldest := int64(0)
+	if totalWritten > rb.size {
+		oldest = int64(totalWritten - rb.size)
+	}
+	if offset < oldest {
+		offset = oldest
+	}
 	if offset >= int64(totalWritten) {
 		return 0, nil
 	}
@@ -45,6 +55,12 @@ func (rb *RingBuffer) Read(offset int64, buf []byte) (int, error) {
 	}
 
 	return available, nil
+}
+
+func (rb *RingBuffer) Size() int {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	return rb.size
 }
 
 func (rb *RingBuffer) WritePosition() int64 {

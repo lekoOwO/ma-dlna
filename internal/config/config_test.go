@@ -159,13 +159,18 @@ func TestValidateSourceURI(t *testing.T) {
 		t.Errorf("public IP should be allowed when AllowPublicSources=true with no CIDR restrictions: %v", err)
 	}
 
-	// Test that AllowedSourceCIDRs takes precedence over AllowPublicSources
+	// Test that AllowedSourceCIDRs gates private IPs, AllowPublicSources gates public IPs
 	sec3 := SecurityConfig{
 		AllowedSourceCIDRs: []string{"192.168.0.0/16"},
 		AllowPublicSources: true,
 	}
-	if err := sec3.ValidateSourceURI("http://8.8.8.8/song.mp3"); err == nil {
-		t.Error("public IP should be rejected when not in AllowedSourceCIDRs")
+	// Private IP not in allowed CIDRs → rejected
+	if err := sec3.ValidateSourceURI("http://10.0.0.5/song.mp3"); err == nil {
+		t.Error("private IP should be rejected when not in AllowedSourceCIDRs")
+	}
+	// Public IP with AllowPublicSources → allowed
+	if err := sec3.ValidateSourceURI("http://8.8.8.8/song.mp3"); err != nil {
+		t.Errorf("public IP should be allowed when AllowPublicSources=true: %v", err)
 	}
 }
 

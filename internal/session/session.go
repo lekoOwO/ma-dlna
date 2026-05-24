@@ -34,18 +34,18 @@ type Metadata struct {
 }
 
 type Session struct {
-	ID            string    `json:"session_id"`
-	SourceURI     string    `json:"source_uri"`
-	MetadataRaw   string    `json:"metadata_raw"`
-	Metadata      *Metadata `json:"metadata_parsed"`
-	State         State     `json:"state"`
-	StreamURL     string    `json:"stream_url"`
-	StreamToken   string    `json:"-"`
-	NextURI       string    `json:"-"`
-	PlayMode      string    `json:"-"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Error         string    `json:"error,omitempty"`
+	ID          string    `json:"session_id"`
+	SourceURI   string    `json:"source_uri"`
+	MetadataRaw string    `json:"metadata_raw"`
+	Metadata    *Metadata `json:"metadata_parsed"`
+	State       State     `json:"state"`
+	StreamURL   string    `json:"stream_url"`
+	StreamToken string    `json:"-"`
+	NextURI     string    `json:"-"`
+	PlayMode    string    `json:"-"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Error       string    `json:"error,omitempty"`
 }
 
 const maxSessions = 64
@@ -194,7 +194,10 @@ func (m *Manager) SetError(sessionID string, errMsg string) {
 func (m *Manager) Get(sessionID string) *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.sessions[sessionID]
+	if s, ok := m.sessions[sessionID]; ok {
+		return s.snapshot()
+	}
+	return nil
 }
 
 func (m *Manager) ActiveSession() *Session {
@@ -202,7 +205,7 @@ func (m *Manager) ActiveSession() *Session {
 	defer m.mu.RUnlock()
 	for _, s := range m.sessions {
 		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded || s.State == StatePaused || s.State == StateError {
-			return s
+			return s.snapshot()
 		}
 	}
 	return nil
@@ -219,9 +222,18 @@ func (m *Manager) AllSessions() []*Session {
 	defer m.mu.RUnlock()
 	result := make([]*Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		result = append(result, s)
+		result = append(result, s.snapshot())
 	}
 	return result
+}
+
+func (s *Session) snapshot() *Session {
+	copy := *s
+	if s.Metadata != nil {
+		m := *s.Metadata
+		copy.Metadata = &m
+	}
+	return &copy
 }
 
 func (m *Manager) StartStream(sessionID, sourceURI string) {

@@ -552,9 +552,9 @@ func (w *testRespWriter) WriteHeader(status int) {
 
 func TestSCPDXMLWellFormed(t *testing.T) {
 	scpds := map[string]string{
-		"AVTransport":        avTransportSCPD,
-		"RenderingControl":   renderingControlSCPD,
-		"ConnectionManager":  connectionManagerSCPD,
+		"AVTransport":       avTransportSCPD,
+		"RenderingControl":  renderingControlSCPD,
+		"ConnectionManager": connectionManagerSCPD,
 	}
 	for name, scpdXML := range scpds {
 		t.Run(name, func(t *testing.T) {
@@ -691,8 +691,12 @@ func TestSSDPAliveMessageFields(t *testing.T) {
 			if !strings.Contains(msg, "NT: "+nt) {
 				t.Errorf("missing NT: %s", nt)
 			}
-			if !strings.Contains(msg, "USN: uuid:test-ssdp::"+nt) {
-				t.Errorf("missing USN for target %s", nt)
+			expectedUSN := "uuid:test-ssdp::" + nt
+			if strings.HasPrefix(nt, "uuid:") {
+				expectedUSN = nt
+			}
+			if !strings.Contains(msg, "USN: "+expectedUSN) {
+				t.Errorf("missing USN for target %s, expected USN: %s", nt, expectedUSN)
 			}
 			if !strings.Contains(msg, "LOCATION: http://192.168.1.1:8787/device.xml") {
 				t.Error("missing LOCATION header")

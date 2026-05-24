@@ -124,6 +124,8 @@ func TestPauseResumePosition(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -224,6 +226,8 @@ func TestSeekRepositions(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"
@@ -294,6 +298,8 @@ func TestDLNAClientFullSession(t *testing.T) {
 	defer haServer.Close()
 
 	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
 	cfg.HA.URL = haServer.URL
 	cfg.HA.Token = "test-token"
 	cfg.HA.TargetEntityID = "media_player.test"

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -122,11 +123,11 @@ func statusHandler(cfg *config.Config, mgr *session.Manager, streamer *stream.St
 	return func(w http.ResponseWriter, r *http.Request) {
 		active := mgr.ActiveSession()
 		resp := map[string]any{
-			"status":            "ok",
+			"status":             "ok",
 			"upnp_friendly_name": cfg.UPnP.FriendlyName,
-			"http_base_url":     cfg.Server.PublicBaseURL,
-			"sessions":          mgr.Count(),
-			"clients":           streamer.TotalClients(),
+			"http_base_url":      cfg.Server.PublicBaseURL,
+			"sessions":           mgr.Count(),
+			"clients":            streamer.TotalClients(),
 		}
 		if active != nil {
 			resp["active_session_id"] = active.ID
@@ -138,7 +139,26 @@ func statusHandler(cfg *config.Config, mgr *session.Manager, streamer *stream.St
 
 func sessionsHandler(mgr *session.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.AllSessions())
+		sessions := mgr.AllSessions()
+		// Redact tokens from stream URLs in API output
+		redacted := make([]map[string]any, 0, len(sessions))
+		for _, s := range sessions {
+			url := s.StreamURL
+			if i := strings.IndexByte(url, '?'); i >= 0 {
+				url = url[:i] + "?token=***"
+			}
+			redacted = append(redacted, map[string]any{
+				"session_id":    s.ID,
+				"source_uri":    s.SourceURI,
+				"metadata":      s.Metadata,
+				"state":         s.State,
+				"stream_url":    url,
+				"created_at":    s.CreatedAt,
+				"updated_at":    s.UpdatedAt,
+				"error":         s.Error,
+			})
+		}
+		writeJSON(w, http.StatusOK, redacted)
 	}
 }
 
@@ -150,7 +170,20 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, s)
+		url := s.StreamURL
+		if i := strings.IndexByte(url, '?'); i >= 0 {
+			url = url[:i] + "?token=***"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id":  s.ID,
+			"source_uri":  s.SourceURI,
+			"metadata":    s.Metadata,
+			"state":       s.State,
+			"stream_url":  url,
+			"created_at":  s.CreatedAt,
+			"updated_at":  s.UpdatedAt,
+			"error":       s.Error,
+		})
 	}
 }
 
@@ -160,8 +193,12 @@ func httpLogMiddleware(next http.Handler) http.Handler {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 			r.Body = io.NopCloser(bytes.NewReader(body))
+			truncated := string(body)
+			if len(truncated) > 256 {
+				truncated = truncated[:256]
+			}
 			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr,
-				"body", string(body)[:min(len(body), 512)])
+				"body_bytes", len(body))
 		} else {
 			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		}

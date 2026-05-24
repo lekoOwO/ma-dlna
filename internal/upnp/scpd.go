@@ -219,8 +219,6 @@ const renderingControlSCPD = `<?xml version="1.0"?>
         <argument><name>DesiredMute</name><direction>in</direction><relatedStateVariable>Mute</relatedStateVariable></argument>
       </argumentList>
     </action>
-    <action>
-    </action>
   </actionList>
   <serviceStateTable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>
@@ -268,8 +266,6 @@ const connectionManagerSCPD = `<?xml version="1.0"?>
         <argument><name>Direction</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable></argument>
         <argument><name>Status</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable></argument>
       </argumentList>
-    </action>
-    <action>
     </action>
   </actionList>
   <serviceStateTable>

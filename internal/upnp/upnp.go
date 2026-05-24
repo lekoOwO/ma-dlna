@@ -32,23 +32,23 @@ type eventSubscriber struct {
 }
 
 type Handler struct {
-	cfg        *config.Config
-	sessionMgr *session.Manager
-	maAdapter  *maadapter.Adapter
-	mu         sync.RWMutex
-	volume     int
-	muted      bool
-	ssdpCancel context.CancelFunc
+	cfg         *config.Config
+	sessionMgr  *session.Manager
+	maAdapter   *maadapter.Adapter
+	mu          sync.RWMutex
+	volume      int
+	muted       bool
+	ssdpCancel  context.CancelFunc
 	deviceUUID  string
 	subscribers map[string]*eventSubscriber
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maadapter.Adapter) *Handler {
 	return &Handler{
-		cfg:        cfg,
-		sessionMgr: sessionMgr,
-		maAdapter:  maAdapter,
-		volume:     50,
+		cfg:         cfg,
+		sessionMgr:  sessionMgr,
+		maAdapter:   maAdapter,
+		volume:      50,
 		deviceUUID:  cfg.UPnP.UUID,
 		subscribers: make(map[string]*eventSubscriber),
 	}
@@ -309,6 +309,12 @@ func matchesSearchTarget(body string) bool {
 }
 
 func (h *Handler) mserveResponse(base, st string) string {
+	usn := h.deviceUUID + "::" + st
+	if strings.HasPrefix(st, "uuid:") {
+		usn = st
+	} else if st == "ssdp:all" {
+		usn = h.deviceUUID + "::upnp:rootdevice"
+	}
 	return fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"CACHE-CONTROL: max-age=%d\r\n"+
@@ -316,14 +322,13 @@ func (h *Handler) mserveResponse(base, st string) string {
 			"LOCATION: %s/device.xml\r\n"+
 			"SERVER: %s\r\n"+
 			"ST: %s\r\n"+
-			"USN: %s::%s\r\n"+
+			"USN: %s\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
 		serverString(),
 		st,
-		h.deviceUUID,
-		st,
+		usn,
 	)
 }
 
@@ -382,6 +387,10 @@ func (h *Handler) broadcastSSDP(msgFn func(string, string) string) {
 }
 
 func (h *Handler) ssdpAliveMsg(base, nt string) string {
+	usn := h.deviceUUID + "::" + nt
+	if strings.HasPrefix(nt, "uuid:") {
+		usn = nt
+	}
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
@@ -390,28 +399,30 @@ func (h *Handler) ssdpAliveMsg(base, nt string) string {
 			"NT: %s\r\n"+
 			"NTS: ssdp:alive\r\n"+
 			"SERVER: %s\r\n"+
-			"USN: %s::%s\r\n"+
+			"USN: %s\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
 		nt,
 		serverString(),
-		h.deviceUUID,
-		nt,
+		usn,
 	)
 }
 
 func (h *Handler) ssdpByeByeMsg(_ string, nt string) string {
+	usn := h.deviceUUID + "::" + nt
+	if strings.HasPrefix(nt, "uuid:") {
+		usn = nt
+	}
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
 			"HOST: 239.255.255.250:1900\r\n"+
 			"NT: %s\r\n"+
 			"NTS: ssdp:byebye\r\n"+
-			"USN: %s::%s\r\n"+
+			"USN: %s\r\n"+
 			"\r\n",
 		nt,
-		h.deviceUUID,
-		nt,
+		usn,
 	)
 }
 
@@ -588,10 +599,10 @@ func initialEventBody(service string) string {
 		return `<?xml version="1.0"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
-    <SourceProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*</SourceProtocolInfo>
+    <SinkProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*</SinkProtocolInfo>
   </e:property>
   <e:property>
-    <SinkProtocolInfo></SinkProtocolInfo>
+    <SourceProtocolInfo></SourceProtocolInfo>
   </e:property>
   <e:property>
     <CurrentConnectionIDs>0</CurrentConnectionIDs>
@@ -648,7 +659,7 @@ func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML s
 		req.Header.Set("NT", "upnp:event")
 		req.Header.Set("NTS", "upnp:propchange")
 		req.Header.Set("SID", sub.sid)
-		req.Header.Set("SEQ", fmt.Sprintf("%d", sub.seq))
+		req.Header.Set("SEQ", fmt.Sprintf("%d", seq))
 		req.Header.Set("SERVER", serverString())
 
 		client := &http.Client{Timeout: 5 * time.Second}
@@ -658,7 +669,7 @@ func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML s
 			continue
 		}
 		resp.Body.Close()
-		slog.Debug("State change NOTIFY sent", "service", sub.service, "url", u, "seq", sub.seq)
+		slog.Debug("State change NOTIFY sent", "service", sub.service, "url", u, "seq", seq)
 	}
 }
 
@@ -711,7 +722,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	action := extractSOAPAction(body)
 
-	slog.Debug("AVTransport SOAP request", "body", string(body))
 	slog.Info("AVTransport action", "action", action)
 
 	var response string
@@ -723,7 +733,12 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		metadata := extractSOAPField(body, "CurrentURIMetaData")
 
 		slog.Info("SetAVTransportURI", "uri", safeURL(uri), "instance_id", instanceID)
-		h.cfg.Security.ValidateOrLog(uri)
+		if err := h.cfg.Security.ValidateOrReject(uri); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.Write([]byte(soapFaultResponse("714", "Illegal MIME-Type or source URI rejected")))
+			return
+		}
 		h.sessionMgr.Create(uri, metadata)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -733,7 +748,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
-			slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", active.StreamURL)
+			slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", safeURL(active.StreamURL))
 			h.sessionMgr.Play(active.ID)
 			h.sessionMgr.StartStream(active.ID, active.SourceURI)
 			if err := h.maAdapter.PlayMedia(
@@ -741,7 +756,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				active.StreamURL,
 				contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
 			); err != nil {
-				slog.Error("PlayMedia failed, setting session error", "session_id", active.ID, "error", err)
+				slog.Error("PlayMedia failed, stopping stream", "session_id", active.ID, "error", err)
+				h.sessionMgr.Stop(active.ID)
 				h.sessionMgr.SetError(active.ID, err.Error())
 			} else {
 				go h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
@@ -757,11 +773,11 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
+			h.sessionMgr.Stop(active.ID)
 			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
-				slog.Error("Stop failed, setting session error", "session_id", active.ID, "error", err)
+				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
 			} else {
-				h.sessionMgr.Stop(active.ID)
 				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 			}
 		}
@@ -773,11 +789,14 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
+			// Always pause locally regardless of HA result
+			if active.State == session.StatePlaying || active.State == session.StateStarting {
+				h.sessionMgr.Pause(active.ID)
+			}
 			if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
-				slog.Error("Pause failed, setting session error", "session_id", active.ID, "error", err)
+				slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
 			} else {
-				h.sessionMgr.Pause(active.ID)
 				go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 			}
 		}
@@ -1245,10 +1264,15 @@ func formatDurationUPnP(d time.Duration) string {
 }
 
 func safeURL(raw string) string {
+	// Strip userinfo (user:pass@)
 	if i := strings.Index(raw, "://"); i > 0 {
 		if j := strings.Index(raw[i+3:], "@"); j > 0 {
-			return raw[:i+3] + "***@" + raw[i+3+j+1:]
+			raw = raw[:i+3] + "***@" + raw[i+3+j+1:]
 		}
+	}
+	// Strip query string (contains token, signatures, etc.)
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		raw = raw[:i] + "?..."
 	}
 	return raw
 }
