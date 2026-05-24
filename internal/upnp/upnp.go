@@ -135,7 +135,6 @@ func (h *Handler) mserve(ctx context.Context) {
 	}
 	slog.Info("M-SEARCH listening", "interfaces", len(conns))
 
-	buf := make([]byte, 4096)
 	type msg struct {
 		data       []byte
 		remoteAddr *net.UDPAddr
@@ -145,6 +144,7 @@ func (h *Handler) mserve(ctx context.Context) {
 
 	for _, conn := range conns {
 		go func(c *net.UDPConn) {
+			buf := make([]byte, 4096)
 			for {
 				select {
 				case <-ctx.Done():
@@ -178,15 +178,28 @@ func (h *Handler) mserve(ctx context.Context) {
 			if !strings.Contains(body, "M-SEARCH") {
 				continue
 			}
-			if !strings.Contains(body, "urn:schemas-upnp-org:device:MediaRenderer:1") {
+			if !matchesSearchTarget(body) {
 				continue
 			}
-			slog.Debug("M-SEARCH received", "from", m.remoteAddr.String())
+			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String())
 			resp := h.mserveResponse()
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
-			slog.Debug("M-SEARCH response sent", "to", m.remoteAddr.String())
 		}
 	}
+}
+
+func matchesSearchTarget(body string) bool {
+	for _, st := range []string{
+		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		"ssdp:all",
+		"upnp:rootdevice",
+		"urn:schemas-upnp-org:service:AVTransport:1",
+	} {
+		if strings.Contains(body, st) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) mserveResponse() string {
@@ -230,20 +243,21 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 }
 
 func (h *Handler) broadcastSSDP(msg string) {
-	for _, iface := range multicastInterfaces() {
+	ifaces := multicastInterfaces()
+	slog.Info("SSDP broadcast", "interfaces", len(ifaces))
+	for _, iface := range ifaces {
 		ip := firstIPv4(iface)
 		if ip == nil {
 			continue
 		}
 		conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: ip}, ssdpAddr)
 		if err != nil {
-			slog.Debug("SSDP dial failed", "iface", iface.Name, "error", err)
+			slog.Warn("SSDP dial failed", "iface", iface.Name, "ip", ip, "error", err)
 			continue
 		}
 		conn.Write([]byte(msg))
 		conn.Close()
 	}
-	slog.Debug("SSDP broadcast done", "interfaces", len(multicastInterfaces()))
 }
 
 func (h *Handler) ssdpAliveMessage() string {
