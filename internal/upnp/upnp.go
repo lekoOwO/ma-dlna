@@ -691,17 +691,24 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 </u:GetTransportInfoResponse>`, state, status))
 
 	case "GetPositionInfo":
-		response = avTransportResponse(action, `
+		relTime := "00:00:00"
+		if h.sessionMgr != nil {
+			if active := h.sessionMgr.ActiveSession(); active != nil {
+				elapsed := h.sessionMgr.Elapsed(active.ID)
+				relTime = formatDurationUPnP(elapsed)
+			}
+		}
+		response = avTransportResponse(action, fmt.Sprintf(`
 <u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
   <Track>1</Track>
   <TrackDuration>00:00:00</TrackDuration>
   <TrackMetaData></TrackMetaData>
   <TrackURI></TrackURI>
-  <RelTime>00:00:00</RelTime>
+  <RelTime>%s</RelTime>
   <AbsTime>00:00:00</AbsTime>
   <RelCount>2147483647</RelCount>
   <AbsCount>2147483647</AbsCount>
-</u:GetPositionInfoResponse>`)
+</u:GetPositionInfoResponse>`, relTime))
 
 	case "GetMediaInfo":
 		active := h.sessionMgr.ActiveSession()
@@ -976,6 +983,13 @@ func soapFaultResponse(errorCode, errorDescription string) string {
     </s:Fault>
   </s:Body>
 </s:Envelope>`, errorCode, errorDescription)
+}
+
+func formatDurationUPnP(d time.Duration) string {
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 func safeURL(raw string) string {

@@ -223,6 +223,10 @@ func (m *Manager) StartStream(sessionID, sourceURI string) {
 	m.streamer.Start(sessionID, sourceURI)
 }
 
+func (m *Manager) Elapsed(sessionID string) time.Duration {
+	return m.streamer.Elapsed(sessionID)
+}
+
 func (m *Manager) ValidateToken(sessionID, token string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
