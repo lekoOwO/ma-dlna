@@ -522,11 +522,15 @@ func (h *Handler) sendInitialEvent(callback, sid, service string) {
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			slog.Debug("Event NOTIFY failed", "url", u, "error", err)
+			slog.Warn("Event NOTIFY network error", "url", u, "error", err)
 			continue
 		}
 		resp.Body.Close()
-		slog.Debug("Initial event sent", "url", u, "sid", sid)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			slog.Debug("Initial event sent", "url", u, "sid", sid, "status", resp.StatusCode)
+		} else {
+			slog.Warn("Event NOTIFY rejected", "url", u, "sid", sid, "status", resp.StatusCode)
+		}
 	}
 }
 
