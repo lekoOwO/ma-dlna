@@ -187,7 +187,7 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	}
 	ft := st.ffmpegTime.Load()
 	if ft > 0 {
-		return time.Duration(ft)
+		return st.resumeOffset + time.Duration(ft)
 	}
 	if st.startTime.IsZero() {
 		return 0
