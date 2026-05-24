@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -451,13 +452,9 @@ func (st *stream) readProgress(stderr io.Reader) {
 	var errLines []string
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "out_time=") {
-			if t, err := time.Parse("15:04:05.000000", strings.TrimPrefix(line, "out_time=")); err == nil {
-				ns := int64(t.Hour())*int64(time.Hour) +
-					int64(t.Minute())*int64(time.Minute) +
-					int64(t.Second())*int64(time.Second) +
-					int64(t.Nanosecond())
-				st.ffmpegTime.Store(ns)
+		if strings.HasPrefix(line, "out_time_ms=") {
+			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_ms="), 10, 64); err == nil {
+				st.ffmpegTime.Store(ms * int64(time.Millisecond))
 			}
 		} else if strings.HasPrefix(line, "progress=") {
 			// progress=continue line, skip
