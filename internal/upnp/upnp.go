@@ -387,6 +387,7 @@ func (h *Handler) ssdpByeByeMsg(_ string) string {
 
 func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
 	base := h.baseURLForRequest(r)
+	slog.Debug("Device description served", "remote", r.RemoteAddr, "base", base)
 	xml := fmt.Sprintf(`<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
   <specVersion>
@@ -459,6 +460,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		uri := extractSOAPField(body, "CurrentURI")
 		metadata := extractSOAPField(body, "CurrentURIMetaData")
 
+		slog.Info("SetAVTransportURI", "uri", safeURL(uri), "instance_id", instanceID)
 		h.sessionMgr.Create(uri, metadata)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -468,12 +470,15 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.sessionMgr.ActiveSession()
 		if active != nil {
+			slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", active.StreamURL)
 			h.sessionMgr.Play(active.ID)
 			h.maAdapter.PlayMedia(
 				h.cfg.HA.TargetEntityID,
 				active.StreamURL,
 				"music",
 			)
+		} else {
+			slog.Warn("Play with no active session")
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -803,6 +808,15 @@ func soapFaultResponse(errorCode, errorDescription string) string {
     </s:Fault>
   </s:Body>
 </s:Envelope>`, errorCode, errorDescription)
+}
+
+func safeURL(raw string) string {
+	if i := strings.Index(raw, "://"); i > 0 {
+		if j := strings.Index(raw[i+3:], "@"); j > 0 {
+			return raw[:i+3] + "***@" + raw[i+3+j+1:]
+		}
+	}
+	return raw
 }
 
 func escapeXML(s string) string {

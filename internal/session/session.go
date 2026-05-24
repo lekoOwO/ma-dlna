@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +95,7 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 
 	m.sessions[id] = s
 
-	slog.Info("Session created", "session_id", id, "state", string(s.State))
+	slog.Info("Session created", "session_id", id, "source", safeURL(sourceURI), "stream_url", s.StreamURL)
 	return s
 }
 
@@ -269,3 +270,12 @@ func parseDIDL(xmlStr string) *Metadata {
 }
 
 var ErrNotFound = errors.New("session not found")
+
+func safeURL(raw string) string {
+	if i := strings.Index(raw, "://"); i > 0 {
+		if j := strings.Index(raw[i+3:], "@"); j > 0 {
+			return raw[:i+3] + "***@" + raw[i+3+j+1:]
+		}
+	}
+	return raw
+}

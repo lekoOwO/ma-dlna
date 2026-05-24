@@ -243,6 +243,7 @@ func (st *stream) run(ctx context.Context) {
 	defer st.active.Store(false)
 
 	args := st.buildFFmpegArgs()
+	slog.Debug("ffmpeg command", "args", args)
 	slog.Info("Starting ffmpeg", "session_id", st.sessionID)
 
 	st.cmd = exec.CommandContext(ctx, "ffmpeg", args...)

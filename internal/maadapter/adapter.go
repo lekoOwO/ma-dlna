@@ -70,6 +70,8 @@ func (a *Adapter) callHAService(service string, payload map[string]any) error {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
+	slog.Debug("HA API call", "url", url, "payload", string(body))
+
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)

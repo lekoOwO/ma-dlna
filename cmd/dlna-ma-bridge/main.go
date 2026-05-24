@@ -33,6 +33,9 @@ func main() {
 	setupLogging(cfg)
 
 	slog.Info("Starting dlna-ma-bridge", "version", "0.1.0")
+	slog.Debug("Config", "ha_url", cfg.HA.URL, "target", cfg.HA.TargetEntityID,
+		"output", cfg.FFmpeg.OutputFormat, "codec", cfg.FFmpeg.Codec, "bitrate", cfg.FFmpeg.Bitrate,
+		"auto_base_url", cfg.UPnP.AutoBaseURL, "public_base_url", cfg.Server.PublicBaseURL)
 
 	streamer := stream.NewStreamer(cfg)
 	sessionMgr := session.NewManager(cfg, streamer)
@@ -48,9 +51,11 @@ func main() {
 	mux.HandleFunc("/sessions/", sessionByIDHandler(sessionMgr))
 	upnpHandler.RegisterUPnPEndpoints(mux)
 
+	wrapped := httpLogMiddleware(mux)
+
 	httpServer := &http.Server{
 		Addr:         net.JoinHostPort(cfg.Server.BindHost, fmt.Sprintf("%d", cfg.Server.HTTPPort)),
-		Handler:      mux,
+		Handler:      wrapped,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
@@ -138,6 +143,13 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, s)
 	}
+}
+
+func httpLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
