@@ -126,7 +126,7 @@ func (s *Streamer) Pause(sessionID string) time.Duration {
 	if !ok {
 		return 0
 	}
-	elapsed := time.Since(st.startTime)
+	elapsed := s.Elapsed(sessionID)
 	s.restartWithOffset(st, sessionID, elapsed)
 	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
 	return elapsed
@@ -415,6 +415,7 @@ func (st *stream) buildFFmpegArgs() []string {
 	}
 
 	if st.resumeOffset > 0 {
+		slog.Debug("Seek offset applied", "session_id", st.sessionID, "offset", st.resumeOffset)
 		args = append(args, "-ss", formatDuration(st.resumeOffset))
 	}
 
