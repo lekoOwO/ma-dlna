@@ -635,6 +635,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		metadata := extractSOAPField(body, "CurrentURIMetaData")
 
 		slog.Info("SetAVTransportURI", "uri", safeURL(uri), "instance_id", instanceID)
+		h.cfg.Security.ValidateOrLog(uri)
 		h.sessionMgr.Create(uri, metadata)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
