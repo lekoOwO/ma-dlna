@@ -457,14 +457,16 @@ func (st *stream) readProgress(stderr io.Reader) {
 			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_ms="), 10, 64); err == nil {
 				st.ffmpegTime.Store(ms * int64(time.Millisecond))
 			}
-		} else if strings.HasPrefix(line, "progress=") {
-			// progress=continue line, skip
-		} else if line != "" && !strings.HasPrefix(line, "frame=") &&
-			!strings.HasPrefix(line, "fps=") && !strings.HasPrefix(line, "stream_") &&
-			!strings.HasPrefix(line, "bitrate=") && !strings.HasPrefix(line, "total_size=") &&
-			!strings.HasPrefix(line, "out_time_ms=") && !strings.HasPrefix(line, "out_time_us=") &&
-			!strings.HasPrefix(line, "speed=") && !strings.HasPrefix(line, "dup_frames=") &&
-			!strings.HasPrefix(line, "drop_frames=") {
+		} else if strings.HasPrefix(line, "out_time=") {
+			// Fallback for ffmpeg versions without out_time_ms
+			if t, err := time.Parse("15:04:05.000000", strings.TrimPrefix(line, "out_time=")); err == nil {
+				ns := int64(t.Hour())*int64(time.Hour) +
+					int64(t.Minute())*int64(time.Minute) +
+					int64(t.Second())*int64(time.Second) +
+					int64(t.Nanosecond())
+				st.ffmpegTime.Store(ns)
+			}
+		} else if !isProgressLine(line) {
 			errLines = append(errLines, line)
 			if len(errLines) > 10 {
 				errLines = errLines[len(errLines)-10:]
@@ -474,6 +476,24 @@ func (st *stream) readProgress(stderr io.Reader) {
 	if len(errLines) > 0 {
 		slog.Warn("ffmpeg stderr", "session_id", st.sessionID, "output", strings.Join(errLines, "\n"))
 	}
+}
+
+var progressKeys = []string{
+	"progress=", "frame=", "fps=", "stream_", "bitrate=", "total_size=",
+	"out_time=", "out_time_ms=", "out_time_us=",
+	"speed=", "dup_frames=", "drop_frames=",
+}
+
+func isProgressLine(line string) bool {
+	if line == "" {
+		return true
+	}
+	for _, p := range progressKeys {
+		if strings.HasPrefix(line, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func formatDuration(d time.Duration) string {
