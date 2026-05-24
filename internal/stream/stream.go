@@ -85,6 +85,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 	}
 	st.active.Store(true)
 	st.startTime = time.Now()
+	st.resumeOffset = 0
 	s.streams[sessionID] = st
 
 	go st.run(ctx)
@@ -180,7 +181,7 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if !ok || st.startTime.IsZero() {
 		return 0
 	}
-	return time.Since(st.startTime)
+	return st.resumeOffset + time.Since(st.startTime)
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {
