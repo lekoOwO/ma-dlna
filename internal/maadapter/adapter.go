@@ -79,6 +79,28 @@ func (a *Adapter) SetVolume(targetEntity string, volume int) error {
 	})
 }
 
+func bodyRedacted(body []byte) string {
+	s := string(body)
+	// Strip token=... from URLs in JSON
+	for _, key := range []string{`"media_id":"`, `"media_content_id":"`} {
+		if i := strings.Index(s, key); i >= 0 {
+			start := i + len(key)
+			if j := strings.IndexByte(s[start:], '"'); j >= 0 {
+				url := s[start : start+j]
+				s = s[:start] + sanitizeURL(url) + s[start+j:]
+			}
+		}
+	}
+	return s
+}
+
+func sanitizeURL(u string) string {
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		return u[:i] + "?token=***"
+	}
+	return u
+}
+
 func (a *Adapter) callHAService(service string, payload map[string]any) error {
 	// HA REST API expects /api/services/{domain}/{service}, but config uses
 	// domain.service notation (consistent with HA YAML). Replace last dot with /.
@@ -93,7 +115,7 @@ func (a *Adapter) callHAService(service string, payload map[string]any) error {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	slog.Debug("HA API call", "url", url, "payload", string(body))
+	slog.Debug("HA API call", "url", strings.Replace(url, a.cfg.HA.Token, "***", 1), "payload", bodyRedacted(body))
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {

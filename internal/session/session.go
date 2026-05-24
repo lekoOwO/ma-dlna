@@ -103,7 +103,7 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 
 	m.sessions[id] = s
 
-	slog.Info("Session created", "session_id", id, "source", safeURL(sourceURI), "stream_url", s.StreamURL)
+	slog.Info("Session created", "session_id", id, "source", safeURL(sourceURI), "stream_url", safeURL(s.StreamURL))
 	return s
 }
 
