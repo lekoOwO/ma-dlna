@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/leko/ma-dlna/internal/config"
@@ -68,7 +69,13 @@ func (a *Adapter) callWithFallback(primary, fallback string, payload map[string]
 }
 
 func (a *Adapter) callHAService(service string, payload map[string]any) error {
-	url := fmt.Sprintf("%s/api/services/%s", a.cfg.HA.URL, service)
+	// HA REST API expects /api/services/{domain}/{service}, but config uses
+	// domain.service notation (consistent with HA YAML). Replace last dot with /.
+	apiPath := service
+	if i := strings.LastIndex(service, "."); i > 0 {
+		apiPath = service[:i] + "/" + service[i+1:]
+	}
+	url := fmt.Sprintf("%s/api/services/%s", a.cfg.HA.URL, apiPath)
 
 	body, err := json.Marshal(payload)
 	if err != nil {

@@ -82,7 +82,7 @@ func TestStopPayload(t *testing.T) {
 	cfg.MAAdapter.StopService = "media_player.media_stop"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/services/media_player.media_stop" {
+		if r.URL.Path != "/api/services/media_player/media_stop" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 
@@ -112,7 +112,7 @@ func TestPausePayload(t *testing.T) {
 	cfg.MAAdapter.PauseService = "media_player.media_pause"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/services/media_player.media_pause" {
+		if r.URL.Path != "/api/services/media_player/media_pause" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -182,7 +182,7 @@ func TestFallbackPlayService(t *testing.T) {
 	cfg.MAAdapter.FallbackPlayService = "media_player.play_media"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/services/media_player.play_media" {
+		if r.URL.Path != "/api/services/media_player/play_media" {
 			t.Errorf("expected fallback service, got path: %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
