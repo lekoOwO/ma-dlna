@@ -255,7 +255,7 @@ func (h *Handler) mserve(ctx context.Context) {
 
 			localIP := matchingIP(m.remoteAddr.IP)
 			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "local_ip", localIP)
-			resp := h.mserveResponse(h.baseURLForIP(localIP))
+			resp := h.mserveResponse(h.baseURLForIP(localIP), st)
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
 		}
 	}
@@ -284,19 +284,21 @@ func matchesSearchTarget(body string) bool {
 	return false
 }
 
-func (h *Handler) mserveResponse(base string) string {
+func (h *Handler) mserveResponse(base, st string) string {
 	return fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"CACHE-CONTROL: max-age=%d\r\n"+
 			"EXT:\r\n"+
 			"LOCATION: %s/device.xml\r\n"+
 			"SERVER: Linux/6.8 UPnP/1.0 dlna-ma-bridge/0.1\r\n"+
-			"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
-			"USN: %s::urn:schemas-upnp-org:device:MediaRenderer:1\r\n"+
+			"ST: %s\r\n"+
+			"USN: %s::%s\r\n"+
 			"\r\n",
 		h.cfg.UPnP.AdvertiseIntervalSecs,
 		base,
+		st,
 		h.deviceUUID,
+		st,
 	)
 }
 
