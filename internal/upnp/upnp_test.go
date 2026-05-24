@@ -1,6 +1,7 @@
 package upnp
 
 import (
+	"encoding/xml"
 	"net"
 	"net/http"
 	"strings"
@@ -547,4 +548,78 @@ func (w *testRespWriter) Write(b []byte) (int, error) {
 
 func (w *testRespWriter) WriteHeader(status int) {
 	w.status = status
+}
+
+func TestSCPDXMLWellFormed(t *testing.T) {
+	scpds := map[string]string{
+		"AVTransport":        avTransportSCPD,
+		"RenderingControl":   renderingControlSCPD,
+		"ConnectionManager":  connectionManagerSCPD,
+	}
+	for name, scpdXML := range scpds {
+		t.Run(name, func(t *testing.T) {
+			decoder := xml.NewDecoder(strings.NewReader(scpdXML))
+			depth := 0
+			for {
+				tok, err := decoder.Token()
+				if err != nil {
+					break
+				}
+				switch tok.(type) {
+				case xml.StartElement:
+					depth++
+				case xml.EndElement:
+					depth--
+					if depth < 0 {
+						t.Error("unmatched closing tag")
+					}
+				}
+			}
+			if depth != 0 {
+				t.Errorf("unclosed tags: final depth=%d", depth)
+			}
+		})
+	}
+}
+
+func TestSCPDHasRequiredActions(t *testing.T) {
+	// AVTransport must declare all implemented actions
+	avtActions := []string{
+		"SetAVTransportURI", "Play", "Stop", "Pause",
+		"GetTransportInfo", "GetPositionInfo", "GetMediaInfo",
+		"Next", "Previous", "SetNextAVTransportURI", "SetPlayMode",
+		"Seek", "GetCurrentTransportActions", "GetDeviceCapabilities",
+		"GetTransportSettings",
+	}
+	for _, a := range avtActions {
+		if !strings.Contains(avTransportSCPD, "<name>"+a+"</name>") {
+			t.Errorf("AVTransport SCPD missing: %s", a)
+		}
+	}
+
+	// RCS should only have volume/mute
+	rcsActions := []string{"GetVolume", "SetVolume", "GetMute", "SetMute"}
+	for _, a := range rcsActions {
+		if !strings.Contains(renderingControlSCPD, "<name>"+a+"</name>") {
+			t.Errorf("RenderingControl SCPD missing: %s", a)
+		}
+	}
+	for _, a := range avtActions {
+		if strings.Contains(renderingControlSCPD, "<name>"+a+"</name>") {
+			t.Errorf("RenderingControl SCPD leaked AVTransport action: %s", a)
+		}
+	}
+
+	// CM should only have connection actions
+	cmActions := []string{"GetProtocolInfo", "GetCurrentConnectionIDs", "GetCurrentConnectionInfo"}
+	for _, a := range cmActions {
+		if !strings.Contains(connectionManagerSCPD, "<name>"+a+"</name>") {
+			t.Errorf("ConnectionManager SCPD missing: %s", a)
+		}
+	}
+	for _, a := range avtActions {
+		if strings.Contains(connectionManagerSCPD, "<name>"+a+"</name>") {
+			t.Errorf("ConnectionManager SCPD leaked AVTransport action: %s", a)
+		}
+	}
 }
