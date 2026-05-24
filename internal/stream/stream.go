@@ -170,6 +170,7 @@ func (s *Streamer) Resume(sessionID string) {
 	}
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
 	st.cancel = resumeCancel
+	st.startTime = time.Now()
 	go st.run(resumeCtx)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
 }
