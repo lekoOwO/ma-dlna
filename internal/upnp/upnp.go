@@ -471,9 +471,8 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("SERVER", serverString())
 		w.WriteHeader(http.StatusOK)
 
-		// Send initial event NOTIFY to CALLBACK URL — required by UPnP spec
 		if cb != "" {
-			go h.sendInitialEvent(cb, sid)
+			go h.sendInitialEvent(cb, sid, eventServiceFromPath(r.URL.Path))
 		}
 
 	case "UNSUBSCRIBE":
@@ -484,18 +483,24 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) sendInitialEvent(callback, sid string) {
+func eventServiceFromPath(path string) string {
+	switch {
+	case strings.Contains(path, "RenderingControl"):
+		return "RenderingControl"
+	case strings.Contains(path, "ConnectionManager"):
+		return "ConnectionManager"
+	default:
+		return "AVTransport"
+	}
+}
+
+func (h *Handler) sendInitialEvent(callback, sid, service string) {
 	urls := extractCallbackURLs(callback)
 	if len(urls) == 0 {
 		return
 	}
 
-	body := `<?xml version="1.0"?>
-<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-  <e:property>
-    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;STOPPED&quot;/&gt;&lt;TransportStatus val=&quot;OK&quot;/&gt;&lt;CurrentPlayMode val=&quot;NORMAL&quot;/&gt;&lt;TransportPlaySpeed val=&quot;1&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
-  </e:property>
-</e:propertyset>`
+	body := initialEventBody(service)
 
 	for _, u := range urls {
 		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
@@ -522,6 +527,38 @@ func (h *Handler) sendInitialEvent(callback, sid string) {
 		}
 		resp.Body.Close()
 		slog.Debug("Initial event sent", "url", u, "sid", sid)
+	}
+}
+
+func initialEventBody(service string) string {
+	switch service {
+	case "RenderingControl":
+		return `<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume val=&quot;50&quot; channel=&quot;Master&quot;/&gt;&lt;Mute val=&quot;0&quot; channel=&quot;Master&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+  </e:property>
+</e:propertyset>`
+	case "ConnectionManager":
+		return `<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <SourceProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*</SourceProtocolInfo>
+  </e:property>
+  <e:property>
+    <SinkProtocolInfo></SinkProtocolInfo>
+  </e:property>
+  <e:property>
+    <CurrentConnectionIDs>0</CurrentConnectionIDs>
+  </e:property>
+</e:propertyset>`
+	default: // AVTransport
+		return `<?xml version="1.0"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;STOPPED&quot;/&gt;&lt;TransportStatus val=&quot;OK&quot;/&gt;&lt;CurrentPlayMode val=&quot;NORMAL&quot;/&gt;&lt;TransportPlaySpeed val=&quot;1&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+  </e:property>
+</e:propertyset>`
 	}
 }
 
