@@ -27,18 +27,19 @@ type Streamer struct {
 }
 
 type stream struct {
-	sessionID string
-	sourceURI string
-	ringBuf   *RingBuffer
-	cmd       *exec.Cmd
-	cancel    context.CancelFunc
-	active    atomic.Bool
-	paused    atomic.Bool
-	clients   map[string]*clientWriter
-	clientsMu sync.Mutex
-	started   chan struct{}
-	err       error
-	ffmpegCfg config.FFmpegConfig
+	sessionID     string
+	sourceURI     string
+	ringBuf       *RingBuffer
+	cmd           *exec.Cmd
+	cancel        context.CancelFunc
+	active        atomic.Bool
+	clients       map[string]*clientWriter
+	clientsMu     sync.Mutex
+	started       chan struct{}
+	err           error
+	ffmpegCfg     config.FFmpegConfig
+	startTime     time.Time
+	resumeOffset  time.Duration
 }
 
 type clientWriter struct {
@@ -80,6 +81,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		ffmpegCfg: s.cfg.FFmpeg,
 	}
 	st.active.Store(true)
+	st.startTime = time.Now()
 	s.streams[sessionID] = st
 
 	go st.run(ctx)
@@ -110,31 +112,60 @@ func (s *Streamer) Stop(sessionID string) {
 	}
 }
 
-func (s *Streamer) Pause(sessionID string) {
+func (s *Streamer) Pause(sessionID string) time.Duration {
 	s.mu.Lock()
 	st, ok := s.streams[sessionID]
 	s.mu.Unlock()
 	if !ok {
-		return
+		return 0
 	}
-	st.paused.Store(true)
-	st.clientsMu.Lock()
-	for _, c := range st.clients {
-		c.cancel()
+	elapsed := time.Since(st.startTime)
+
+	// Kill ffmpeg, disconnect all clients, but keep stream entry alive.
+	if st.active.Swap(false) {
+		st.cancel()
+		if st.cmd != nil && st.cmd.Process != nil {
+			st.cmd.Process.Kill()
+		}
+		st.clientsMu.Lock()
+		for _, c := range st.clients {
+			c.cancel()
+		}
+		st.clientsMu.Unlock()
 	}
-	st.clientsMu.Unlock()
-	slog.Info("Stream paused (ffmpeg kept alive)", "session_id", sessionID)
+	// Re-init for resume
+	st.active.Store(true)
+	_, cancel := context.WithCancel(context.Background())
+	st.cancel = cancel
+	st.resumeOffset = elapsed
+	st.started = make(chan struct{})
+	st.clients = make(map[string]*clientWriter)
+
+	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
+	return elapsed
 }
 
 func (s *Streamer) Resume(sessionID string) {
 	s.mu.Lock()
 	st, ok := s.streams[sessionID]
 	s.mu.Unlock()
-	if !ok {
+	if !ok || !st.active.Load() {
 		return
 	}
-	st.paused.Store(false)
-	slog.Info("Stream resumed", "session_id", sessionID)
+	resumeCtx, resumeCancel := context.WithCancel(context.Background())
+	st.cancel = resumeCancel
+	go st.run(resumeCtx)
+	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
+}
+
+func (s *Streamer) Elapsed(sessionID string) time.Duration {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok || st.startTime.IsZero() {
+		return 0
+	}
+	return time.Since(st.startTime)
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {
@@ -183,12 +214,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !ok || !st.active.Load() {
 		http.Error(w, "Stream not available", http.StatusNotFound)
-		return
-	}
-
-	if st.paused.Load() {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "Stream paused", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -359,6 +384,10 @@ func (st *stream) buildFFmpegArgs() []string {
 		args = append(args, cfg.ExtraInputArgs...)
 	}
 
+	if st.resumeOffset > 0 {
+		args = append(args, "-ss", formatDuration(st.resumeOffset))
+	}
+
 	args = append(args, "-i", st.sourceURI)
 
 	args = append(args, "-vn")
@@ -385,6 +414,10 @@ func (st *stream) buildFFmpegArgs() []string {
 	return args
 }
 
+func formatDuration(d time.Duration) string {
+	return fmt.Sprintf("%d.%03d", int64(d.Seconds()), d.Milliseconds()%1000)
+}
+
 func contentTypeForFormat(format string) string {
 	switch format {
 	case "mp3":
@@ -405,9 +438,6 @@ func contentTypeForFormat(format string) string {
 }
 
 func (st *stream) broadcast(data []byte) {
-	if st.paused.Load() {
-		return
-	}
 	st.clientsMu.Lock()
 	defer st.clientsMu.Unlock()
 

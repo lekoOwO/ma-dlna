@@ -416,21 +416,19 @@ If HA volume call fails, do not fail the whole session.
 
 ### 8.8 Pause Behavior
 
-Pause keeps ffmpeg running and stops broadcasting to downstream clients.
-The ring buffer continues to fill during pause.
+Pause records the elapsed playback position, calls MA pause, and terminates
+ffmpeg. Resume/Play restarts ffmpeg with `-ss <position>` to seek to the
+recorded position.
 
 ```text
-Pause = call MA pause + stop downstream broadcast (ffmpeg keeps running)
-Resume/Play = call MA play + resume downstream broadcast from ring buffer
+Pause = record elapsed time + call MA pause + kill ffmpeg
+Resume/Play = call MA play + restart ffmpeg with -ss <position>
 ```
 
-This preserves the approximate playback position because ffmpeg continues
-ingesting the source. Position accuracy depends on buffer fill level.
-
-* For sources that don't expect long-lived connections (some HTTP servers),
-  ffmpeg's reconnect flags handle reconnection if the source drops.
-* The ring buffer may overflow during long pauses; resuming after overflow
-  starts from the current buffer write position (near-live).
+If the source supports HTTP Range requests, ffmpeg will seek to the correct
+position. If the source does not support seeking (e.g. live streams), ffmpeg
+starts from the current stream position. The bridge does not explicitly probe
+for Range support — it relies on ffmpeg's input seeking behavior.
 
 ## 9. Configuration
 
