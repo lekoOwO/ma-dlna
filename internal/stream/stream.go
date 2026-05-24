@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -43,6 +44,7 @@ type stream struct {
 	ffmpegCfg     config.FFmpegConfig
 	startTime     time.Time
 	resumeOffset  time.Duration
+	ffmpegTime    atomic.Int64 // output media time in nanoseconds (from ffmpeg progress)
 }
 
 type clientWriter struct {
@@ -179,7 +181,14 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	s.mu.Lock()
 	st, ok := s.streams[sessionID]
 	s.mu.Unlock()
-	if !ok || st.startTime.IsZero() {
+	if !ok {
+		return 0
+	}
+	ft := st.ffmpegTime.Load()
+	if ft > 0 {
+		return time.Duration(ft)
+	}
+	if st.startTime.IsZero() {
 		return 0
 	}
 	return st.resumeOffset + time.Since(st.startTime)
@@ -357,13 +366,7 @@ func (st *stream) run(ctx context.Context) {
 	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", st.cmd.Process.Pid)
 	close(st.started)
 
-	go func() {
-		limited := io.LimitReader(stderr, 4096)
-		data, _ := io.ReadAll(limited)
-		if len(data) > 0 {
-			slog.Warn("ffmpeg stderr", "session_id", st.sessionID, "output", string(data))
-		}
-	}()
+	go st.readProgress(stderr)
 
 	buf := make([]byte, 65536)
 	for {
@@ -437,7 +440,42 @@ func (st *stream) buildFFmpegArgs() []string {
 
 	args = append(args, "-f", cfg.OutputFormat, "pipe:1")
 
+	// Write progress lines to stderr so we can parse output timestamps.
+	args = append(args, "-progress", "pipe:2")
+
 	return args
+}
+
+func (st *stream) readProgress(stderr io.Reader) {
+	scanner := bufio.NewScanner(stderr)
+	var errLines []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "out_time=") {
+			if t, err := time.Parse("15:04:05.000000", strings.TrimPrefix(line, "out_time=")); err == nil {
+				ns := int64(t.Hour())*int64(time.Hour) +
+					int64(t.Minute())*int64(time.Minute) +
+					int64(t.Second())*int64(time.Second) +
+					int64(t.Nanosecond())
+				st.ffmpegTime.Store(ns)
+			}
+		} else if strings.HasPrefix(line, "progress=") {
+			// progress=continue line, skip
+		} else if line != "" && !strings.HasPrefix(line, "frame=") &&
+			!strings.HasPrefix(line, "fps=") && !strings.HasPrefix(line, "stream_") &&
+			!strings.HasPrefix(line, "bitrate=") && !strings.HasPrefix(line, "total_size=") &&
+			!strings.HasPrefix(line, "out_time_ms=") && !strings.HasPrefix(line, "out_time_us=") &&
+			!strings.HasPrefix(line, "speed=") && !strings.HasPrefix(line, "dup_frames=") &&
+			!strings.HasPrefix(line, "drop_frames=") {
+			errLines = append(errLines, line)
+			if len(errLines) > 10 {
+				errLines = errLines[len(errLines)-10:]
+			}
+		}
+	}
+	if len(errLines) > 0 {
+		slog.Warn("ffmpeg stderr", "session_id", st.sessionID, "output", strings.Join(errLines, "\n"))
+	}
 }
 
 func formatDuration(d time.Duration) string {
