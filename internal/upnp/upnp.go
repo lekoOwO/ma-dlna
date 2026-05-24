@@ -485,9 +485,9 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 
 func eventServiceFromPath(path string) string {
 	switch {
-	case strings.Contains(path, "RenderingControl"):
+	case strings.Contains(path, "/rendering/"):
 		return "RenderingControl"
-	case strings.Contains(path, "ConnectionManager"):
+	case strings.Contains(path, "/connection/"):
 		return "ConnectionManager"
 	default:
 		return "AVTransport"
