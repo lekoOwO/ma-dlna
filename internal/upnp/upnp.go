@@ -111,6 +111,14 @@ func firstIPv4(iface net.Interface) net.IP {
 	return nil
 }
 
+// msearchHistory serves as a lightweight dedup for M-SEARCH responses.
+// Each M-SEARCH packet arrives on every multicast interface, so we must
+// respond only once per (remote IP, ST) combination.
+type msearchKey struct {
+	ip string
+	st string
+}
+
 // M-SEARCH listener joins the multicast group on every multicast interface.
 func (h *Handler) mserve(ctx context.Context) {
 	conns := make([]*net.UDPConn, 0)
@@ -169,23 +177,50 @@ func (h *Handler) mserve(ctx context.Context) {
 		}(conn)
 	}
 
+	history := map[msearchKey]time.Time{}
+	cleanupTicker := time.NewTicker(time.Minute)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-cleanupTicker.C:
+			now := time.Now()
+			for k, t := range history {
+				if now.Sub(t) > time.Minute {
+					delete(history, k)
+				}
+			}
 		case m := <-ch:
 			body := string(m.data)
 			if !strings.Contains(body, "M-SEARCH") {
 				continue
 			}
+			st := extractST(body)
 			if !matchesSearchTarget(body) {
 				continue
 			}
-			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String())
+			key := msearchKey{ip: m.remoteAddr.IP.String(), st: st}
+			if _, exists := history[key]; exists {
+				continue
+			}
+			history[key] = time.Now()
+
+			slog.Info("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st)
 			resp := h.mserveResponse()
 			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
 		}
 	}
+}
+
+func extractST(body string) string {
+	for _, line := range strings.Split(body, "\r\n") {
+		if strings.HasPrefix(strings.ToUpper(line), "ST:") {
+			return strings.TrimSpace(line[3:])
+		}
+	}
+	return ""
 }
 
 func matchesSearchTarget(body string) bool {
