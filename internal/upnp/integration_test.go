@@ -350,6 +350,250 @@ func TestEventEndpointsPerService(t *testing.T) {
 	}
 }
 
+// TestPlaybackActions tests the full SetAVTransportURI → Play → Stop → Pause flow.
+func TestPlaybackActions(t *testing.T) {
+	// Mock HA server that records calls
+	type haCall struct {
+		service string
+		body    string
+	}
+	var haCalls []haCall
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		haCalls = append(haCalls, haCall{service: r.URL.Path, body: string(body)})
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Step 1: SetAVTransportURI
+	uri := "http://example.com/song.flac"
+	metadata := "<DIDL-Lite><item><title>Test</title></item></DIDL-Lite>"
+	body := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+uri+"</CurrentURI><CurrentURIMetaData>"+escapeXMLText(metadata)+"</CurrentURIMetaData>")
+
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("SetAVTransportURI expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify session created — must use AllSessions() since Loaded != ActiveSession()
+	sessions := sm.AllSessions()
+	if len(sessions) == 0 {
+		t.Fatal("No session created after SetAVTransportURI")
+	}
+	s := sessions[len(sessions)-1]
+	if s.SourceURI != uri {
+		t.Errorf("SourceURI: expected %s, got %s", uri, s.SourceURI)
+	}
+	if s.State != session.StateLoaded {
+		t.Errorf("State: expected loaded, got %s", s.State)
+	}
+	if s.Metadata.Title != "Test" {
+		t.Errorf("Metadata title: expected Test, got %s", s.Metadata.Title)
+	}
+	t.Logf("SetAVTransportURI ok: session=%s, state=%s, stream_url=%s", s.ID, s.State, s.StreamURL)
+
+	// Step 2: Play
+	haCalls = nil
+	body = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
+	}
+
+	// Session should be in "starting" state (Play sets it to starting)
+	s = sm.Get(s.ID)
+	if s.State != session.StateStarting {
+		t.Errorf("State after Play: expected starting, got %s", s.State)
+	}
+
+	// MA should have been called
+	found := false
+	for _, c := range haCalls {
+		if strings.Contains(c.service, "play_media") {
+			found = true
+			if !strings.Contains(c.body, s.StreamURL) {
+				t.Errorf("play_media payload should contain stream URL, got: %s", c.body)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("Play did not call play_media service")
+	}
+	t.Logf("Play ok: session state=%s, MA play_media called", s.State)
+
+	// Step 3: Stop
+	haCalls = nil
+	body = soapEnvelope("AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Stop expected 200, got %d", resp.StatusCode)
+	}
+	s = sm.Get(s.ID)
+	if s.State != session.StateStopped {
+		t.Errorf("State after Stop: expected stopped, got %s", s.State)
+	}
+	found = false
+	for _, c := range haCalls {
+		if strings.Contains(c.service, "media_stop") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Stop did not call media_stop service")
+	}
+	t.Logf("Stop ok: session state=%s", s.State)
+
+	// Step 4: New session → Play → Pause
+	uri2 := "http://example.com/song2.mp3"
+	body = soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+uri2+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	allSessions := sm.AllSessions()
+	s2 := allSessions[len(allSessions)-1]
+	body = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, _ = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	resp.Body.Close()
+
+	haCalls = nil
+	body = soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	s2 = sm.Get(s2.ID)
+	if s2.State != session.StatePaused {
+		t.Errorf("State after Pause: expected paused, got %s", s2.State)
+	}
+	found = false
+	for _, c := range haCalls {
+		if strings.Contains(c.service, "media_pause") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Pause did not call media_pause service")
+	}
+	t.Logf("Pause ok: session state=%s", s2.State)
+}
+
+// TestVolumeControl validates RenderingControl volume/mute actions.
+func TestVolumeControl(t *testing.T) {
+	// Mock HA server
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.UPnP.AutoBaseURL = false
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Set volume to 75
+	body := soapEnvelope("RenderingControl", "SetVolume",
+		"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>75</DesiredVolume>")
+	resp, err := http.Post(ts.URL+"/rendering/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("SetVolume expected 200, got %d", resp.StatusCode)
+	}
+
+	// Get volume back
+	body = soapEnvelope("RenderingControl", "GetVolume",
+		"<InstanceID>0</InstanceID><Channel>Master</Channel>")
+	resp, err = http.Post(ts.URL+"/rendering/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(data), "<CurrentVolume>75</CurrentVolume>") {
+		t.Errorf("GetVolume should return 75, got: %s", string(data))
+	}
+	t.Logf("SetVolume/GetVolume ok")
+
+	// Set mute
+	body = soapEnvelope("RenderingControl", "SetMute",
+		"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>1</DesiredMute>")
+	resp, _ = http.Post(ts.URL+"/rendering/control", "text/xml", strings.NewReader(body))
+	resp.Body.Close()
+
+	// Get mute
+	body = soapEnvelope("RenderingControl", "GetMute",
+		"<InstanceID>0</InstanceID><Channel>Master</Channel>")
+	resp, err = http.Post(ts.URL+"/rendering/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(data), "<CurrentMute>1</CurrentMute>") {
+		t.Errorf("GetMute should return 1, got: %s", string(data))
+	}
+	t.Logf("SetMute/GetMute ok")
+}
+
+// escapeXMLText escapes a string for inclusion in XML.
+func escapeXMLText(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
 func soapEnvelope(service, action, inner string) string {
 	return `<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"

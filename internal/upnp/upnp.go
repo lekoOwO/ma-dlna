@@ -922,7 +922,16 @@ func extractSOAPField(body []byte, field string) string {
 	if end < 0 {
 		return ""
 	}
-	return s[start : start+end]
+	return unescapeXML(s[start : start+end])
+}
+
+func unescapeXML(s string) string {
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", "\"")
+	s = strings.ReplaceAll(s, "&apos;", "'")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	return s
 }
 
 func avTransportResponse(action, innerXML string) string {

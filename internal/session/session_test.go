@@ -129,6 +129,15 @@ func TestMetadataParsing(t *testing.T) {
 	if md.Album != "Test Album" {
 		t.Errorf("expected 'Test Album', got '%s'", md.Album)
 	}
+
+	// With DIDL-Lite wrapper (as real controllers send)
+	md = parseDIDL(`<DIDL-Lite><item><title>Wrapped</title><artist>Wrapper</artist></item></DIDL-Lite>`)
+	if md.Title != "Wrapped" {
+		t.Errorf("DIDL-Lite wrapped: expected 'Wrapped', got '%s'", md.Title)
+	}
+	if md.Artist != "Wrapper" {
+		t.Errorf("DIDL-Lite wrapped: expected 'Wrapper', got '%s'", md.Artist)
+	}
 }
 
 func TestStreamURLGeneration(t *testing.T) {

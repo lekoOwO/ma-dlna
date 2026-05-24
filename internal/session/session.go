@@ -181,7 +181,7 @@ func (m *Manager) ActiveSession() *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, s := range m.sessions {
-		if s.State == StatePlaying || s.State == StateStarting {
+		if s.State == StatePlaying || s.State == StateStarting || s.State == StateLoaded {
 			return s
 		}
 	}
@@ -242,31 +242,46 @@ func parseDIDL(xmlStr string) *Metadata {
 		return &Metadata{}
 	}
 
-	type didlItem struct {
-		Title       string `xml:"title"`
-		Creator     string `xml:"creator"`
-		Artist      string `xml:"artist"`
-		Album       string `xml:"album"`
-		AlbumArtURI string `xml:"albumArtURI"`
+	decoder := xml.NewDecoder(strings.NewReader(xmlStr))
+	var md Metadata
+	var inItem bool
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "item" {
+				inItem = true
+			}
+			if inItem {
+				switch t.Name.Local {
+				case "title":
+					decoder.DecodeElement(&md.Title, &t)
+				case "creator":
+					var v string
+					decoder.DecodeElement(&v, &t)
+					if md.Artist == "" {
+						md.Artist = v
+					}
+				case "artist":
+					decoder.DecodeElement(&md.Artist, &t)
+				case "album":
+					decoder.DecodeElement(&md.Album, &t)
+				case "albumArtURI":
+					decoder.DecodeElement(&md.AlbumArtURI, &t)
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "item" {
+				inItem = false
+			}
+		}
 	}
 
-	var item didlItem
-	if err := xml.Unmarshal([]byte(xmlStr), &item); err != nil {
-		return &Metadata{}
-	}
-
-	md := &Metadata{
-		Title:       item.Title,
-		Album:       item.Album,
-		AlbumArtURI: item.AlbumArtURI,
-	}
-	if item.Artist != "" {
-		md.Artist = item.Artist
-	} else if item.Creator != "" {
-		md.Artist = item.Creator
-	}
-
-	return md
+	return &md
 }
 
 var ErrNotFound = errors.New("session not found")
