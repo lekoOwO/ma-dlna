@@ -730,6 +730,24 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
   <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
 </u:GetMediaInfoResponse>`, escapeXML(uri)))
 
+	case "Seek":
+		instanceID := extractSOAPField(body, "InstanceID")
+		unit := extractSOAPField(body, "Unit")
+		target := extractSOAPField(body, "Target")
+		_ = instanceID
+		if unit == "REL_TIME" && h.sessionMgr != nil {
+			active := h.sessionMgr.ActiveSession()
+			if active != nil {
+				if offset, err := parseRelTime(target); err == nil {
+					slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
+					h.sessionMgr.Seek(active.ID, offset)
+					h.sessionMgr.Resume(active.ID)
+				}
+			}
+		}
+		response = avTransportResponse(action, fmt.Sprintf(`
+<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+
 	case "GetCurrentTransportActions":
 		var actions string
 		if h.sessionMgr != nil {
@@ -1025,6 +1043,15 @@ func transportActionsForState(s session.State) string {
 	default:
 		return ""
 	}
+}
+
+func parseRelTime(s string) (time.Duration, error) {
+	var h, m, sec int
+	_, err := fmt.Sscanf(s, "%d:%d:%d", &h, &m, &sec)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec)*time.Second, nil
 }
 
 func formatDurationUPnP(d time.Duration) string {

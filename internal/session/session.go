@@ -227,6 +227,14 @@ func (m *Manager) Elapsed(sessionID string) time.Duration {
 	return m.streamer.Elapsed(sessionID)
 }
 
+func (m *Manager) Seek(sessionID string, offset time.Duration) {
+	m.streamer.Seek(sessionID, offset)
+}
+
+func (m *Manager) Resume(sessionID string) {
+	m.streamer.Resume(sessionID)
+}
+
 func (m *Manager) ValidateToken(sessionID, token string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

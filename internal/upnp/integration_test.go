@@ -271,6 +271,20 @@ func TestSOAPEndpoints(t *testing.T) {
 			200,
 		},
 		{
+			"GetCurrentTransportActions",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "GetCurrentTransportActions",
+				"<InstanceID>0</InstanceID>"),
+			200,
+		},
+		{
+			"GetDeviceCapabilities",
+			"/avtransport/control",
+			soapEnvelope("AVTransport", "GetDeviceCapabilities",
+				"<InstanceID>0</InstanceID>"),
+			200,
+		},
+		{
 			"InvalidAction",
 			"/avtransport/control",
 			soapEnvelope("AVTransport", "NonExistentAction", ""),
@@ -856,7 +870,20 @@ func TestFullDLNALifecycle(t *testing.T) {
 	}
 	t.Log("Step 14: GetDeviceCapabilities OK")
 
-	t.Logf("Full DLNA lifecycle test PASSED (14 steps)")
+	t.Log("Step 15: Seek")
+	seekBody := soapEnvelope("AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:30</Target>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(seekBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Seek returned %d", resp.StatusCode)
+	}
+	time.Sleep(500 * time.Millisecond)
+	t.Log("Step 15: Seek OK")
+
+	t.Logf("Full DLNA lifecycle test PASSED (15 steps)")
 }
 
 func extractXMLField(xml, field string) string {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/leko/ma-dlna/internal/config"
 )
@@ -223,6 +224,30 @@ func TestParseSOAPRequestMethodCheck(t *testing.T) {
 	_, err := parseSOAPRequest(r)
 	if err == nil {
 		t.Error("GET should be rejected for SOAP endpoint")
+	}
+}
+
+func TestParseRelTime(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected time.Duration
+	}{
+		{"00:00:00", 0},
+		{"00:00:01", time.Second},
+		{"00:01:00", time.Minute},
+		{"01:00:00", time.Hour},
+		{"00:00:30", 30 * time.Second},
+		{"01:23:45", 1*time.Hour + 23*time.Minute + 45*time.Second},
+	}
+	for _, tc := range tests {
+		d, err := parseRelTime(tc.input)
+		if err != nil {
+			t.Errorf("parseRelTime(%q) error: %v", tc.input, err)
+			continue
+		}
+		if d != tc.expected {
+			t.Errorf("parseRelTime(%q) = %v, want %v", tc.input, d, tc.expected)
+		}
 	}
 }
 

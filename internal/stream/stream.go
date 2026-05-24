@@ -120,8 +120,24 @@ func (s *Streamer) Pause(sessionID string) time.Duration {
 		return 0
 	}
 	elapsed := time.Since(st.startTime)
+	s.restartWithOffset(st, sessionID, elapsed)
+	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
+	return elapsed
+}
 
-	// Kill ffmpeg, disconnect all clients, but keep stream entry alive.
+func (s *Streamer) Seek(sessionID string, offset time.Duration) {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	s.restartWithOffset(st, sessionID, offset)
+	slog.Info("Stream seek", "session_id", sessionID, "to", offset.Round(time.Second))
+}
+
+// restartWithOffset kills ffmpeg, resets the stream, and sets resume offset for restart.
+func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.Duration) {
 	if st.active.Swap(false) {
 		st.cancel()
 		if st.cmd != nil && st.cmd.Process != nil {
@@ -133,16 +149,12 @@ func (s *Streamer) Pause(sessionID string) time.Duration {
 		}
 		st.clientsMu.Unlock()
 	}
-	// Re-init for resume
 	st.active.Store(true)
 	_, cancel := context.WithCancel(context.Background())
 	st.cancel = cancel
-	st.resumeOffset = elapsed
+	st.resumeOffset = offset
 	st.started = make(chan struct{})
 	st.clients = make(map[string]*clientWriter)
-
-	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
-	return elapsed
 }
 
 func (s *Streamer) Resume(sessionID string) {
