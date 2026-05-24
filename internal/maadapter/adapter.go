@@ -26,40 +26,45 @@ func New(cfg *config.Config) *Adapter {
 }
 
 func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
-	service := a.cfg.MAAdapter.PlayService
-	if service == "" {
-		service = a.cfg.MAAdapter.FallbackPlayService
-	}
-
 	payload := map[string]any{
-		"entity_id":         targetEntity,
+		"entity_id":          targetEntity,
 		"media_content_id":   contentID,
 		"media_content_type": contentType,
 	}
-
-	return a.callHAService(service, payload)
+	return a.callWithFallback(a.cfg.MAAdapter.PlayService, a.cfg.MAAdapter.FallbackPlayService, payload)
 }
 
 func (a *Adapter) Stop(targetEntity string) error {
-	service := a.cfg.MAAdapter.StopService
-	return a.callHAService(service, map[string]any{
+	return a.callHAService(a.cfg.MAAdapter.StopService, map[string]any{
 		"entity_id": targetEntity,
 	})
 }
 
 func (a *Adapter) Pause(targetEntity string) error {
-	service := a.cfg.MAAdapter.PauseService
-	return a.callHAService(service, map[string]any{
+	return a.callHAService(a.cfg.MAAdapter.PauseService, map[string]any{
 		"entity_id": targetEntity,
 	})
 }
 
 func (a *Adapter) SetVolume(targetEntity string, volume int) error {
-	service := a.cfg.MAAdapter.VolumeService
-	return a.callHAService(service, map[string]any{
-		"entity_id":  targetEntity,
+	return a.callHAService(a.cfg.MAAdapter.VolumeService, map[string]any{
+		"entity_id":    targetEntity,
 		"volume_level": float64(volume) / 100.0,
 	})
+}
+
+func (a *Adapter) callWithFallback(primary, fallback string, payload map[string]any) error {
+	if primary != "" {
+		err := a.callHAService(primary, payload)
+		if err == nil {
+			return nil
+		}
+		slog.Warn("Primary service failed, trying fallback", "primary", primary, "fallback", fallback)
+	}
+	if fallback != "" {
+		return a.callHAService(fallback, payload)
+	}
+	return fmt.Errorf("no service configured")
 }
 
 func (a *Adapter) callHAService(service string, payload map[string]any) error {
