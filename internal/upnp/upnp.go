@@ -66,45 +66,110 @@ func (h *Handler) baseURL() string {
 	return h.cfg.Server.PublicBaseURL
 }
 
-// M-SEARCH listener
-func (h *Handler) mserve(ctx context.Context) {
-	addr := &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+var ssdpAddr = &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
+
+// multicastInterfaces returns all IPv4 addresses on multicast-capable UP interfaces.
+func multicastInterfaces() []*net.UDPAddr {
+	var out []*net.UDPAddr
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		slog.Warn("Failed to listen for M-SEARCH", "error", err)
+		return out
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok || ipn.IP.To4() == nil || ipn.IP.IsLoopback() {
+				continue
+			}
+			out = append(out, &net.UDPAddr{IP: ipn.IP})
+		}
+	}
+	return out
+}
+
+// M-SEARCH listener on all interfaces.
+func (h *Handler) mserve(ctx context.Context) {
+	conns := make([]*net.UDPConn, 0)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	for _, laddr := range multicastInterfaces() {
+		conn, err := net.ListenMulticastUDP("udp4", nil, &net.UDPAddr{IP: laddr.IP, Port: ssdpAddr.Port})
+		if err != nil {
+			slog.Warn("M-SEARCH listen failed on interface", "ip", laddr.IP, "error", err)
+			continue
+		}
+		conns = append(conns, conn)
+	}
+
+	if len(conns) == 0 {
+		slog.Warn("No multicast interfaces available for M-SEARCH")
 		return
 	}
-	defer conn.Close()
+	slog.Info("M-SEARCH listening", "interfaces", len(conns))
 
+	// Unified receive loop across all connections.
 	buf := make([]byte, 4096)
+	type msg struct {
+		data       []byte
+		remoteAddr *net.UDPAddr
+		conn       *net.UDPConn
+	}
+	ch := make(chan msg, 8)
+
+	for _, conn := range conns {
+		go func(c *net.UDPConn) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				c.SetReadDeadline(time.Now().Add(time.Second))
+				n, remoteAddr, err := c.ReadFromUDP(buf)
+				if err != nil {
+					if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+						continue
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				ch <- msg{data: data, remoteAddr: remoteAddr, conn: c}
+			}
+		}(conn)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		case m := <-ch:
+			body := string(m.data)
+			if !strings.Contains(body, "M-SEARCH") {
 				continue
 			}
-			continue
+			if !strings.Contains(body, "urn:schemas-upnp-org:device:MediaRenderer:1") {
+				continue
+			}
+			slog.Debug("M-SEARCH received", "from", m.remoteAddr.String())
+			resp := h.mserveResponse()
+			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
+			slog.Debug("M-SEARCH response sent", "to", m.remoteAddr.String())
 		}
-
-		msg := string(buf[:n])
-		if !strings.Contains(msg, "M-SEARCH") {
-			continue
-		}
-		if !strings.Contains(msg, "urn:schemas-upnp-org:device:MediaRenderer:1") {
-			continue
-		}
-
-		slog.Debug("Received M-SEARCH", "from", remoteAddr.String())
-		resp := h.mserveResponse()
-		conn.WriteToUDP([]byte(resp), remoteAddr)
-		slog.Debug("Sent M-SEARCH response", "to", remoteAddr.String())
 	}
 }
 
@@ -132,47 +197,33 @@ func (h *Handler) ssdpLoop(ctx context.Context) {
 		interval = 30 * time.Minute
 	}
 
-	addr := &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	h.sendSSDP(addr)
+	h.broadcastSSDP(h.ssdpAliveMessage())
 
 	for {
 		select {
 		case <-ctx.Done():
-			h.sendSSDPByeBye(addr)
+			h.broadcastSSDP(h.ssdpByeByeMessage())
 			return
 		case <-ticker.C:
-			h.sendSSDP(addr)
+			h.broadcastSSDP(h.ssdpAliveMessage())
 		}
 	}
 }
 
-func (h *Handler) sendSSDP(addr *net.UDPAddr) {
-	conn, err := net.DialUDP("udp4", nil, addr)
-	if err != nil {
-		slog.Warn("Failed to send SSDP advertisement", "error", err)
-		return
+func (h *Handler) broadcastSSDP(msg string) {
+	for _, laddr := range multicastInterfaces() {
+		conn, err := net.DialUDP("udp4", laddr, ssdpAddr)
+		if err != nil {
+			slog.Debug("SSDP dial failed", "iface", laddr.IP, "error", err)
+			continue
+		}
+		conn.Write([]byte(msg))
+		conn.Close()
 	}
-	defer conn.Close()
-
-	msg := h.ssdpAliveMessage()
-	conn.Write([]byte(msg))
-	slog.Debug("SSDP alive sent")
-}
-
-func (h *Handler) sendSSDPByeBye(addr *net.UDPAddr) {
-	conn, err := net.DialUDP("udp4", nil, addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	msg := h.ssdpByeByeMessage()
-	conn.Write([]byte(msg))
-	slog.Debug("SSDP byebye sent")
+	slog.Debug("SSDP broadcast done")
 }
 
 func (h *Handler) ssdpAliveMessage() string {
