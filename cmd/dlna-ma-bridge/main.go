@@ -156,7 +156,7 @@ func sessionsHandler(mgr *session.Manager) http.HandlerFunc {
 			redacted = append(redacted, map[string]any{
 				"session_id": s.ID,
 				"source_uri": redactQuery(s.SourceURI),
-				"metadata":   s.Metadata,
+				"metadata":   redactMetadata(s.Metadata),
 				"state":      s.State,
 				"stream_url": url,
 				"created_at": s.CreatedAt,
@@ -183,7 +183,7 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"session_id": s.ID,
 			"source_uri": redactQuery(s.SourceURI),
-			"metadata":   s.Metadata,
+			"metadata":   redactMetadata(s.Metadata),
 			"state":      s.State,
 			"stream_url": url,
 			"created_at": s.CreatedAt,
@@ -203,6 +203,15 @@ func httpLogMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func redactMetadata(md *session.Metadata) *session.Metadata {
+	if md == nil {
+		return nil
+	}
+	cp := *md
+	cp.AlbumArtURI = redactQuery(cp.AlbumArtURI)
+	return &cp
 }
 
 func redactQuery(raw string) string {

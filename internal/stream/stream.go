@@ -450,8 +450,8 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st.clientsMu.Lock()
-	// Re-check atomically: gen must be current, active, and not canceled
-	if st.currentGen() != gen || !gen.active.Load() || gen.ctx.Err() != nil {
+	// Re-check atomically: gen must be current, active, stream active, and not canceled
+	if st.currentGen() != gen || !st.active.Load() || !gen.active.Load() || gen.ctx.Err() != nil {
 		st.clientsMu.Unlock()
 		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
 		return
@@ -604,9 +604,8 @@ func (st *stream) run(gen *streamGeneration) {
 			return
 		case <-timer.C:
 			st.clientsMu.Lock()
-			empty := len(gen.clients) == 0
-			st.clientsMu.Unlock()
-			if empty && st.currentGen() == gen {
+			if st.currentGen() == gen && len(gen.clients) == 0 && gen.active.Swap(false) {
+				st.clientsMu.Unlock()
 				slog.Warn("No client connected within startup timeout, stopping stream", "session_id", st.sessionID)
 				gen.setErr(fmt.Errorf("no stream client connected within startup timeout"))
 				if st.errorCB != nil {
@@ -615,6 +614,8 @@ func (st *stream) run(gen *streamGeneration) {
 				st.active.Store(false)
 				gen.cancel()
 				gen.killCmd()
+			} else {
+				st.clientsMu.Unlock()
 			}
 		}
 	}()

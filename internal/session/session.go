@@ -99,7 +99,7 @@ func (m *Manager) CurrentSession() *Session {
 			return s
 		}
 	}
-	return m.ActiveSession()
+	return nil
 }
 
 func (m *Manager) Create(sourceURI, metadataXML string) *Session {
@@ -139,6 +139,9 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	}
 
 	ext := m.cfg.FFmpeg.OutputFormat
+	if ext == "opus" {
+		ext = "ogg"
+	}
 	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
 	m.sessions[id] = s
@@ -274,7 +277,10 @@ func (m *Manager) ActiveSession() *Session {
 // StatusSession returns the active session for status reporting,
 // including StateError sessions that ActiveSession excludes.
 func (m *Manager) StatusSession() *Session {
-	return m.CurrentSession()
+	if s := m.CurrentSession(); s != nil {
+		return s
+	}
+	return m.ActiveSession()
 }
 
 func (m *Manager) Count() int {

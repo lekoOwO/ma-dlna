@@ -148,7 +148,7 @@ func TestStreamURLGeneration(t *testing.T) {
 
 	s := mgr.Create("http://source.local/test", "")
 
-	expected := "http://bridge.local:8787/live/" + s.ID + ".opus?token=" + s.StreamToken
+	expected := "http://bridge.local:8787/live/" + s.ID + ".ogg?token=" + s.StreamToken
 	if s.StreamURL != expected {
 		t.Errorf("expected URL '%s', got '%s'", expected, s.StreamURL)
 	}

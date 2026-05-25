@@ -991,7 +991,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
 				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
-				go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 			} else {
 				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 			}
@@ -1259,16 +1258,19 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 
 		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
 			slog.Error("SetVolume failed", "error", err)
-		} else {
-			h.mu.Lock()
-			h.volume = vol
-			if vol > 0 && oldMuted {
-				h.muted = false
-			}
-			muted := h.muted
-			h.mu.Unlock()
-			go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
 		}
+		h.mu.Lock()
+		h.volume = vol
+		if vol > 0 && oldMuted {
+			h.muted = false
+		}
+		muted := h.muted
+		h.mu.Unlock()
+		go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
 
 		response = renderingResponse(action, `
 <u:SetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
