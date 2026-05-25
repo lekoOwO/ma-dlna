@@ -98,16 +98,14 @@ func (h *Handler) Stop() {
 }
 
 // notifyCurrentSession sends an AVTransport event only if the given sessionID
-// is still the current session at the time the goroutine executes, preventing
-// stale events from old sessions overwriting current playback state.
+// is still current. Synchronous so request-handler event ordering is preserved
+// (notifySubscribers itself uses internal goroutines for HTTP delivery).
 func (h *Handler) notifyCurrentSession(sessionID, lastChangeXML string) {
-	go func() {
-		cur := h.sessionMgr.CurrentSession()
-		if cur == nil || cur.ID != sessionID {
-			return
-		}
-		h.notifySubscribers("AVTransport", lastChangeXML)
-	}()
+	cur := h.sessionMgr.CurrentSession()
+	if cur == nil || cur.ID != sessionID {
+		return
+	}
+	h.notifySubscribers("AVTransport", lastChangeXML)
 }
 
 // NotifyError sends AVTransport LastChange on stream/session errors (ffmpeg crash,

@@ -92,6 +92,22 @@ type streamGeneration struct {
 	active          atomic.Bool
 }
 
+// reportError sets the generation error and calls errorCB only if this
+// generation is still current. Prevents old-generation errors from overwriting
+// new-generation playback state for the same session ID.
+func (st *stream) reportError(gen *streamGeneration, err error) {
+	if gen.ctx.Err() != nil {
+		return
+	}
+	if st.currentGen() != gen {
+		return
+	}
+	gen.setErr(err)
+	if st.errorCB != nil {
+		st.errorCB(st.sessionID, err)
+	}
+}
+
 func (st *stream) currentGen() *streamGeneration {
 	st.genMu.Lock()
 	defer st.genMu.Unlock()
@@ -311,6 +327,13 @@ func (s *Streamer) Resume(sessionID string) {
 		return
 	}
 	if !st.runsInFlight.CompareAndSwap(0, 1) {
+		return
+	}
+	s.mu.Lock()
+	stillCurrent := s.streams[sessionID] == st && st.active.Load()
+	s.mu.Unlock()
+	if !stillCurrent {
+		st.runsInFlight.Store(0)
 		return
 	}
 	st.genMu.Lock()
@@ -572,34 +595,25 @@ func (st *stream) run(gen *streamGeneration) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		hadError = true
-		gen.setErr(err)
 		slog.Error("Failed to create ffmpeg stdout pipe", "error", err)
 		close(gen.started)
-		if st.errorCB != nil {
-			st.errorCB(st.sessionID, err)
-		}
+		st.reportError(gen, err)
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		hadError = true
-		gen.setErr(err)
 		slog.Error("Failed to create ffmpeg stderr pipe", "error", err)
 		close(gen.started)
-		if st.errorCB != nil {
-			st.errorCB(st.sessionID, err)
-		}
+		st.reportError(gen, err)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
 		hadError = true
-		gen.setErr(err)
 		slog.Error("Failed to start ffmpeg", "error", err)
 		close(gen.started)
-		if st.errorCB != nil {
-			st.errorCB(st.sessionID, err)
-		}
+		st.reportError(gen, err)
 		return
 	}
 
@@ -623,10 +637,7 @@ func (st *stream) run(gen *streamGeneration) {
 			if st.currentGen() == gen && len(gen.clients) == 0 && gen.active.Swap(false) {
 				st.clientsMu.Unlock()
 				slog.Warn("No client connected within startup timeout, stopping stream", "session_id", st.sessionID)
-				gen.setErr(fmt.Errorf("no stream client connected within startup timeout"))
-				if st.errorCB != nil {
-					st.errorCB(st.sessionID, gen.getErr())
-				}
+				st.reportError(gen, fmt.Errorf("no stream client connected within startup timeout"))
 				st.active.Store(false)
 				gen.cancel()
 				gen.killCmd()
@@ -668,9 +679,7 @@ waitproc:
 		hadError = true
 		gen.setErr(err)
 		slog.Error("ffmpeg exited with error", "session_id", st.sessionID, "error", err)
-		if st.errorCB != nil {
-			st.errorCB(st.sessionID, err)
-		}
+		st.reportError(gen, err)
 	} else {
 		slog.Info("ffmpeg exited", "session_id", st.sessionID)
 	}

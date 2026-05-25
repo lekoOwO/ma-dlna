@@ -221,6 +221,9 @@ func (m *Manager) MarkStopped(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
+		if s.State == StateStarting || s.State == StatePlaying {
+			return
+		}
 		s.State = StateStopped
 		s.UpdatedAt = time.Now()
 		slog.Info("Session marked stopped", "session_id", sessionID)
