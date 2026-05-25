@@ -55,7 +55,7 @@ func TestBuildFFmpegArgsDefault(t *testing.T) {
 		ffmpegCfg: cfg.FFmpeg,
 	}
 
-	args := st.buildFFmpegArgs()
+	args := st.buildFFmpegArgs(0)
 
 	findArg := func(name string) int {
 		for i, a := range args {
@@ -99,7 +99,7 @@ func TestBuildFFmpegArgsCustom(t *testing.T) {
 		},
 	}
 
-	args := st.buildFFmpegArgs()
+	args := st.buildFFmpegArgs(0)
 
 	findArg := func(name string) int {
 		for i, a := range args {

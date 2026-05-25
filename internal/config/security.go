@@ -70,6 +70,9 @@ func (c *SecurityConfig) validateIP(ip net.IP) error {
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return fmt.Errorf("source IP blocked: %s (link-local)", ip)
 	}
+	if ip.IsMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("source IP blocked: %s (multicast/unspecified)", ip)
+	}
 
 	// Block public IPs if not allowed
 	if !ip.IsPrivate() && !c.AllowPublicSources {

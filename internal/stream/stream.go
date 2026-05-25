@@ -70,6 +70,7 @@ type streamGeneration struct {
 	ringBuf *RingBuffer
 	cmd     *exec.Cmd
 	clients map[string]*clientWriter
+	offset  time.Duration
 }
 
 func NewStreamer(cfg *config.Config) *Streamer {
@@ -108,6 +109,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		},
 	}
 	st.active.Store(true)
+	st.runsInFlight.Store(1)
 	st.startTime = time.Now()
 	st.resumeOffset = 0
 	s.streams[sessionID] = st
@@ -191,17 +193,21 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	}
 	st.runsInFlight.Store(0)
 	ctx, cancel := context.WithCancel(context.Background())
+	ringBufSize := s.cfg.Stream.RingBufferBytes
+	if oldGen != nil {
+		ringBufSize = oldGen.ringBuf.Size()
+	}
 	newGen := &streamGeneration{
 		ctx:     ctx,
 		cancel:  cancel,
 		started: make(chan struct{}),
 		done:    make(chan struct{}),
-		ringBuf: NewRingBuffer(oldGen.ringBuf.Size()),
+		ringBuf: NewRingBuffer(ringBufSize),
 		clients: make(map[string]*clientWriter),
+		offset:  offset,
 	}
 	st.genMu.Lock()
 	st.gen = newGen
-	st.resumeOffset = offset
 	st.ffmpegTime.Store(0)
 	st.err = nil
 	st.active.Store(true)
@@ -227,6 +233,7 @@ func (s *Streamer) Resume(sessionID string) {
 		done:    make(chan struct{}),
 		ringBuf: NewRingBuffer(st.gen.ringBuf.Size()),
 		clients: make(map[string]*clientWriter),
+		offset:  st.gen.offset,
 	}
 	st.gen = newGen
 	st.startTime = time.Now()
@@ -245,7 +252,13 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 		return 0
 	}
 	st.genMu.Lock()
-	resumeOff := st.resumeOffset
+	gen := st.gen
+	var resumeOff time.Duration
+	if gen != nil {
+		resumeOff = gen.offset
+	} else {
+		resumeOff = st.resumeOffset
+	}
 	startT := st.startTime
 	st.genMu.Unlock()
 	ft := st.ffmpegTime.Load()
@@ -262,7 +275,7 @@ func (s *Streamer) IsRunning(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if st, ok := s.streams[sessionID]; ok {
-		return st.active.Load()
+		return st.active.Load() && st.runsInFlight.Load() > 0
 	}
 	return false
 }
@@ -404,22 +417,24 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	<-ctx.Done()
 
 	st.clientsMu.Lock()
-	delete(st.gen.clients, clientID)
-	remaining := len(st.gen.clients)
+	delete(gen.clients, clientID)
+	remaining := len(gen.clients)
 	st.clientsMu.Unlock()
 
 	slog.Info("Client disconnected from stream", "session_id", sessionID, "client_id", clientID, "remaining", remaining)
 
 	if remaining == 0 {
+		capturedGen := gen
 		go func(snapshot *stream) {
 			time.Sleep(time.Duration(s.cfg.Stream.NoClientGraceSeconds) * time.Second)
 			s.mu.Lock()
 			current := s.streams[sessionID]
 			s.mu.Unlock()
 			snapshot.clientsMu.Lock()
-			empty := len(snapshot.gen.clients) == 0
+			currentGen := snapshot.gen
+			empty := len(capturedGen.clients) == 0
 			snapshot.clientsMu.Unlock()
-			if current == snapshot && empty {
+			if current == snapshot && currentGen == capturedGen && empty {
 				slog.Info("No clients remaining, stopping stream", "session_id", sessionID)
 				s.Stop(sessionID)
 			}
@@ -428,7 +443,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (st *stream) run(gen *streamGeneration) {
-	st.runsInFlight.Add(1)
 	defer func() {
 		st.runsInFlight.Store(0)
 		if gen.ctx.Err() == nil {
@@ -439,7 +453,7 @@ func (st *stream) run(gen *streamGeneration) {
 		close(gen.done)
 	}()
 
-	args := st.buildFFmpegArgs()
+	args := st.buildFFmpegArgs(gen.offset)
 	slog.Debug("ffmpeg command", "args", args)
 	slog.Info("Starting ffmpeg", "session_id", st.sessionID)
 
@@ -498,11 +512,12 @@ func (st *stream) run(gen *streamGeneration) {
 		select {
 		case <-gen.ctx.Done():
 			slog.Info("ffmpeg context cancelled", "session_id", st.sessionID)
-			return
+			goto waitproc
 		default:
 		}
 	}
 
+waitproc:
 	if err := cmd.Wait(); err != nil && gen.ctx.Err() == nil {
 		st.err = err
 		slog.Error("ffmpeg exited with error", "session_id", st.sessionID, "error", err)
@@ -514,7 +529,7 @@ func (st *stream) run(gen *streamGeneration) {
 	}
 }
 
-func (st *stream) buildFFmpegArgs() []string {
+func (st *stream) buildFFmpegArgs(offset time.Duration) []string {
 	cfg := st.ffmpegCfg
 
 	args := []string{
@@ -533,9 +548,9 @@ func (st *stream) buildFFmpegArgs() []string {
 		args = append(args, cfg.ExtraInputArgs...)
 	}
 
-	if st.resumeOffset > 0 {
-		slog.Debug("Seek offset applied", "session_id", st.sessionID, "offset", st.resumeOffset)
-		args = append(args, "-ss", formatDuration(st.resumeOffset))
+	if offset > 0 {
+		slog.Debug("Seek offset applied", "session_id", st.sessionID, "offset", offset)
+		args = append(args, "-ss", formatDuration(offset))
 	}
 
 	args = append(args, "-i", st.sourceURI)

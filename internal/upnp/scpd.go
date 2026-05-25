@@ -177,7 +177,8 @@ const avTransportSCPD = `<?xml version="1.0"?>
     <stateVariable sendEvents="no"><name>AbsoluteTimePosition</name><dataType>time</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>RelativeCounterPosition</name><dataType>i4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AbsoluteCounterPosition</name><dataType>i4</dataType></stateVariable>
-  </serviceStateTable>
+    <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
+	</serviceStateTable>
 </scpd>`
 
 const renderingControlSCPD = `<?xml version="1.0"?>
@@ -231,7 +232,8 @@ const renderingControlSCPD = `<?xml version="1.0"?>
       <allowedValueRange><minimum>0</minimum><maximum>100</maximum><step>1</step></allowedValueRange>
     </stateVariable>
     <stateVariable sendEvents="no"><name>Mute</name><dataType>boolean</dataType></stateVariable>
-  </serviceStateTable>
+    <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
+	</serviceStateTable>
 </scpd>`
 
 const connectionManagerSCPD = `<?xml version="1.0"?>
@@ -292,5 +294,5 @@ const connectionManagerSCPD = `<?xml version="1.0"?>
     <stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>CurrentConnectionIDs</name><dataType>string</dataType></stateVariable>
-  </serviceStateTable>
+	</serviceStateTable>
 </scpd>`

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -65,7 +66,7 @@ func (h *Handler) Start(ctx context.Context) error {
 	ctx, h.ssdpCancel = context.WithCancel(ctx)
 	go h.ssdpLoop(ctx)
 	go h.mserve(ctx)
-	slog.Info("UPnP handler started", "friendly_name", h.cfg.UPnP.FriendlyName, "uuid", h.deviceUUID)
+	slog.Info("UPnP handler started", "friendly_name", escapeXML(h.cfg.UPnP.FriendlyName), "uuid", h.deviceUUID)
 	return nil
 }
 
@@ -486,9 +487,9 @@ func (h *Handler) serveDeviceDesc(w http.ResponseWriter, r *http.Request) {
     </serviceList>
   </device>
 </root>`,
-		h.cfg.UPnP.FriendlyName,
-		h.cfg.UPnP.Manufacturer,
-		h.cfg.UPnP.ModelName,
+		escapeXML(h.cfg.UPnP.FriendlyName),
+		escapeXML(h.cfg.UPnP.Manufacturer),
+		escapeXML(h.cfg.UPnP.ModelName),
 		version.Version,
 		h.deviceUUID,
 		base, base, base,
@@ -908,9 +909,16 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			if active != nil {
 				if offset, err := parseRelTime(target); err == nil {
 					slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
-					h.sessionMgr.Seek(active.ID, offset)
 					wasPaused := active.State == session.StatePaused
+					h.sessionMgr.Seek(active.ID, offset)
 					if !wasPaused {
+						h.sessionMgr.Resume(active.ID)
+						go h.maAdapter.PlayMedia(
+							h.cfg.HA.TargetEntityID,
+							active.StreamURL,
+							contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
+						)
+						go h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
 					}
 				}
 			}
@@ -1110,12 +1118,15 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
   <ProtocolInfo></ProtocolInfo>
   <PeerConnectionManager></PeerConnectionManager>
   <PeerConnectionID>-1</PeerConnectionID>
-  <Direction>Output</Direction>
+  <Direction>Input</Direction>
   <Status>OK</Status>
 </u:GetCurrentConnectionInfoResponse>`)
 
 	default:
-		response = soapFaultResponse("401", "Invalid Action")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -1147,7 +1158,7 @@ func parseSOAPRequest(r *http.Request) ([]byte, error) {
 	}
 
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(r.Body)
+	buf.ReadFrom(io.LimitReader(r.Body, 4<<20))
 	return buf.Bytes(), nil
 }
 
