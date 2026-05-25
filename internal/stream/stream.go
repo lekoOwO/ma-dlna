@@ -371,6 +371,19 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher = f
 	}
 
+	gen = st.gen
+	if gen == nil {
+		http.Error(w, "Stream not available", http.StatusNotFound)
+		return
+	}
+
+	st.clientsMu.Lock()
+	if len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
+		st.clientsMu.Unlock()
+		http.Error(w, "Too many clients", http.StatusTooManyRequests)
+		return
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -379,16 +392,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if cw.flusher != nil {
 		cw.flusher.Flush()
-	}
-
-	// Hold clientsMu across prebuffer read + client add to prevent
-	// a broadcast() from sneaking a live chunk between them.
-	gen = st.gen
-	st.clientsMu.Lock()
-	if gen == nil || len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
-		st.clientsMu.Unlock()
-		http.Error(w, "Too many clients", http.StatusTooManyRequests)
-		return
 	}
 
 	wp := gen.ringBuf.WritePosition()

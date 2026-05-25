@@ -3,6 +3,7 @@ package upnp
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -726,16 +727,10 @@ func extractCallbackURLs(callback string) []string {
 
 func generateSubscriptionUUID() string {
 	b := make([]byte, 16)
-	randRead(b)
+	_, _ = crand.Read(b)
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-func randRead(b []byte) {
-	for i := range b {
-		b[i] = byte(time.Now().UnixNano()>>(i%8)) ^ 0x55
-	}
 }
 
 // ---- AVTransport ----

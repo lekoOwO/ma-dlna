@@ -100,8 +100,15 @@ func Load(path string) (*Config, error) {
 	if cfg.Server.PublicBaseURL == "" {
 		cfg.Server.PublicBaseURL = fmt.Sprintf("http://%s:%d", cfg.Server.BindHost, cfg.Server.HTTPPort)
 	}
+	if strings.Contains(cfg.Server.PublicBaseURL, "0.0.0.0") && !cfg.UPnP.AutoBaseURL {
+		return nil, fmt.Errorf("public_base_url resolves to 0.0.0.0; set public_base_url to the bridge's LAN IP or enable auto_base_url")
+	}
 	if strings.Contains(cfg.Server.PublicBaseURL, "0.0.0.0") {
-		slog.Warn("public_base_url resolves to 0.0.0.0 — HA/MA won't be able to reach the stream. Set public_base_url to the bridge's LAN IP.")
+		slog.Warn("public_base_url resolves to 0.0.0.0 — stream URLs will use auto-detected LAN IP; verify HA/MA can reach it")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	if cfg.UPnP.UUID == "" || cfg.UPnP.UUID == "auto" {
@@ -109,6 +116,28 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func (c *Config) Validate() error {
+	if c.Stream.RingBufferBytes < 1024 {
+		return fmt.Errorf("stream.ring_buffer_bytes must be >= 1024, got %d", c.Stream.RingBufferBytes)
+	}
+	if c.Stream.PrebufferBytes < 0 {
+		return fmt.Errorf("stream.prebuffer_bytes must be >= 0, got %d", c.Stream.PrebufferBytes)
+	}
+	if c.Stream.MaxClientsPerSession <= 0 {
+		return fmt.Errorf("stream.max_clients_per_session must be > 0, got %d", c.Stream.MaxClientsPerSession)
+	}
+	if c.Stream.StartupTimeoutSeconds <= 0 {
+		return fmt.Errorf("stream.startup_timeout_seconds must be > 0, got %d", c.Stream.StartupTimeoutSeconds)
+	}
+	if c.Stream.NoClientGraceSeconds <= 0 {
+		return fmt.Errorf("stream.no_client_grace_seconds must be > 0, got %d", c.Stream.NoClientGraceSeconds)
+	}
+	if c.FFmpeg.OutputFormat == "" {
+		return fmt.Errorf("ffmpeg.output_format must not be empty")
+	}
+	return nil
 }
 
 func DefaultConfig() Config {

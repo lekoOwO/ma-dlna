@@ -193,10 +193,6 @@ func httpLogMiddleware(next http.Handler) http.Handler {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			truncated := string(body)
-			if len(truncated) > 256 {
-				truncated = truncated[:256]
-			}
 			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr,
 				"body_bytes", len(body))
 		} else {
