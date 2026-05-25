@@ -1043,6 +1043,13 @@ func TestStateChangeNotify(t *testing.T) {
 	}
 	resp.Body.Close()
 
+	// Consume SetAVTransportURI STOPPED event
+	select {
+	case <-cbCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for SetAVTransportURI NOTIFY")
+	}
+
 	// Play → should trigger state change NOTIFY with PLAYING
 	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))

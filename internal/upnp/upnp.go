@@ -97,24 +97,28 @@ func (h *Handler) Stop() {
 	slog.Info("UPnP handler stopped")
 }
 
+// notifyCurrentSession sends an AVTransport event only if the given sessionID
+// is still the current session at the time the goroutine executes, preventing
+// stale events from old sessions overwriting current playback state.
+func (h *Handler) notifyCurrentSession(sessionID, lastChangeXML string) {
+	go func() {
+		cur := h.sessionMgr.CurrentSession()
+		if cur == nil || cur.ID != sessionID {
+			return
+		}
+		h.notifySubscribers("AVTransport", lastChangeXML)
+	}()
+}
+
 // NotifyError sends AVTransport LastChange on stream/session errors (ffmpeg crash,
 // first-client timeout, pipe failure) so subscribers see ERROR_OCCURRED without polling.
-// Only fires if the given sessionID matches the current AVTransport session.
 func (h *Handler) NotifyError(sessionID string) {
-	cur := h.sessionMgr.CurrentSession()
-	if cur == nil || cur.ID != sessionID {
-		return
-	}
-	go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
+	h.notifyCurrentSession(sessionID, avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 }
 
 // NotifyEnded sends AVTransport LastChange on natural stream end (EOF).
 func (h *Handler) NotifyEnded(sessionID string) {
-	cur := h.sessionMgr.CurrentSession()
-	if cur == nil || cur.ID != sessionID {
-		return
-	}
-	go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+	h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
 }
 
 func (h *Handler) activeSession() *session.Session {
@@ -962,6 +966,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
 		_ = h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
+		go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -998,6 +1003,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
 	case "Stop":
+		// Idempotent: returns success even without current media
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.activeSession()
 		if active != nil {

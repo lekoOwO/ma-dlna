@@ -46,8 +46,6 @@ type stream struct {
 	clientsMu      sync.Mutex
 	ffmpegCfg      config.FFmpegConfig
 	startupTimeout time.Duration
-	startTime      time.Time
-	resumeOffset   time.Duration
 	runsInFlight   atomic.Int32
 	genMu          sync.Mutex
 	errorCB        ErrorCallback
@@ -84,6 +82,7 @@ type streamGeneration struct {
 	cmd             *exec.Cmd
 	clients         map[string]*clientWriter
 	offset          time.Duration
+	startTime       time.Time
 	err             error
 	ffmpegTime      atomic.Int64
 	initBuf         []byte
@@ -195,10 +194,9 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 			initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 		},
 	}
+	st.gen.startTime = time.Now()
 	st.active.Store(true)
 	st.runsInFlight.Store(1)
-	st.startTime = time.Now()
-	st.resumeOffset = 0
 	s.streams[sessionID] = st
 
 	go st.run(st.gen)
@@ -326,8 +324,8 @@ func (s *Streamer) Resume(sessionID string) {
 		offset:       st.gen.offset,
 		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 	}
+	newGen.startTime = time.Now()
 	st.gen = newGen
-	st.startTime = time.Now()
 	st.genMu.Unlock()
 	go st.run(newGen)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", newGen.offset.Round(time.Second))
@@ -352,10 +350,10 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if ft > 0 {
 		return gen.offset + time.Duration(ft)
 	}
-	if st.startTime.IsZero() {
+	if gen.startTime.IsZero() {
 		return 0
 	}
-	return gen.offset + time.Since(st.startTime)
+	return gen.offset + time.Since(gen.startTime)
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {

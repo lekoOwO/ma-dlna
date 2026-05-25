@@ -66,6 +66,9 @@ type FFmpegConfig struct {
 	ExtraOutputArgs []string `yaml:"extra_output_args"`
 }
 
+// For multi-NIC, Docker, or VLAN deployments where HA/MA cannot reach the
+// auto-detected controller interface, set server.stream_public_base_url to
+// the URL that HA/MA should use to connect to /live streams.
 type StreamConfig struct {
 	PrebufferBytes        int `yaml:"prebuffer_bytes"`
 	RingBufferBytes       int `yaml:"ring_buffer_bytes"`
@@ -141,6 +144,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Stream.InitSegmentBytes < 0 {
 		return fmt.Errorf("stream.init_segment_bytes must be >= 0, got %d", c.Stream.InitSegmentBytes)
+	}
+	if c.Stream.InitSegmentBytes > c.Stream.RingBufferBytes {
+		return fmt.Errorf("stream.init_segment_bytes must not exceed ring_buffer_bytes (%d), got %d", c.Stream.RingBufferBytes, c.Stream.InitSegmentBytes)
 	}
 	if c.FFmpeg.OutputFormat == "" {
 		return fmt.Errorf("ffmpeg.output_format must not be empty")

@@ -49,7 +49,7 @@ func main() {
 		sessionMgr.SetPlaying(sessionID)
 	})
 	streamer.SetEndCallback(func(sessionID string) {
-		sessionMgr.Stop(sessionID)
+		sessionMgr.MarkStopped(sessionID)
 		upnpHandler.NotifyEnded(sessionID)
 	})
 	streamer.SetErrorCallback(func(sessionID string, err error) {

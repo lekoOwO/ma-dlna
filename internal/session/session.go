@@ -211,6 +211,19 @@ func (m *Manager) Stop(sessionID string) error {
 	return nil
 }
 
+// MarkStopped updates the session state to stopped without touching the streamer.
+// Used for natural EOF callbacks where the stream has already exited and calling
+// Streamer.Stop() would race with a new stream for the same session ID.
+func (m *Manager) MarkStopped(sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		s.State = StateStopped
+		s.UpdatedAt = time.Now()
+		slog.Info("Session marked stopped", "session_id", sessionID)
+	}
+}
+
 func (m *Manager) Pause(sessionID string) error {
 	m.mu.Lock()
 	s, ok := m.sessions[sessionID]
