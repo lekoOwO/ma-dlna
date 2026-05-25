@@ -1241,6 +1241,10 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- RenderingControl ----
+//
+// All RCS commands are synchronous against HA to keep renderer state consistent.
+// This means SetVolume/SetMute may block up to the HA HTTP timeout (15s) on HA
+// failure. The tradeoff is correctness over latency.
 
 func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) {
 	body, err := parseSOAPRequest(r)

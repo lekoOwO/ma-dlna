@@ -118,6 +118,9 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if cfg.Stream.InitSegmentBytes > 16*1024*1024 {
+		slog.Warn("stream.init_segment_bytes is large and may cause memory pressure on late-client attach", "bytes", cfg.Stream.InitSegmentBytes)
+	}
 
 	if cfg.UPnP.UUID == "" || cfg.UPnP.UUID == "auto" {
 		cfg.UPnP.UUID = generateUUID()

@@ -45,12 +45,14 @@ type Streamer struct {
 	genStartCB     GenStartCallback
 }
 
-// Lock order: clientsMu must be acquired before genMu (via currentGen()).
-// Never hold genMu while acquiring clientsMu to avoid deadlock.
+// Lock order: lifeMu → clientsMu → genMu.
+// lifeMu serializes concurrent Stop/Pause/Seek/Resume/Start per-session.
+// Never hold genMu while acquiring clientsMu or lifeMu.
 type stream struct {
 	sessionID      string
 	sourceURI      string
 	active         atomic.Bool
+	lifeMu         sync.Mutex
 	clientsMu      sync.Mutex
 	ffmpegCfg      config.FFmpegConfig
 	startupTimeout time.Duration
@@ -244,6 +246,9 @@ func (s *Streamer) Stop(sessionID string) {
 	delete(s.streams, sessionID)
 	s.mu.Unlock()
 
+	st.lifeMu.Lock()
+	defer st.lifeMu.Unlock()
+
 	if st.active.Swap(false) {
 		st.genMu.Lock()
 		gen := st.gen
@@ -280,6 +285,8 @@ func (s *Streamer) Pause(sessionID string) time.Duration {
 	if !ok {
 		return 0
 	}
+	st.lifeMu.Lock()
+	defer st.lifeMu.Unlock()
 	elapsed := s.Elapsed(sessionID)
 	s.restartWithOffset(st, sessionID, elapsed)
 	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
@@ -293,6 +300,8 @@ func (s *Streamer) Seek(sessionID string, offset time.Duration) {
 	if !ok {
 		return
 	}
+	st.lifeMu.Lock()
+	defer st.lifeMu.Unlock()
 	s.restartWithOffset(st, sessionID, offset)
 	slog.Info("Stream seek", "session_id", sessionID, "to", offset.Round(time.Second))
 }
@@ -345,14 +354,9 @@ func (s *Streamer) Resume(sessionID string) {
 	if !ok || !st.active.Load() {
 		return
 	}
+	st.lifeMu.Lock()
+	defer st.lifeMu.Unlock()
 	if !st.runsInFlight.CompareAndSwap(0, 1) {
-		return
-	}
-	s.mu.Lock()
-	stillCurrent := s.streams[sessionID] == st && st.active.Load()
-	s.mu.Unlock()
-	if !stillCurrent {
-		st.runsInFlight.Store(0)
 		return
 	}
 	st.genMu.Lock()
