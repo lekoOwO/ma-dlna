@@ -313,9 +313,15 @@ func (h *Handler) mserve(ctx context.Context) {
 			history[key] = time.Now()
 
 			localIP := matchingIP(m.remoteAddr.IP)
+			base := h.baseURLForIP(localIP)
 			slog.Debug("M-SEARCH responded", "from", m.remoteAddr.String(), "st", st, "local_ip", localIP)
-			resp := h.mserveResponse(h.baseURLForIP(localIP), st)
-			m.conn.WriteToUDP([]byte(resp), m.remoteAddr)
+			if st == "ssdp:all" {
+				for _, t := range ssdpAllTargets(h.deviceUUID) {
+					m.conn.WriteToUDP([]byte(h.mserveResponse(base, t)), m.remoteAddr)
+				}
+			} else {
+				m.conn.WriteToUDP([]byte(h.mserveResponse(base, st)), m.remoteAddr)
+			}
 		}
 	}
 }
@@ -346,13 +352,22 @@ func (h *Handler) matchesSearchTarget(body string) bool {
 	return false
 }
 
+func ssdpAllTargets(deviceUUID string) []string {
+	return []string{
+		"upnp:rootdevice",
+		uuidUSN(deviceUUID),
+		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1",
+	}
+}
+
 func (h *Handler) mserveResponse(base, st string) string {
 	u := uuidUSN(h.deviceUUID)
 	usn := u + "::" + st
 	if strings.HasPrefix(st, "uuid:") {
 		usn = u
-	} else if st == "ssdp:all" {
-		usn = u + "::upnp:rootdevice"
 	}
 	return fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+

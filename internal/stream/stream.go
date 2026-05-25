@@ -76,6 +76,7 @@ type streamGeneration struct {
 	offset     time.Duration
 	err        error
 	ffmpegTime atomic.Int64
+	header     []byte
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -431,6 +432,9 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
 		start = 0
+		if gen.header != nil {
+			cw.ch <- append([]byte(nil), gen.header...)
+		}
 	}
 	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
 	n, _ := gen.ringBuf.Read(start, prebuf)
@@ -540,6 +544,10 @@ func (st *stream) run(gen *streamGeneration) {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			gen.ringBuf.Write(chunk)
+			if gen.header == nil {
+				gen.header = make([]byte, len(chunk))
+				copy(gen.header, chunk)
+			}
 			st.broadcast(gen, chunk)
 		}
 		if readErr != nil {
