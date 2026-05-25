@@ -215,6 +215,9 @@ func (m *Manager) Stop(sessionID string) error {
 // Used for natural EOF callbacks where the stream has already exited and calling
 // Streamer.Stop() would race with a new stream for the same session ID.
 func (m *Manager) MarkStopped(sessionID string) {
+	if m.streamer.IsRunning(sessionID) {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {

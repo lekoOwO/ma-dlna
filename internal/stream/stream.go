@@ -222,9 +222,11 @@ func (s *Streamer) Stop(sessionID string) {
 			gen.cancel()
 			gen.killCmd()
 			st.closeClients(gen)
-			select {
-			case <-gen.done:
-			case <-time.After(2 * time.Second):
+			if st.runsInFlight.Load() > 0 {
+				select {
+				case <-gen.done:
+				case <-time.After(2 * time.Second):
+				}
 			}
 		}
 		slog.Info("Stream stopped", "session_id", sessionID)
@@ -553,7 +555,7 @@ func (st *stream) run(gen *streamGeneration) {
 		if gen.ctx.Err() == nil {
 			st.closeClients(gen)
 			st.active.Store(false)
-			if !hadError && st.endCB != nil {
+			if !hadError && st.endCB != nil && st.currentGen() == gen {
 				st.endCB(st.sessionID)
 			}
 		}

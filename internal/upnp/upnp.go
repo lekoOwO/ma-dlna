@@ -965,8 +965,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Server.StreamPublicBaseURL != "" {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
-		_ = h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
-		go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
+		h.notifyCurrentSession(s.ID, avTransportLastChange("STOPPED"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -998,7 +998,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		go h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+		h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
@@ -1016,7 +1016,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 				return
 			}
-			go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+			h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1047,7 +1047,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
+		h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
