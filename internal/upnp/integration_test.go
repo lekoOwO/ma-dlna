@@ -906,6 +906,22 @@ func TestFullDLNALifecycle(t *testing.T) {
 	}
 	t.Log("Step 14: GetDeviceCapabilities OK")
 
+	// Re-create session before Seek (session was stopped in Step 10)
+	setAVBody = soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+uri+"</CurrentURI><CurrentURIMetaData>"+escapeXMLText(metadata)+"</CurrentURIMetaData>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setAVBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	playBody = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	time.Sleep(500 * time.Millisecond)
+
 	t.Log("Step 15: Seek")
 	seekBody := soapEnvelope("AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:30</Target>")
 	resp, err = client.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(seekBody))

@@ -123,6 +123,12 @@ func (gen *streamGeneration) getHeader() []byte {
 	return gen.header
 }
 
+func (gen *streamGeneration) getHeaderSize() int64 {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	return gen.headerSize
+}
+
 func (gen *streamGeneration) setHeader(data []byte) {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
@@ -316,16 +322,18 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if gen == nil {
 		return 0
 	}
-	resumeOff := gen.offset
+	// When ffmpeg is not running (paused/stopped), position is frozen at gen.offset.
+	if st.runsInFlight.Load() == 0 {
+		return gen.offset
+	}
 	ft := gen.ffmpegTime.Load()
 	if ft > 0 {
-		return resumeOff + time.Duration(ft)
+		return gen.offset + time.Duration(ft)
 	}
 	if st.startTime.IsZero() {
 		return 0
 	}
-	return resumeOff + time.Since(st.startTime)
-
+	return gen.offset + time.Since(st.startTime)
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {
@@ -459,7 +467,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send header first for new clients that need the container init segment.
 	// To avoid duplication, skip past header bytes when reading prebuffer if
 	// the prebuffer range overlaps with the header.
-	hdrSize := gen.headerSize
+	hdrSize := gen.getHeaderSize()
 	if hdr := gen.getHeader(); hdr != nil {
 		cw.ch <- append([]byte(nil), hdr...)
 	}

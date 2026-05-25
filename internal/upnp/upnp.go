@@ -157,7 +157,7 @@ func (h *Handler) baseURLForRequest(r *http.Request) string {
 
 func (h *Handler) baseURLForIP(ip net.IP) string {
 	if h.cfg.UPnP.AutoBaseURL && ip != nil {
-		return fmt.Sprintf("http://%s:%d", ip.String(), h.cfg.Server.HTTPPort)
+		return "http://" + net.JoinHostPort(ip.String(), fmt.Sprintf("%d", h.cfg.Server.HTTPPort))
 	}
 	return h.cfg.Server.PublicBaseURL
 }
@@ -603,7 +603,7 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		pinIP, err := h.validateCallback(cb, r.RemoteAddr)
 		if err != nil {
-			slog.Warn("Event callback rejected", "callback", cb, "error", err)
+			slog.Warn("Event callback rejected", "callback", safeURL(cb), "error", err)
 			http.Error(w, "invalid CALLBACK", http.StatusPreconditionFailed)
 			return
 		}
@@ -721,6 +721,7 @@ func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
 		req.Header.Set("SERVER", serverString())
 
 		transport := &http.Transport{
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				if pinIP != "" {
 					_, port, _ := net.SplitHostPort(addr)
@@ -847,6 +848,7 @@ func (h *Handler) sendStateChange(snap subSnapshot, lastChangeXML string) {
 		req.Header.Set("SERVER", serverString())
 
 		transport := &http.Transport{
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				if snap.callbackIP != "" {
 					_, port, _ := net.SplitHostPort(addr)
@@ -874,7 +876,11 @@ func (h *Handler) sendStateChange(snap subSnapshot, lastChangeXML string) {
 }
 
 func avTransportLastChange(state string) string {
-	return fmt.Sprintf(`<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="%s"/><TransportStatus val="OK"/><CurrentPlayMode val="NORMAL"/><TransportPlaySpeed val="1"/></InstanceID></Event>`, state)
+	return avTransportLastChangeStatus(state, "OK")
+}
+
+func avTransportLastChangeStatus(state, status string) string {
+	return fmt.Sprintf(`<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="%s"/><TransportStatus val="%s"/><CurrentPlayMode val="NORMAL"/><TransportPlaySpeed val="1"/></InstanceID></Event>`, state, status)
 }
 
 func renderingControlLastChange(vol int, muted bool) string {
@@ -983,7 +989,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
 			} else {
-				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+				go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -993,17 +999,24 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	case "Pause":
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.activeSession()
-		if active != nil {
-			// Always pause locally regardless of HA result
-			if active.State == session.StatePlaying || active.State == session.StateStarting {
-				h.sessionMgr.Pause(active.ID)
-			}
-			if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
-				slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
-				h.sessionMgr.SetError(active.ID, err.Error())
-			} else {
-				go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
-			}
+		if active == nil {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
+			return
+		}
+		if active.State != session.StatePlaying && active.State != session.StateStarting {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
+			return
+		}
+		h.sessionMgr.Pause(active.ID)
+		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
+			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
+			h.sessionMgr.SetError(active.ID, err.Error())
+		} else {
+			go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1096,6 +1109,14 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
+		switch active.State {
+		case session.StatePlaying, session.StateStarting, session.StatePaused:
+		default:
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
+			return
+		}
 		slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
 		wasPaused := active.State == session.StatePaused
 		h.sessionMgr.Seek(active.ID, offset)
@@ -1110,7 +1131,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
 					h.sessionMgr.Stop(active.ID)
 					h.sessionMgr.SetError(active.ID, err.Error())
-					h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+					h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 					return
 				}
 				h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
@@ -1230,6 +1251,10 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 
 		h.mu.Lock()
 		h.volume = vol
+		wasMuted := h.muted
+		if vol > 0 && wasMuted {
+			h.muted = false
+		}
 		h.mu.Unlock()
 
 		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
@@ -1291,6 +1316,9 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			go func() {
 				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol); err != nil {
 					slog.Error("SetMute unmute failed", "error", err)
+					h.mu.Lock()
+					h.muted = true
+					h.mu.Unlock()
 					go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
 					return
 				}

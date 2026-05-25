@@ -70,13 +70,13 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 }
 
 func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Session {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	var toStop []string
 
+	m.mu.Lock()
 	for _, s := range m.sessions {
 		if s.State == StatePlaying || s.State == StateStarting || s.State == StatePaused || s.State == StateLoaded || s.State == StateError {
 			slog.Info("Stopping existing active session", "session_id", s.ID)
-			m.streamer.Stop(s.ID)
+			toStop = append(toStop, s.ID)
 			s.State = StateStopped
 			s.UpdatedAt = time.Now()
 		}
@@ -105,6 +105,11 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
 	m.sessions[id] = s
+	m.mu.Unlock()
+
+	for _, sid := range toStop {
+		m.streamer.Stop(sid)
+	}
 
 	slog.Info("Session created", "session_id", id, "source", safeURL(sourceURI), "stream_url", safeURL(s.StreamURL))
 	return s
@@ -347,8 +352,13 @@ func (m *Manager) evictLocked() {
 
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.sessions))
 	for id := range m.sessions {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+
+	for _, id := range ids {
 		m.streamer.Stop(id)
 	}
 }
