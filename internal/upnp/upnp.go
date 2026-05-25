@@ -138,8 +138,6 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 
 func (h *Handler) baseURLForRequest(r *http.Request) string {
 	if h.cfg.UPnP.AutoBaseURL && r.Host != "" {
-		// Determine local IP from the connection's local address, if available.
-		// Fall back to Host header validation.
 		localIP := localAddrFromConn(r)
 		if localIP != nil && !localIP.IsLoopback() && !localIP.IsUnspecified() &&
 			!localIP.IsLinkLocalUnicast() && !localIP.IsLinkLocalMulticast() {
@@ -154,9 +152,14 @@ func (h *Handler) baseURLForRequest(r *http.Request) string {
 		if ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && matchingIP(ip) != nil {
 			return "http://" + net.JoinHostPort(host, port)
 		}
-		return h.cfg.Server.PublicBaseURL
 	}
-	// Avoid returning 0.0.0.0 if PublicBaseURL is the default; fall back to matching IP
+	// All paths fall through to the common fallback helper
+	return h.fallbackBaseURL(r)
+}
+
+// fallbackBaseURL returns the configured PublicBaseURL, avoiding 0.0.0.0 if
+// possible by matching the requester's IP against local interfaces.
+func (h *Handler) fallbackBaseURL(r *http.Request) string {
 	if strings.Contains(h.cfg.Server.PublicBaseURL, "0.0.0.0") {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if lip := matchingIP(net.ParseIP(remoteIP)); lip != nil {
@@ -923,6 +926,10 @@ func generateSubscriptionUUID() string {
 }
 
 // ---- AVTransport ----
+//
+// HA command failure semantics: local stream cleanup is applied before HA command.
+// If HA fails, the session is marked as ERROR_OCCURRED and a SOAP fault is returned.
+// This is not transactional rollback — local state changes (stop/pause) persist.
 
 func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	body, err := parseSOAPRequest(r)
@@ -954,8 +961,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Server.StreamPublicBaseURL != "" {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
-		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
-		h.sessionMgr.SetCurrentSessionID(s.ID)
+		_ = h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -1028,6 +1034,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		h.sessionMgr.Pause(active.ID)
 		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
 			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
+			h.sessionMgr.Stop(active.ID)
 			h.sessionMgr.SetError(active.ID, err.Error())
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1282,7 +1289,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		}
 		muted := h.muted
 		h.mu.Unlock()
-		go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
+		h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
 
 		response = renderingResponse(action, `
 <u:SetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
@@ -1344,7 +1351,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			h.prevVolume = curVol
 			h.muted = true
 			h.mu.Unlock()
-			go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
+			h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
 		} else {
 			// Unmute: restore volume
 			restoreVol := curVol
@@ -1362,7 +1369,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			h.volume = restoreVol
 			h.muted = false
 			h.mu.Unlock()
-			go h.notifySubscribers("RenderingControl", renderingControlLastChange(restoreVol, false))
+			h.notifySubscribers("RenderingControl", renderingControlLastChange(restoreVol, false))
 		}
 
 		response = renderingResponse(action, `
