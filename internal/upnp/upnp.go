@@ -561,6 +561,34 @@ func eventServiceFromPath(path string) string {
 	}
 }
 
+func (h *Handler) validateCallback(callback string) error {
+	urls := extractCallbackURLs(callback)
+	if len(urls) == 0 {
+		return fmt.Errorf("no valid callback URL")
+	}
+	for _, rawURL := range urls {
+		u, err := neturl.Parse(rawURL)
+		if err != nil {
+			return fmt.Errorf("invalid callback URL %q: %w", rawURL, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("callback scheme not allowed: %s", u.Scheme)
+		}
+		host := u.Hostname()
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			return fmt.Errorf("cannot resolve callback host: %w", err)
+		}
+		for _, ip := range ips {
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+				ip.IsMulticast() || ip.IsUnspecified() {
+				return fmt.Errorf("callback IP blocked: %s", ip)
+			}
+		}
+	}
+	return nil
+}
+
 func (h *Handler) sendInitialEvent(callback, sid, service string) {
 	urls := extractCallbackURLs(callback)
 	if len(urls) == 0 {
@@ -761,7 +789,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("714", "Illegal MIME-Type or source URI rejected")))
 			return
 		}
-		h.sessionMgr.Create(uri, metadata)
+		h.sessionMgr.CreateWithBase(uri, metadata, h.baseURLForRequest(r))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -1153,7 +1181,10 @@ func parseSOAPRequest(r *http.Request) ([]byte, error) {
 	}
 
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(io.LimitReader(r.Body, 4<<20))
+	n, _ := buf.ReadFrom(io.LimitReader(r.Body, 4<<20+1))
+	if n > 4<<20 {
+		return nil, fmt.Errorf("request body too large")
+	}
 	return buf.Bytes(), nil
 }
 

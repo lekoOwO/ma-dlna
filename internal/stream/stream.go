@@ -73,6 +73,12 @@ type streamGeneration struct {
 	offset  time.Duration
 }
 
+func (st *stream) currentGen() *streamGeneration {
+	st.genMu.Lock()
+	defer st.genMu.Unlock()
+	return st.gen
+}
+
 func NewStreamer(cfg *config.Config) *Streamer {
 	return &Streamer{
 		cfg:     cfg,
@@ -294,7 +300,7 @@ func (s *Streamer) TotalClients() int {
 	total := 0
 	for _, st := range s.streams {
 		st.clientsMu.Lock()
-		total += len(st.gen.clients)
+		total += len(st.currentGen().clients)
 		st.clientsMu.Unlock()
 	}
 	return total
@@ -338,7 +344,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gen := st.gen
+	gen := st.currentGen()
 	if gen == nil {
 		http.Error(w, "Stream not available", http.StatusNotFound)
 		return
@@ -369,12 +375,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if f, ok := w.(http.Flusher); ok {
 		cw.flusher = f
-	}
-
-	gen = st.gen
-	if gen == nil {
-		http.Error(w, "Stream not available", http.StatusNotFound)
-		return
 	}
 
 	st.clientsMu.Lock()
@@ -503,7 +503,7 @@ func (st *stream) run(gen *streamGeneration) {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			gen.ringBuf.Write(chunk)
-			st.broadcast(chunk)
+			st.broadcast(gen, chunk)
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
@@ -602,10 +602,6 @@ func (st *stream) readProgress(stderr io.Reader) {
 					int64(t.Nanosecond())
 				st.ffmpegTime.Store(ns)
 			}
-		} else if strings.HasPrefix(line, "out_time_ms=") {
-			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_ms="), 10, 64); err == nil {
-				st.ffmpegTime.Store(ms * int64(time.Millisecond))
-			}
 		} else if !isProgressLine(line) {
 			errLines = append(errLines, line)
 			if len(errLines) > 10 {
@@ -659,12 +655,8 @@ func contentTypeForFormat(format string) string {
 	}
 }
 
-func (st *stream) broadcast(data []byte) {
+func (st *stream) broadcast(gen *streamGeneration, data []byte) {
 	if !st.active.Load() {
-		return
-	}
-	gen := st.gen
-	if gen == nil {
 		return
 	}
 	st.clientsMu.Lock()

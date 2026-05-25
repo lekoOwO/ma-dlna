@@ -66,6 +66,10 @@ func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
 }
 
 func (m *Manager) Create(sourceURI, metadataXML string) *Session {
+	return m.CreateWithBase(sourceURI, metadataXML, m.cfg.Server.PublicBaseURL)
+}
+
+func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -97,7 +101,6 @@ func (m *Manager) Create(sourceURI, metadataXML string) *Session {
 		UpdatedAt:   time.Now(),
 	}
 
-	baseURL := m.cfg.Server.PublicBaseURL
 	ext := m.cfg.FFmpeg.OutputFormat
 	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
