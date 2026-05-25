@@ -61,6 +61,7 @@ type Handler struct {
 	sessionMgr  *session.Manager
 	maAdapter   *maadapter.Adapter
 	mu          sync.RWMutex
+	rcMu        sync.Mutex
 	volume      int
 	prevVolume  int
 	muted       bool
@@ -1252,9 +1253,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			vol = 100
 		}
 
-		h.mu.RLock()
-		oldMuted := h.muted
-		h.mu.RUnlock()
+		h.rcMu.Lock()
+		defer h.rcMu.Unlock()
 
 		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
 			slog.Error("SetVolume failed", "error", err)
@@ -1265,7 +1265,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		}
 		h.mu.Lock()
 		h.volume = vol
-		if vol > 0 && oldMuted {
+		if vol > 0 && h.muted {
 			h.muted = false
 		}
 		muted := h.muted
@@ -1292,47 +1292,55 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		muteStr := extractSOAPField(body, "DesiredMute")
 		targetMuted := muteStr == "1"
 
-		h.mu.Lock()
-		wasMuted := h.muted
-		if targetMuted && !wasMuted {
-			h.prevVolume = h.volume
-		}
-		h.muted = targetMuted
+		// Snapshot current state under h.mu
+		h.mu.RLock()
 		curVol := h.volume
+		curMuted := h.muted
 		prevVol := h.prevVolume
-		h.mu.Unlock()
+		h.mu.RUnlock()
 
-		if targetMuted && !wasMuted {
-			go func() {
-				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0); err != nil {
-					slog.Error("SetMute failed", "error", err)
-					h.mu.Lock()
-					h.muted = false
-					h.mu.Unlock()
-					go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, false))
-					return
-				}
-				go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
-			}()
-		} else if !targetMuted && wasMuted {
+		// No-op if target == current
+		if targetMuted == curMuted {
+			response = renderingResponse(action, `
+	<u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
+			break
+		}
+
+		h.rcMu.Lock()
+		defer h.rcMu.Unlock()
+
+		if targetMuted {
+			// Mute: save volume, then call HA
+			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0); err != nil {
+				slog.Error("SetMute failed", "error", err)
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+				return
+			}
+			h.mu.Lock()
+			h.prevVolume = curVol
+			h.muted = true
+			h.mu.Unlock()
+			go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
+		} else {
+			// Unmute: restore volume
 			restoreVol := curVol
 			if prevVol > 0 {
 				restoreVol = prevVol
 			}
-			go func() {
-				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol); err != nil {
-					slog.Error("SetMute unmute failed", "error", err)
-					h.mu.Lock()
-					h.muted = true
-					h.mu.Unlock()
-					go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
-					return
-				}
-				h.mu.Lock()
-				h.volume = restoreVol
-				h.mu.Unlock()
-				go h.notifySubscribers("RenderingControl", renderingControlLastChange(restoreVol, false))
-			}()
+			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol); err != nil {
+				slog.Error("SetMute unmute failed", "error", err)
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+				return
+			}
+			h.mu.Lock()
+			h.volume = restoreVol
+			h.muted = false
+			h.mu.Unlock()
+			go h.notifySubscribers("RenderingControl", renderingControlLastChange(restoreVol, false))
 		}
 
 		response = renderingResponse(action, `
