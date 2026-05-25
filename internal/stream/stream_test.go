@@ -13,7 +13,7 @@ func TestContentTypeMapping(t *testing.T) {
 		expected string
 	}{
 		{"mp3", "audio/mpeg"},
-		{"opus", "audio/opus"},
+		{"opus", "audio/ogg"},
 		{"ogg", "audio/ogg"},
 		{"flac", "audio/flac"},
 		{"aac", "audio/aac"},
@@ -249,8 +249,8 @@ func TestStreamerHeadRequest(t *testing.T) {
 	if w.status != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.status)
 	}
-	if w.header.Get("Content-Type") != "audio/opus" {
-		t.Errorf("expected audio/opus, got %s", w.header.Get("Content-Type"))
+	if w.header.Get("Content-Type") != "audio/ogg" {
+		t.Errorf("expected audio/ogg, got %s", w.header.Get("Content-Type"))
 	}
 }
 

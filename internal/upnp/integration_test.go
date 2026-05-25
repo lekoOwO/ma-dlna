@@ -873,8 +873,8 @@ func TestFullDLNALifecycle(t *testing.T) {
 	}
 	protoXML, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(protoXML), "audio/opus") {
-		t.Error("GetProtocolInfo missing opus")
+	if !strings.Contains(string(protoXML), "audio/ogg") {
+		t.Error("GetProtocolInfo missing ogg")
 	}
 	if !strings.Contains(string(protoXML), cfg.FFmpeg.OutputFormat) {
 		t.Errorf("GetProtocolInfo missing configured format: %s", cfg.FFmpeg.OutputFormat)
@@ -1143,13 +1143,16 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Play — HA will return error
+	// Play — HA will return error, now returns SOAP fault
 	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Errorf("Play with failing HA should return 500 SOAP fault, got %d", resp.StatusCode)
+	}
 
 	// Session should be in error state
 	sessions := sm.AllSessions()

@@ -185,7 +185,7 @@ func (m *Manager) SetPlaying(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
-		if s.State == StateError {
+		if s.State != StateStarting {
 			return
 		}
 		s.State = StatePlaying

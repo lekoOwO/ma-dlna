@@ -7,6 +7,11 @@ import (
 	"net/url"
 )
 
+// ValidateSourceURI performs a preflight validation of the source URL.
+// NOTE: This is a preflight check only — the actual fetch is done by ffmpeg which
+// may follow redirects, resolve DNS differently, or support protocols that this
+// check does not. In untrusted-LAN deployments, the bridge should proxy source
+// fetches and validate each redirect hop.
 func (c *SecurityConfig) ValidateSourceURI(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {

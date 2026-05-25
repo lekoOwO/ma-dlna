@@ -23,9 +23,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	BindHost      string `yaml:"bind_host"`
-	HTTPPort      int    `yaml:"http_port"`
-	PublicBaseURL string `yaml:"public_base_url"`
+	BindHost            string `yaml:"bind_host"`
+	HTTPPort            int    `yaml:"http_port"`
+	PublicBaseURL       string `yaml:"public_base_url"`
+	StreamPublicBaseURL string `yaml:"stream_public_base_url"`
 }
 
 type UPnPConfig struct {

@@ -38,17 +38,18 @@ type Streamer struct {
 type EndCallback func(sessionID string)
 
 type stream struct {
-	sessionID    string
-	sourceURI    string
-	active       atomic.Bool
-	clientsMu    sync.Mutex
-	ffmpegCfg    config.FFmpegConfig
-	startTime    time.Time
-	resumeOffset time.Duration
-	runsInFlight atomic.Int32
-	genMu        sync.Mutex
-	errorCB      ErrorCallback
-	endCB        EndCallback
+	sessionID      string
+	sourceURI      string
+	active         atomic.Bool
+	clientsMu      sync.Mutex
+	ffmpegCfg      config.FFmpegConfig
+	startupTimeout time.Duration
+	startTime      time.Time
+	resumeOffset   time.Duration
+	runsInFlight   atomic.Int32
+	genMu          sync.Mutex
+	errorCB        ErrorCallback
+	endCB          EndCallback
 
 	gen *streamGeneration
 }
@@ -65,18 +66,19 @@ type clientWriter struct {
 // streamGeneration holds the per-run mutable state for a single ffmpeg instance.
 // It is replaced on each Pause/Seek/Resume cycle.
 type streamGeneration struct {
-	mu         sync.Mutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	started    chan struct{}
-	done       chan struct{}
-	ringBuf    *RingBuffer
-	cmd        *exec.Cmd
-	clients    map[string]*clientWriter
-	offset     time.Duration
-	err        error
-	ffmpegTime atomic.Int64
-	header     []byte
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	started     chan struct{}
+	done        chan struct{}
+	firstClient chan struct{}
+	ringBuf     *RingBuffer
+	cmd         *exec.Cmd
+	clients     map[string]*clientWriter
+	offset      time.Duration
+	err         error
+	ffmpegTime  atomic.Int64
+	header      []byte
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -97,6 +99,12 @@ func (gen *streamGeneration) setErr(err error) {
 	gen.err = err
 }
 
+func (gen *streamGeneration) setCmd(cmd *exec.Cmd) {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	gen.cmd = cmd
+}
+
 func (gen *streamGeneration) killCmd() {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
@@ -109,6 +117,24 @@ func (gen *streamGeneration) getCmd() *exec.Cmd {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
 	return gen.cmd
+}
+
+func (gen *streamGeneration) getHeader() []byte {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	if gen.header == nil {
+		return nil
+	}
+	return gen.header
+}
+
+func (gen *streamGeneration) setHeader(data []byte) {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	if gen.header == nil {
+		gen.header = make([]byte, len(data))
+		copy(gen.header, data)
+	}
 }
 
 func NewStreamer(cfg *config.Config) *Streamer {
@@ -133,18 +159,20 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	st := &stream{
-		sessionID: sessionID,
-		sourceURI: sourceURI,
-		ffmpegCfg: s.cfg.FFmpeg,
-		errorCB:   s.errorCB,
-		endCB:     s.endCB,
+		sessionID:      sessionID,
+		sourceURI:      sourceURI,
+		ffmpegCfg:      s.cfg.FFmpeg,
+		startupTimeout: time.Duration(s.cfg.Stream.StartupTimeoutSeconds) * time.Second,
+		errorCB:        s.errorCB,
+		endCB:          s.endCB,
 		gen: &streamGeneration{
-			ctx:     ctx,
-			cancel:  cancel,
-			started: make(chan struct{}),
-			done:    make(chan struct{}),
-			ringBuf: NewRingBuffer(s.cfg.Stream.RingBufferBytes),
-			clients: make(map[string]*clientWriter),
+			ctx:         ctx,
+			cancel:      cancel,
+			started:     make(chan struct{}),
+			done:        make(chan struct{}),
+			firstClient: make(chan struct{}),
+			ringBuf:     NewRingBuffer(s.cfg.Stream.RingBufferBytes),
+			clients:     make(map[string]*clientWriter),
 		},
 	}
 	st.active.Store(true)
@@ -175,6 +203,10 @@ func (s *Streamer) Stop(sessionID string) {
 			gen.cancel()
 			gen.killCmd()
 			st.closeClients(gen)
+			select {
+			case <-gen.done:
+			case <-time.After(2 * time.Second):
+			}
 		}
 		slog.Info("Stream stopped", "session_id", sessionID)
 	}
@@ -233,13 +265,14 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		ringBufSize = oldGen.ringBuf.Size()
 	}
 	newGen := &streamGeneration{
-		ctx:     ctx,
-		cancel:  cancel,
-		started: make(chan struct{}),
-		done:    make(chan struct{}),
-		ringBuf: NewRingBuffer(ringBufSize),
-		clients: make(map[string]*clientWriter),
-		offset:  offset,
+		ctx:         ctx,
+		cancel:      cancel,
+		started:     make(chan struct{}),
+		done:        make(chan struct{}),
+		firstClient: make(chan struct{}),
+		ringBuf:     NewRingBuffer(ringBufSize),
+		clients:     make(map[string]*clientWriter),
+		offset:      offset,
 	}
 	st.genMu.Lock()
 	st.gen = newGen
@@ -260,13 +293,14 @@ func (s *Streamer) Resume(sessionID string) {
 	st.genMu.Lock()
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
 	newGen := &streamGeneration{
-		ctx:     resumeCtx,
-		cancel:  resumeCancel,
-		started: make(chan struct{}),
-		done:    make(chan struct{}),
-		ringBuf: NewRingBuffer(st.gen.ringBuf.Size()),
-		clients: make(map[string]*clientWriter),
-		offset:  st.gen.offset,
+		ctx:         resumeCtx,
+		cancel:      resumeCancel,
+		started:     make(chan struct{}),
+		done:        make(chan struct{}),
+		firstClient: make(chan struct{}),
+		ringBuf:     NewRingBuffer(st.gen.ringBuf.Size()),
+		clients:     make(map[string]*clientWriter),
+		offset:      st.gen.offset,
 	}
 	st.gen = newGen
 	st.startTime = time.Now()
@@ -428,13 +462,15 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
+	// Always send container header first so late clients can decode
+	if hdr := gen.getHeader(); hdr != nil {
+		cw.ch <- append([]byte(nil), hdr...)
+	}
+
 	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
 		start = 0
-		if gen.header != nil {
-			cw.ch <- append([]byte(nil), gen.header...)
-		}
 	}
 	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
 	n, _ := gen.ringBuf.Read(start, prebuf)
@@ -446,8 +482,11 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isFirst := len(gen.clients) == 1
 	st.clientsMu.Unlock()
 
-	if isFirst && s.firstClientCB != nil {
-		s.firstClientCB(sessionID)
+	if isFirst {
+		close(gen.firstClient)
+		if s.firstClientCB != nil {
+			s.firstClientCB(sessionID)
+		}
 	}
 
 	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
@@ -506,23 +545,29 @@ func (st *stream) run(gen *streamGeneration) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		hadError = true
-		gen.err = err
+		gen.setErr(err)
 		slog.Error("Failed to create ffmpeg stdout pipe", "error", err)
 		close(gen.started)
+		if st.errorCB != nil {
+			st.errorCB(st.sessionID, err)
+		}
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		hadError = true
-		gen.err = err
+		gen.setErr(err)
 		slog.Error("Failed to create ffmpeg stderr pipe", "error", err)
 		close(gen.started)
+		if st.errorCB != nil {
+			st.errorCB(st.sessionID, err)
+		}
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
 		hadError = true
-		gen.err = err
+		gen.setErr(err)
 		slog.Error("Failed to start ffmpeg", "error", err)
 		close(gen.started)
 		if st.errorCB != nil {
@@ -531,9 +576,32 @@ func (st *stream) run(gen *streamGeneration) {
 		return
 	}
 
-	gen.cmd = cmd
+	gen.setCmd(cmd)
 	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", cmd.Process.Pid)
 	close(gen.started)
+
+	// If no client connects before the startup timeout, stop ffmpeg to avoid
+	// resource leak (e.g. HA/MA accepted play_media but never hits /live).
+	go func() {
+		timer := time.NewTimer(st.startupTimeout)
+		defer timer.Stop()
+		select {
+		case <-gen.firstClient:
+			return
+		case <-gen.done:
+			return
+		case <-timer.C:
+			st.clientsMu.Lock()
+			empty := len(gen.clients) == 0
+			st.clientsMu.Unlock()
+			if empty {
+				slog.Warn("No client connected within startup timeout, stopping stream", "session_id", st.sessionID)
+				st.active.Store(false)
+				gen.cancel()
+				gen.killCmd()
+			}
+		}
+	}()
 
 	go st.readProgress(gen, stderr)
 
@@ -544,10 +612,7 @@ func (st *stream) run(gen *streamGeneration) {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			gen.ringBuf.Write(chunk)
-			if gen.header == nil {
-				gen.header = make([]byte, len(chunk))
-				copy(gen.header, chunk)
-			}
+			gen.setHeader(chunk)
 			st.broadcast(gen, chunk)
 		}
 		if readErr != nil {
@@ -679,27 +744,36 @@ func isProgressLine(line string) bool {
 }
 
 func redactStderr(line string) string {
-	// Redact URLs in ffmpeg stderr to avoid leaking tokens/signatures
-	result := line
+	// Redact query strings from all URLs in ffmpeg stderr to avoid leaking tokens/signatures.
+	// Walk through the string finding each URL and redact its query portion.
+	var b strings.Builder
+	rest := line
 	for {
-		i := strings.Index(result, "http")
+		i := strings.Index(rest, "http")
 		if i < 0 {
+			b.WriteString(rest)
 			break
 		}
-		end := i
-		for end < len(result) && result[end] != ' ' && result[end] != '\n' && result[end] != ':' {
+		b.WriteString(rest[:i])
+		rest = rest[i:]
+
+		// Find end of URL (ends at whitespace or end-of-string)
+		end := 0
+		for end < len(rest) && rest[end] != ' ' && rest[end] != '\n' {
 			end++
 		}
-		for end < len(result) && result[end] != ' ' && result[end] != '\n' {
-			end++
-		}
-		if j := strings.IndexByte(result[i:end], '?'); j >= 0 {
-			result = result[:i+j] + "?..." + result[end:]
+		urlPart := rest[:end]
+		rest = rest[end:]
+
+		// Redact query string in this URL
+		if qi := strings.IndexByte(urlPart, '?'); qi >= 0 {
+			b.WriteString(urlPart[:qi])
+			b.WriteString("?...")
 		} else {
-			break
+			b.WriteString(urlPart)
 		}
 	}
-	return result
+	return b.String()
 }
 
 func formatDuration(d time.Duration) string {
@@ -711,7 +785,7 @@ func contentTypeForFormat(format string) string {
 	case "mp3":
 		return "audio/mpeg"
 	case "opus":
-		return "audio/opus"
+		return "audio/ogg"
 	case "ogg":
 		return "audio/ogg"
 	case "flac":
@@ -746,6 +820,7 @@ func (st *stream) broadcast(gen *streamGeneration, data []byte) {
 }
 
 func (cw *clientWriter) writeLoop() {
+	rc := http.NewResponseController(cw.w)
 	for {
 		select {
 		case <-cw.ctx.Done():
@@ -754,6 +829,9 @@ func (cw *clientWriter) writeLoop() {
 			if !ok {
 				return
 			}
+			// Set a short write deadline to prevent goroutines from hanging
+			// on clients that stop reading TCP data.
+			rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := cw.w.Write(data); err != nil {
 				cw.cancel()
 				return
