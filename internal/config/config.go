@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 
@@ -139,6 +140,34 @@ func (c *Config) Validate() error {
 	}
 	if c.FFmpeg.OutputFormat == "" {
 		return fmt.Errorf("ffmpeg.output_format must not be empty")
+	}
+	// Validate URLs to catch typos like missing scheme
+	if c.Server.PublicBaseURL != "" {
+		u, err := url.Parse(c.Server.PublicBaseURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("server.public_base_url must have a scheme and host, got %q", c.Server.PublicBaseURL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("server.public_base_url scheme must be http or https, got %q", u.Scheme)
+		}
+	}
+	if c.Server.StreamPublicBaseURL != "" {
+		u, err := url.Parse(c.Server.StreamPublicBaseURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("server.stream_public_base_url must have a scheme and host, got %q", c.Server.StreamPublicBaseURL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("server.stream_public_base_url scheme must be http or https, got %q", u.Scheme)
+		}
+	}
+	if c.HA.URL != "" {
+		u, err := url.Parse(c.HA.URL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("ha.url must have a scheme and host, got %q", c.HA.URL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("ha.url scheme must be http or https, got %q", u.Scheme)
+		}
 	}
 	return nil
 }
