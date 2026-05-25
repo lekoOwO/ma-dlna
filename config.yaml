@@ -2,6 +2,9 @@ server:
   bind_host: "0.0.0.0"
   http_port: 8787
   public_base_url: "http://192.168.1.10:8787"
+  # Set stream_public_base_url if HA/MA cannot reach the auto-detected
+  # controller interface (multi-NIC, Docker, VLAN deployments).
+  # stream_public_base_url: "http://10.0.0.5:8787"
 
 upnp:
   friendly_name: "Music Assistant Whole Home"
@@ -38,9 +41,10 @@ ffmpeg:
 stream:
   prebuffer_bytes: 524288
   ring_buffer_bytes: 8388608
+  init_segment_bytes: 262144
   max_clients_per_session: 16
   no_client_grace_seconds: 10
-  startup_timeout_seconds: 15
+  startup_timeout_seconds: 30
 
 security:
   require_stream_token: true
@@ -49,9 +53,9 @@ security:
     - "10.0.0.0/8"
     - "172.16.0.0/12"
   blocked_source_cidrs:
-    - "127.0.0.0/8"
     - "169.254.0.0/16"
   allow_public_sources: true
+  allow_loopback_sources: false
 
 logging:
   level: "info"
