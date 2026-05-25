@@ -26,6 +26,20 @@ func serverString() string {
 	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + version.Version
 }
 
+func localAddrFromConn(r *http.Request) net.IP {
+	a := r.Context().Value(http.LocalAddrContextKey)
+	if a == nil {
+		return nil
+	}
+	switch addr := a.(type) {
+	case *net.TCPAddr:
+		return addr.IP
+	case net.TCPAddr:
+		return addr.IP
+	}
+	return nil
+}
+
 func uuidUSN(id string) string {
 	for strings.HasPrefix(id, "uuid:") {
 		id = id[5:]
@@ -96,16 +110,22 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 
 func (h *Handler) baseURLForRequest(r *http.Request) string {
 	if h.cfg.UPnP.AutoBaseURL && r.Host != "" {
+		// Determine local IP from the connection's local address, if available.
+		// Fall back to Host header validation.
+		localIP := localAddrFromConn(r)
+		if localIP != nil {
+			return fmt.Sprintf("http://%s:%d", localIP.String(), h.cfg.Server.HTTPPort)
+		}
 		host, port, err := net.SplitHostPort(r.Host)
 		if err != nil {
 			host = r.Host
 			port = fmt.Sprintf("%d", h.cfg.Server.HTTPPort)
 		}
 		ip := net.ParseIP(host)
-		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
-			return h.cfg.Server.PublicBaseURL
+		if ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && matchingIP(ip) != nil {
+			return "http://" + net.JoinHostPort(host, port)
 		}
-		return "http://" + net.JoinHostPort(host, port)
+		return h.cfg.Server.PublicBaseURL
 	}
 	return h.cfg.Server.PublicBaseURL
 }
@@ -520,7 +540,16 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 	case "SUBSCRIBE":
 		sid := r.Header.Get("SID")
 		if sid != "" {
-			// Renewal — echo back the same SID
+			h.mu.Lock()
+			sub, ok := h.subscribers[sid]
+			if ok {
+				sub.expiresAt = time.Now().Add(1800 * time.Second)
+			}
+			h.mu.Unlock()
+			if !ok {
+				http.Error(w, "unknown SID", http.StatusPreconditionFailed)
+				return
+			}
 			w.Header().Set("SID", sid)
 			w.Header().Set("TIMEOUT", "Second-1800")
 			w.WriteHeader(http.StatusOK)
@@ -532,7 +561,7 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "missing CALLBACK", http.StatusBadRequest)
 			return
 		}
-		if err := h.validateCallback(cb); err != nil {
+		if err := h.validateCallback(cb, r.RemoteAddr); err != nil {
 			slog.Warn("Event callback rejected", "callback", cb, "error", err)
 			http.Error(w, "invalid CALLBACK", http.StatusPreconditionFailed)
 			return
@@ -574,7 +603,8 @@ func eventServiceFromPath(path string) string {
 	}
 }
 
-func (h *Handler) validateCallback(callback string) error {
+func (h *Handler) validateCallback(callback string, remoteAddr string) error {
+	remoteIP, _, _ := net.SplitHostPort(remoteAddr)
 	urls := extractCallbackURLs(callback)
 	if len(urls) == 0 {
 		return fmt.Errorf("no valid callback URL")
@@ -591,6 +621,19 @@ func (h *Handler) validateCallback(callback string) error {
 		ips, err := net.LookupIP(host)
 		if err != nil {
 			return fmt.Errorf("cannot resolve callback host: %w", err)
+		}
+		// If we can determine the requester IP, only allow callback to same IP
+		if remoteIP != "" {
+			matched := false
+			for _, ip := range ips {
+				if ip.String() == remoteIP {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("callback host does not match requester IP")
+			}
 		}
 		for _, ip := range ips {
 			if ip.IsLoopback() && !h.cfg.Security.AllowLoopbackSources {
@@ -814,8 +857,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 		slog.Info("SetAVTransportURI", "uri", safeURL(uri), "instance_id", instanceID)
 		if err := h.cfg.Security.ValidateOrReject(uri); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(soapFaultResponse("714", "Illegal MIME-Type or source URI rejected")))
 			return
 		}
@@ -936,7 +979,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		uri := ""
 		if h.sessionMgr != nil {
 			if active := h.sessionMgr.ActiveSession(); active != nil {
-				uri = safeURL(active.SourceURI)
+				uri = ""
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`

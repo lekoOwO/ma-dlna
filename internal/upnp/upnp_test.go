@@ -423,19 +423,40 @@ func TestSubscriptionNew(t *testing.T) {
 
 func TestSubscriptionRenewal(t *testing.T) {
 	cfg := config.DefaultConfig()
-	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-sub"}
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-sub", subscribers: make(map[string]*eventSubscriber)}
 
+	// First create a real subscription
+	w1 := &testRespWriter{header: make(http.Header)}
+	r1, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r1.Header.Set("CALLBACK", "<http://192.168.1.1:12345/>")
+	r1.Header.Set("NT", "upnp:event")
+	r1.Header.Set("TIMEOUT", "Second-1800")
+	h.serveEvent(w1, r1)
+	sid := w1.header.Get("SID")
+	if sid == "" {
+		t.Fatal("initial SUBSCRIBE must return SID")
+	}
+
+	// Renew with the real SID
 	w := &testRespWriter{header: make(http.Header)}
 	r, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
-	r.Header.Set("SID", "uuid:existing-sid")
+	r.Header.Set("SID", sid)
 
 	h.serveEvent(w, r)
 
 	if w.status != http.StatusOK {
 		t.Errorf("renewal SUBSCRIBE expected 200, got %d", w.status)
 	}
-	if w.header.Get("SID") != "uuid:existing-sid" {
+	if w.header.Get("SID") != sid {
 		t.Errorf("renewal must echo existing SID, got %s", w.header.Get("SID"))
+	}
+	// Renewal with unknown SID should fail
+	w2 := &testRespWriter{header: make(http.Header)}
+	r2, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r2.Header.Set("SID", "uuid:nonexistent")
+	h.serveEvent(w2, r2)
+	if w2.status != http.StatusPreconditionFailed {
+		t.Errorf("renewal with unknown SID expected 412, got %d", w2.status)
 	}
 }
 

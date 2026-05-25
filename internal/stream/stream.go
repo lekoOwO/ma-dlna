@@ -65,6 +65,7 @@ type clientWriter struct {
 // streamGeneration holds the per-run mutable state for a single ffmpeg instance.
 // It is replaced on each Pause/Seek/Resume cycle.
 type streamGeneration struct {
+	mu         sync.Mutex
 	ctx        context.Context
 	cancel     context.CancelFunc
 	started    chan struct{}
@@ -81,6 +82,32 @@ func (st *stream) currentGen() *streamGeneration {
 	st.genMu.Lock()
 	defer st.genMu.Unlock()
 	return st.gen
+}
+
+func (gen *streamGeneration) getErr() error {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	return gen.err
+}
+
+func (gen *streamGeneration) setErr(err error) {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	gen.err = err
+}
+
+func (gen *streamGeneration) killCmd() {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	if gen.cmd != nil && gen.cmd.Process != nil {
+		gen.cmd.Process.Kill()
+	}
+}
+
+func (gen *streamGeneration) getCmd() *exec.Cmd {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	return gen.cmd
 }
 
 func NewStreamer(cfg *config.Config) *Streamer {
@@ -145,9 +172,7 @@ func (s *Streamer) Stop(sessionID string) {
 		st.genMu.Unlock()
 		if gen != nil {
 			gen.cancel()
-			if gen.cmd != nil && gen.cmd.Process != nil {
-				gen.cmd.Process.Kill()
-			}
+			gen.killCmd()
 			st.closeClients(gen)
 		}
 		slog.Info("Stream stopped", "session_id", sessionID)
@@ -194,9 +219,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	st.genMu.Unlock()
 	if st.active.Swap(false) && oldGen != nil {
 		oldGen.cancel()
-		if oldGen.cmd != nil && oldGen.cmd.Process != nil {
-			oldGen.cmd.Process.Kill()
-		}
+		oldGen.killCmd()
 		st.closeClients(oldGen)
 	}
 	if st.runsInFlight.Load() > 0 && oldGen != nil {
@@ -362,7 +385,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if gen.err != nil {
+	if gen.getErr() != nil {
 		http.Error(w, "Stream error", http.StatusInternalServerError)
 		return
 	}
@@ -383,6 +406,11 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st.clientsMu.Lock()
+	if st.currentGen() != gen || gen.ctx.Err() != nil {
+		st.clientsMu.Unlock()
+		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
+		return
+	}
 	if len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
 		st.clientsMu.Unlock()
 		http.Error(w, "Too many clients", http.StatusTooManyRequests)
@@ -399,12 +427,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	// Reject if generation changed while we waited
-	if st.currentGen() != gen {
-		st.clientsMu.Unlock()
-		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
-		return
-	}
 	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
@@ -457,13 +479,13 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (st *stream) run(gen *streamGeneration) {
+	hadError := false
 	defer func() {
 		st.runsInFlight.Store(0)
 		if gen.ctx.Err() == nil {
-			// Natural exit: close clients so /live connections don't hang.
 			st.closeClients(gen)
 			st.active.Store(false)
-			if st.endCB != nil {
+			if !hadError && st.endCB != nil {
 				st.endCB(st.sessionID)
 			}
 		}
@@ -479,6 +501,7 @@ func (st *stream) run(gen *streamGeneration) {
 	cmd := exec.CommandContext(gen.ctx, bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		hadError = true
 		gen.err = err
 		slog.Error("Failed to create ffmpeg stdout pipe", "error", err)
 		close(gen.started)
@@ -486,6 +509,7 @@ func (st *stream) run(gen *streamGeneration) {
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		hadError = true
 		gen.err = err
 		slog.Error("Failed to create ffmpeg stderr pipe", "error", err)
 		close(gen.started)
@@ -493,6 +517,7 @@ func (st *stream) run(gen *streamGeneration) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		hadError = true
 		gen.err = err
 		slog.Error("Failed to start ffmpeg", "error", err)
 		close(gen.started)
@@ -534,7 +559,8 @@ func (st *stream) run(gen *streamGeneration) {
 
 waitproc:
 	if err := cmd.Wait(); err != nil && gen.ctx.Err() == nil {
-		gen.err = err
+		hadError = true
+		gen.setErr(err)
 		slog.Error("ffmpeg exited with error", "session_id", st.sessionID, "error", err)
 		if st.errorCB != nil {
 			st.errorCB(st.sessionID, err)
@@ -622,7 +648,7 @@ func (st *stream) readProgress(gen *streamGeneration, stderr io.Reader) {
 		}
 	}
 	if len(errLines) > 0 {
-		slog.Warn("ffmpeg stderr", "session_id", st.sessionID, "output", strings.Join(errLines, "\n"))
+		slog.Warn("ffmpeg stderr", "session_id", st.sessionID, "output", redactStderr(strings.Join(errLines, "\n")))
 	}
 }
 
@@ -642,6 +668,30 @@ func isProgressLine(line string) bool {
 		}
 	}
 	return false
+}
+
+func redactStderr(line string) string {
+	// Redact URLs in ffmpeg stderr to avoid leaking tokens/signatures
+	result := line
+	for {
+		i := strings.Index(result, "http")
+		if i < 0 {
+			break
+		}
+		end := i
+		for end < len(result) && result[end] != ' ' && result[end] != '\n' && result[end] != ':' {
+			end++
+		}
+		for end < len(result) && result[end] != ' ' && result[end] != '\n' {
+			end++
+		}
+		if j := strings.IndexByte(result[i:end], '?'); j >= 0 {
+			result = result[:i+j] + "?..." + result[end:]
+		} else {
+			break
+		}
+	}
+	return result
 }
 
 func formatDuration(d time.Duration) string {

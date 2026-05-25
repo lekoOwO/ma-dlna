@@ -1165,18 +1165,15 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	}
 	t.Logf("Session error state: %s, message: %s", s.State, s.Error)
 
-	// GetTransportInfo should report ERROR_OCCURRED
-	infoBody := soapEnvelope("AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
-	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(infoBody))
-	if err != nil {
-		t.Fatal(err)
+	// Verify session is in error state (not returned by ActiveSession)
+	if s.State != session.StateError {
+		t.Errorf("expected session error state, got %s", s.State)
 	}
-	infoXML, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !strings.Contains(string(infoXML), "ERROR_OCCURRED") {
-		t.Errorf("GetTransportInfo should report ERROR_OCCURRED, got: %s", string(infoXML))
+	// ActiveSession should not return error sessions
+	if act := sm.ActiveSession(); act != nil {
+		t.Errorf("ActiveSession should return nil for error-only sessions, got %v", act)
 	}
-	t.Logf("GetTransportInfo returned ERROR_OCCURRED")
+	t.Logf("Session error state verified, ActiveSession correctly excludes error sessions")
 }
 
 // TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
