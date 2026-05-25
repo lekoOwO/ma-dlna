@@ -1230,7 +1230,7 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	action := extractSOAPAction(body)
+	action := extractActionName(r, body)
 	slog.Debug("RenderingControl action", "action", action)
 
 	var response string
@@ -1360,7 +1360,7 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	action := extractSOAPAction(body)
+	action := extractActionName(r, body)
 	slog.Debug("ConnectionManager action", "action", action)
 
 	var response string
@@ -1438,6 +1438,22 @@ func parseSOAPRequest(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("request body too large")
 	}
 	return buf.Bytes(), nil
+}
+
+// extractActionName returns the SOAP action name from the body, falling back to
+// the SOAPACTION header if the body parser returns empty (some controllers only
+// set the header).
+func extractActionName(r *http.Request, body []byte) string {
+	if action := extractSOAPAction(body); action != "" {
+		return action
+	}
+	// Fallback: parse from SOAPACTION header (format: "urn:...service:...#Action")
+	if sa := r.Header.Get("SOAPACTION"); sa != "" {
+		if i := strings.LastIndexByte(sa, '#'); i >= 0 {
+			return sa[i+1:]
+		}
+	}
+	return ""
 }
 
 func extractSOAPAction(body []byte) string {
