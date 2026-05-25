@@ -328,6 +328,8 @@ func TestExtractST(t *testing.T) {
 }
 
 func TestMatchesSearchTarget(t *testing.T) {
+	cfg := config.DefaultConfig()
+	h := &Handler{cfg: &cfg, deviceUUID: "uuid:test-match"}
 	tests := []struct {
 		body   string
 		expect bool
@@ -336,11 +338,14 @@ func TestMatchesSearchTarget(t *testing.T) {
 		{"ST: ssdp:all", true},
 		{"ST: upnp:rootdevice", true},
 		{"ST: urn:schemas-upnp-org:service:AVTransport:1", true},
+		{"ST: urn:schemas-upnp-org:service:RenderingControl:1", true},
+		{"ST: urn:schemas-upnp-org:service:ConnectionManager:1", true},
+		{"ST: uuid:test-match", true},
 		{"ST: urn:schemas-upnp-org:device:MediaServer:1", false},
 		{"", false},
 	}
 	for _, tc := range tests {
-		if got := matchesSearchTarget(tc.body); got != tc.expect {
+		if got := h.matchesSearchTarget(tc.body); got != tc.expect {
 			t.Errorf("matchesSearchTarget(%q): expected %v, got %v", tc.body, tc.expect, got)
 		}
 	}

@@ -393,8 +393,11 @@ var ErrNotFound = errors.New("session not found")
 func safeURL(raw string) string {
 	if i := strings.Index(raw, "://"); i > 0 {
 		if j := strings.Index(raw[i+3:], "@"); j > 0 {
-			return raw[:i+3] + "***@" + raw[i+3+j+1:]
+			raw = raw[:i+3] + "***@" + raw[i+3+j+1:]
 		}
+	}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		raw = raw[:i] + "?..."
 	}
 	return raw
 }

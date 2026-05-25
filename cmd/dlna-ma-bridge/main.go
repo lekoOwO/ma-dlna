@@ -148,14 +148,14 @@ func sessionsHandler(mgr *session.Manager) http.HandlerFunc {
 				url = url[:i] + "?token=***"
 			}
 			redacted = append(redacted, map[string]any{
-				"session_id":    s.ID,
-				"source_uri":    s.SourceURI,
-				"metadata":      s.Metadata,
-				"state":         s.State,
-				"stream_url":    url,
-				"created_at":    s.CreatedAt,
-				"updated_at":    s.UpdatedAt,
-				"error":         s.Error,
+				"session_id": s.ID,
+				"source_uri": s.SourceURI,
+				"metadata":   s.Metadata,
+				"state":      s.State,
+				"stream_url": url,
+				"created_at": s.CreatedAt,
+				"updated_at": s.UpdatedAt,
+				"error":      s.Error,
 			})
 		}
 		writeJSON(w, http.StatusOK, redacted)
@@ -175,14 +175,14 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 			url = url[:i] + "?token=***"
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"session_id":  s.ID,
-			"source_uri":  s.SourceURI,
-			"metadata":    s.Metadata,
-			"state":       s.State,
-			"stream_url":  url,
-			"created_at":  s.CreatedAt,
-			"updated_at":  s.UpdatedAt,
-			"error":       s.Error,
+			"session_id": s.ID,
+			"source_uri": s.SourceURI,
+			"metadata":   s.Metadata,
+			"state":      s.State,
+			"stream_url": url,
+			"created_at": s.CreatedAt,
+			"updated_at": s.UpdatedAt,
+			"error":      s.Error,
 		})
 	}
 }
@@ -204,6 +204,13 @@ func httpLogMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func redactQuery(raw string) string {
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i] + "?..."
+	}
+	return raw
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

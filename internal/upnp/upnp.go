@@ -24,6 +24,11 @@ func serverString() string {
 	return runtime.GOOS + "/ UPnP/1.0 dlna-ma-bridge/" + version.Version
 }
 
+func uuidUSN(id string) string {
+	id = strings.TrimPrefix(id, "uuid:")
+	return "uuid:" + id
+}
+
 type eventSubscriber struct {
 	sid      string
 	callback string
@@ -268,7 +273,7 @@ func (h *Handler) mserve(ctx context.Context) {
 				continue
 			}
 			st := extractST(body)
-			if !matchesSearchTarget(body) {
+			if !h.matchesSearchTarget(body) {
 				continue
 			}
 			key := msearchKey{ip: m.remoteAddr.IP.String(), st: st}
@@ -294,12 +299,15 @@ func extractST(body string) string {
 	return ""
 }
 
-func matchesSearchTarget(body string) bool {
+func (h *Handler) matchesSearchTarget(body string) bool {
 	for _, st := range []string{
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
 		"ssdp:all",
 		"upnp:rootdevice",
 		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1",
+		uuidUSN(h.deviceUUID),
 	} {
 		if strings.Contains(body, st) {
 			return true
@@ -309,11 +317,12 @@ func matchesSearchTarget(body string) bool {
 }
 
 func (h *Handler) mserveResponse(base, st string) string {
-	usn := h.deviceUUID + "::" + st
+	u := uuidUSN(h.deviceUUID)
+	usn := u + "::" + st
 	if strings.HasPrefix(st, "uuid:") {
-		usn = st
+		usn = u
 	} else if st == "ssdp:all" {
-		usn = h.deviceUUID + "::upnp:rootdevice"
+		usn = u + "::upnp:rootdevice"
 	}
 	return fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
@@ -362,7 +371,7 @@ func (h *Handler) broadcastSSDP(msgFn func(string, string) string) {
 	// UPnP spec requires alive for rootdevice, uuid, device type, and each service
 	targets := []string{
 		"upnp:rootdevice",
-		"uuid:" + h.deviceUUID,
+		uuidUSN(h.deviceUUID),
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
 		"urn:schemas-upnp-org:service:AVTransport:1",
 		"urn:schemas-upnp-org:service:RenderingControl:1",
@@ -387,9 +396,10 @@ func (h *Handler) broadcastSSDP(msgFn func(string, string) string) {
 }
 
 func (h *Handler) ssdpAliveMsg(base, nt string) string {
-	usn := h.deviceUUID + "::" + nt
+	u := uuidUSN(h.deviceUUID)
+	usn := u + "::" + nt
 	if strings.HasPrefix(nt, "uuid:") {
-		usn = nt
+		usn = u
 	}
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+
@@ -410,9 +420,10 @@ func (h *Handler) ssdpAliveMsg(base, nt string) string {
 }
 
 func (h *Handler) ssdpByeByeMsg(_ string, nt string) string {
-	usn := h.deviceUUID + "::" + nt
+	u := uuidUSN(h.deviceUUID)
+	usn := u + "::" + nt
 	if strings.HasPrefix(nt, "uuid:") {
-		usn = nt
+		usn = u
 	}
 	return fmt.Sprintf(
 		"NOTIFY * HTTP/1.1\r\n"+

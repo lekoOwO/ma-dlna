@@ -50,9 +50,9 @@ type stream struct {
 	ffmpegCfg    config.FFmpegConfig
 	startTime    time.Time
 	resumeOffset time.Duration
-	ffmpegTime    atomic.Int64
-	runsInFlight  atomic.Int32
-	errorCB       ErrorCallback
+	ffmpegTime   atomic.Int64
+	runsInFlight atomic.Int32
+	errorCB      ErrorCallback
 }
 
 type clientWriter struct {
@@ -172,9 +172,10 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		}
 		st.clientsMu.Unlock()
 	}
-	if st.done != nil {
+	if st.runsInFlight.Load() > 0 && st.done != nil {
 		<-st.done
 	}
+	st.runsInFlight.Store(0)
 	st.active.Store(true)
 	st.ringBuf = NewRingBuffer(st.ringBuf.Size())
 	_, cancel := context.WithCancel(context.Background())
@@ -194,7 +195,7 @@ func (s *Streamer) Resume(sessionID string) {
 	if !ok || !st.active.Load() {
 		return
 	}
-	if st.runsInFlight.Load() > 0 {
+	if !st.runsInFlight.CompareAndSwap(0, 1) {
 		return
 	}
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
@@ -318,6 +319,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher = f
 	}
 
+	st.clientsMu.Lock()
+	if len(st.clients) >= s.cfg.Stream.MaxClientsPerSession {
+		st.clientsMu.Unlock()
+		http.Error(w, "Too many clients", http.StatusTooManyRequests)
+		return
+	}
+	st.clientsMu.Unlock()
+
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -328,23 +337,8 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	st.clientsMu.Lock()
-	if len(st.clients) >= s.cfg.Stream.MaxClientsPerSession {
-		st.clientsMu.Unlock()
-		cw.cancel()
-		return
-	}
-	st.clients[clientID] = cw
-	isFirst := len(st.clients) == 1
-	st.clientsMu.Unlock()
-
-	if isFirst && s.firstClientCB != nil {
-		s.firstClientCB(sessionID)
-	}
-
-	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
-
-	// Replay prebuffer data so late clients get stream headers
+	// Replay prebuffer before making this client visible to broadcast,
+	// so the first data the client receives is the prebuffer header.
 	wp := st.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
@@ -355,6 +349,17 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n > 0 {
 		cw.ch <- prebuf[:n]
 	}
+
+	st.clientsMu.Lock()
+	st.clients[clientID] = cw
+	isFirst := len(st.clients) == 1
+	st.clientsMu.Unlock()
+
+	if isFirst && s.firstClientCB != nil {
+		s.firstClientCB(sessionID)
+	}
+
+	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
 
 	go cw.writeLoop()
 
@@ -387,7 +392,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (st *stream) run(ctx context.Context) {
 	st.runsInFlight.Add(1)
 	defer func() {
-		st.runsInFlight.Add(-1)
+		st.runsInFlight.Store(0)
 		close(st.done)
 		// Only mark inactive if the context was NOT cancelled (natural exit).
 		// When we cancel the context (Stop/Pause), restartWithOffset/Resume
@@ -531,18 +536,21 @@ func (st *stream) readProgress(stderr io.Reader) {
 	var errLines []string
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "out_time_ms=") {
-			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_ms="), 10, 64); err == nil {
-				st.ffmpegTime.Store(ms * int64(time.Millisecond))
+		if strings.HasPrefix(line, "out_time_us=") {
+			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_us="), 10, 64); err == nil {
+				st.ffmpegTime.Store(ms * int64(time.Microsecond))
 			}
 		} else if strings.HasPrefix(line, "out_time=") {
-			// Fallback for ffmpeg versions without out_time_ms
 			if t, err := time.Parse("15:04:05.000000", strings.TrimPrefix(line, "out_time=")); err == nil {
 				ns := int64(t.Hour())*int64(time.Hour) +
 					int64(t.Minute())*int64(time.Minute) +
 					int64(t.Second())*int64(time.Second) +
 					int64(t.Nanosecond())
 				st.ffmpegTime.Store(ns)
+			}
+		} else if strings.HasPrefix(line, "out_time_ms=") {
+			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_ms="), 10, 64); err == nil {
+				st.ffmpegTime.Store(ms * int64(time.Millisecond))
 			}
 		} else if !isProgressLine(line) {
 			errLines = append(errLines, line)
