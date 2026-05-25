@@ -51,10 +51,11 @@ type Session struct {
 const maxSessions = 64
 
 type Manager struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	cfg      *config.Config
-	streamer *stream.Streamer
+	mu            sync.RWMutex
+	sessions      map[string]*Session
+	lastSessionID string
+	cfg           *config.Config
+	streamer      *stream.Streamer
 }
 
 func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
@@ -105,6 +106,7 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
 	m.sessions[id] = s
+	m.lastSessionID = id
 	m.mu.Unlock()
 
 	for _, sid := range toStop {
@@ -235,11 +237,13 @@ func (m *Manager) StatusSession() *Session {
 	if s != nil {
 		return s
 	}
+	// Fall back to last session if it's in error state
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, s := range m.sessions {
-		if s.State == StateError {
-			return s.snapshot()
+	sid := m.lastSessionID
+	m.mu.RUnlock()
+	if sid != "" {
+		if s := m.Get(sid); s != nil && s.State == StateError {
+			return s
 		}
 	}
 	return nil

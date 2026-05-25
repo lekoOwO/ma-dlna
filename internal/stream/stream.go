@@ -765,9 +765,9 @@ func redactStderr(line string) string {
 		b.WriteString(rest[:i])
 		rest = rest[i:]
 
-		// Find end of URL (ends at whitespace or end-of-string)
+		// Find end of URL (ends at whitespace, punctuation, or end-of-string)
 		end := 0
-		for end < len(rest) && rest[end] != ' ' && rest[end] != '\n' {
+		for end < len(rest) && !isURLBoundary(rest[end]) {
 			end++
 		}
 		urlPart := rest[:end]
@@ -782,6 +782,14 @@ func redactStderr(line string) string {
 		}
 	}
 	return b.String()
+}
+
+func isURLBoundary(c byte) bool {
+	switch c {
+	case ' ', '\n', '\t', '\r', '"', '\'', '(', ')', '[', ']', '<', '>', ',':
+		return true
+	}
+	return false
 }
 
 func formatDuration(d time.Duration) string {
