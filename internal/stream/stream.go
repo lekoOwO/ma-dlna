@@ -39,7 +39,6 @@ type stream struct {
 	sourceURI    string
 	active       atomic.Bool
 	clientsMu    sync.Mutex
-	err          error
 	ffmpegCfg    config.FFmpegConfig
 	startTime    time.Time
 	resumeOffset time.Duration
@@ -71,6 +70,7 @@ type streamGeneration struct {
 	cmd     *exec.Cmd
 	clients map[string]*clientWriter
 	offset  time.Duration
+	err     error
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -215,7 +215,6 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	st.genMu.Lock()
 	st.gen = newGen
 	st.ffmpegTime.Store(0)
-	st.err = nil
 	st.active.Store(true)
 	st.genMu.Unlock()
 }
@@ -244,10 +243,9 @@ func (s *Streamer) Resume(sessionID string) {
 	st.gen = newGen
 	st.startTime = time.Now()
 	st.ffmpegTime.Store(0)
-	st.err = nil
 	st.genMu.Unlock()
 	go st.run(newGen)
-	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
+	slog.Info("Stream resuming", "session_id", sessionID, "offset", newGen.offset.Round(time.Second))
 }
 
 func (s *Streamer) Elapsed(sessionID string) time.Duration {
@@ -300,7 +298,9 @@ func (s *Streamer) TotalClients() int {
 	total := 0
 	for _, st := range s.streams {
 		st.clientsMu.Lock()
-		total += len(st.currentGen().clients)
+		if gen := st.currentGen(); gen != nil {
+			total += len(gen.clients)
+		}
 		st.clientsMu.Unlock()
 	}
 	return total
@@ -357,7 +357,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if st.err != nil {
+	if gen.err != nil {
 		http.Error(w, "Stream error", http.StatusInternalServerError)
 		return
 	}
@@ -467,21 +467,21 @@ func (st *stream) run(gen *streamGeneration) {
 	cmd := exec.CommandContext(gen.ctx, bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		st.err = err
+		gen.err = err
 		slog.Error("Failed to create ffmpeg stdout pipe", "error", err)
 		close(gen.started)
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		st.err = err
+		gen.err = err
 		slog.Error("Failed to create ffmpeg stderr pipe", "error", err)
 		close(gen.started)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		st.err = err
+		gen.err = err
 		slog.Error("Failed to start ffmpeg", "error", err)
 		close(gen.started)
 		if st.errorCB != nil {
@@ -522,7 +522,7 @@ func (st *stream) run(gen *streamGeneration) {
 
 waitproc:
 	if err := cmd.Wait(); err != nil && gen.ctx.Err() == nil {
-		st.err = err
+		gen.err = err
 		slog.Error("ffmpeg exited with error", "session_id", st.sessionID, "error", err)
 		if st.errorCB != nil {
 			st.errorCB(st.sessionID, err)

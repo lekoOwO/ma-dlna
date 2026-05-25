@@ -402,6 +402,7 @@ func TestSubscriptionNew(t *testing.T) {
 	r.Header.Set("CALLBACK", "<http://127.0.0.1:12345/>")
 	r.Header.Set("NT", "upnp:event")
 	r.Header.Set("TIMEOUT", "Second-1800")
+	r.Header.Set("CALLBACK", "<http://192.168.1.1:12345/>")
 
 	h.serveEvent(w, r)
 

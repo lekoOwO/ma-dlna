@@ -34,10 +34,11 @@ func uuidUSN(id string) string {
 }
 
 type eventSubscriber struct {
-	sid      string
-	callback string
-	service  string
-	seq      int
+	sid       string
+	callback  string
+	service   string
+	seq       int
+	expiresAt time.Time
 }
 
 type Handler struct {
@@ -95,11 +96,16 @@ func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
 
 func (h *Handler) baseURLForRequest(r *http.Request) string {
 	if h.cfg.UPnP.AutoBaseURL && r.Host != "" {
-		host := r.Host
-		if !strings.Contains(host, ":") {
-			host = fmt.Sprintf("%s:%d", host, h.cfg.Server.HTTPPort)
+		host, port, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+			port = fmt.Sprintf("%d", h.cfg.Server.HTTPPort)
 		}
-		return "http://" + host
+		ip := net.ParseIP(host)
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			return h.cfg.Server.PublicBaseURL
+		}
+		return "http://" + net.JoinHostPort(host, port)
 	}
 	return h.cfg.Server.PublicBaseURL
 }
@@ -522,19 +528,26 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		// New subscription
 		sid = "uuid:" + generateSubscriptionUUID()
+		if cb == "" {
+			http.Error(w, "missing CALLBACK", http.StatusBadRequest)
+			return
+		}
+		if err := h.validateCallback(cb); err != nil {
+			slog.Warn("Event callback rejected", "callback", cb, "error", err)
+			http.Error(w, "invalid CALLBACK", http.StatusPreconditionFailed)
+			return
+		}
 		w.Header().Set("SID", sid)
 		w.Header().Set("TIMEOUT", "Second-1800")
 		w.Header().Set("SERVER", serverString())
 		w.WriteHeader(http.StatusOK)
 
-		if cb != "" {
-			if h.subscribers != nil {
-				h.mu.Lock()
-				h.subscribers[sid] = &eventSubscriber{sid: sid, callback: cb, service: svc}
-				h.mu.Unlock()
-			}
-			go h.sendInitialEvent(cb, sid, svc)
+		if h.subscribers != nil {
+			h.mu.Lock()
+			h.subscribers[sid] = &eventSubscriber{sid: sid, callback: cb, service: svc, expiresAt: time.Now().Add(1800 * time.Second)}
+			h.mu.Unlock()
 		}
+		go h.sendInitialEvent(cb, sid, svc)
 
 	case "UNSUBSCRIBE":
 		sid := r.Header.Get("SID")
@@ -580,7 +593,9 @@ func (h *Handler) validateCallback(callback string) error {
 			return fmt.Errorf("cannot resolve callback host: %w", err)
 		}
 		for _, ip := range ips {
-			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			if ip.IsLoopback() && !h.cfg.Security.AllowLoopbackSources {
+			}
+			if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 				ip.IsMulticast() || ip.IsUnspecified() {
 				return fmt.Errorf("callback IP blocked: %s", ip)
 			}
@@ -666,22 +681,26 @@ func (h *Handler) notifySubscribers(service, lastChangeXML string) {
 		return
 	}
 	h.mu.Lock()
-	subs := make([]*eventSubscriber, 0)
+	subs := make([]subSnapshot, 0)
+	now := time.Now()
 	for _, sub := range h.subscribers {
+		if now.After(sub.expiresAt) {
+			delete(h.subscribers, sub.sid)
+			continue
+		}
 		if sub.service == service {
 			sub.seq++
-			subs = append(subs, sub)
+			subs = append(subs, subSnapshot{
+				sid:      sub.sid,
+				callback: sub.callback,
+				service:  sub.service,
+				seq:      sub.seq,
+			})
 		}
 	}
 	h.mu.Unlock()
 
-	for _, sub := range subs {
-		s := subSnapshot{
-			sid:      sub.sid,
-			callback: sub.callback,
-			service:  sub.service,
-			seq:      sub.seq,
-		}
+	for _, s := range subs {
 		go h.sendStateChange(s, lastChangeXML)
 	}
 }
@@ -906,7 +925,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		uri := ""
 		if h.sessionMgr != nil {
 			if active := h.sessionMgr.ActiveSession(); active != nil {
-				uri = active.StreamURL
+				uri = safeURL(active.StreamURL)
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -1012,8 +1031,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		slog.Warn("Unknown AVTransport action", "action", action)
-		w.WriteHeader(http.StatusInternalServerError)
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
 		return
 	}
@@ -1050,6 +1069,11 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		desired := extractSOAPField(body, "DesiredVolume")
 		vol := 50
 		if _, err := fmt.Sscanf(desired, "%d", &vol); err != nil {
+			if vol < 0 {
+				vol = 0
+			} else if vol > 100 {
+				vol = 100
+			}
 			vol = 50
 		}
 
@@ -1083,14 +1107,17 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		muteStr := extractSOAPField(body, "DesiredMute")
 		h.mu.Lock()
 		h.muted = muteStr == "1"
+		if muteStr == "1" {
+			go h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0)
+		}
 		h.mu.Unlock()
 
 		response = renderingResponse(action, `
 <u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
 
 	default:
-		w.WriteHeader(http.StatusInternalServerError)
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
 		return
 	}
@@ -1146,8 +1173,8 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 </u:GetCurrentConnectionInfoResponse>`)
 
 	default:
-		w.WriteHeader(http.StatusInternalServerError)
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(soapFaultResponse("401", "Invalid Action")))
 		return
 	}
