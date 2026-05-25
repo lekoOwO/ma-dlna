@@ -65,21 +65,28 @@ type clientWriter struct {
 
 // streamGeneration holds the per-run mutable state for a single ffmpeg instance.
 // It is replaced on each Pause/Seek/Resume cycle.
+//
+// Late-client reconnect note: gen.header captures ffmpeg's first stdout chunk
+// as a best-effort init segment. For MP3 this is usually sufficient; for Ogg/Opus,
+// FLAC, and WAV, the header may not form a complete decodable init segment.
+// Late reconnects to containerized formats are best-effort.
 type streamGeneration struct {
-	mu          sync.Mutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	started     chan struct{}
-	done        chan struct{}
-	firstClient chan struct{}
-	ringBuf     *RingBuffer
-	cmd         *exec.Cmd
-	clients     map[string]*clientWriter
-	offset      time.Duration
-	err         error
-	ffmpegTime  atomic.Int64
-	header      []byte
-	headerSize  int64
+	mu              sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	started         chan struct{}
+	done            chan struct{}
+	firstClient     chan struct{}
+	firstClientOnce sync.Once
+	ringBuf         *RingBuffer
+	cmd             *exec.Cmd
+	clients         map[string]*clientWriter
+	offset          time.Duration
+	err             error
+	ffmpegTime      atomic.Int64
+	header          []byte
+	headerSize      int64
+	active          atomic.Bool
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -442,12 +449,13 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher = f
 	}
 
-	// Check gen is still current before acquiring clientsMu
-	if st.currentGen() != gen || gen.ctx.Err() != nil {
+	st.clientsMu.Lock()
+	// Re-check atomically: gen must be current, active, and not canceled
+	if st.currentGen() != gen || !gen.active.Load() || gen.ctx.Err() != nil {
+		st.clientsMu.Unlock()
 		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
 		return
 	}
-	st.clientsMu.Lock()
 	if len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
 		st.clientsMu.Unlock()
 		http.Error(w, "Too many clients", http.StatusTooManyRequests)
@@ -483,15 +491,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.ch <- append([]byte(nil), prebuf[:n]...)
 	}
 	gen.clients[clientID] = cw
-	isFirst := len(gen.clients) == 1
 	st.clientsMu.Unlock()
 
-	if isFirst {
+	gen.firstClientOnce.Do(func() {
 		close(gen.firstClient)
 		if s.firstClientCB != nil {
 			s.firstClientCB(sessionID)
 		}
-	}
+	})
 
 	slog.Info("Client attached to stream", "session_id", sessionID, "client_id", clientID)
 
@@ -581,6 +588,7 @@ func (st *stream) run(gen *streamGeneration) {
 	}
 
 	gen.setCmd(cmd)
+	gen.active.Store(true)
 	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", cmd.Process.Pid)
 	close(gen.started)
 

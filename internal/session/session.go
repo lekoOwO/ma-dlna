@@ -360,7 +360,7 @@ func (m *Manager) evictLocked() {
 				}
 			}
 		}
-		if oldest != nil {
+		if oldest != nil && oldest.ID != m.currentSessionID {
 			delete(m.sessions, oldest.ID)
 			slog.Debug("Evicted session", "session_id", oldest.ID, "state", string(oldest.State))
 			return true

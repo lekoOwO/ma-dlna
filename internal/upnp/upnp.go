@@ -98,8 +98,22 @@ func (h *Handler) Stop() {
 
 // NotifyError sends AVTransport LastChange on stream/session errors (ffmpeg crash,
 // first-client timeout, pipe failure) so subscribers see ERROR_OCCURRED without polling.
+// Only fires if the given sessionID matches the current AVTransport session.
 func (h *Handler) NotifyError(sessionID string) {
+	cur := h.sessionMgr.CurrentSession()
+	if cur == nil || cur.ID != sessionID {
+		return
+	}
 	go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
+}
+
+// NotifyEnded sends AVTransport LastChange on natural stream end (EOF).
+func (h *Handler) NotifyEnded(sessionID string) {
+	cur := h.sessionMgr.CurrentSession()
+	if cur == nil || cur.ID != sessionID {
+		return
+	}
+	go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 }
 
 func (h *Handler) activeSession() *session.Session {
@@ -126,7 +140,8 @@ func (h *Handler) baseURLForRequest(r *http.Request) string {
 		// Determine local IP from the connection's local address, if available.
 		// Fall back to Host header validation.
 		localIP := localAddrFromConn(r)
-		if localIP != nil && !localIP.IsLoopback() && !localIP.IsUnspecified() {
+		if localIP != nil && !localIP.IsLoopback() && !localIP.IsUnspecified() &&
+			!localIP.IsLinkLocalUnicast() && !localIP.IsLinkLocalMulticast() {
 			return "http://" + net.JoinHostPort(localIP.String(), fmt.Sprintf("%d", h.cfg.Server.HTTPPort))
 		}
 		host, port, err := net.SplitHostPort(r.Host)
@@ -908,7 +923,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action := extractSOAPAction(body)
+	action := extractActionName(r, body)
 
 	slog.Info("AVTransport action", "action", action)
 
@@ -1004,7 +1019,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
 			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
 			h.sessionMgr.SetError(active.ID, err.Error())
-			go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("PAUSED_PLAYBACK", "ERROR_OCCURRED"))
 		} else {
 			go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 		}
@@ -1430,7 +1444,9 @@ func extractActionName(r *http.Request, body []byte) string {
 		return action
 	}
 	// Fallback: parse from SOAPACTION header (format: "urn:...service:...#Action")
+	// Header value may be quoted; strip quotes before parsing.
 	if sa := r.Header.Get("SOAPACTION"); sa != "" {
+		sa = strings.Trim(sa, `"`)
 		if i := strings.LastIndexByte(sa, '#'); i >= 0 {
 			return sa[i+1:]
 		}

@@ -41,18 +41,20 @@ func main() {
 
 	streamer := stream.NewStreamer(cfg)
 	sessionMgr := session.NewManager(cfg, streamer)
+	maAdapter := maadapter.New(cfg)
+	upnpHandler := upnp.NewHandler(cfg, sessionMgr, maAdapter)
+
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string) {
 		sessionMgr.SetPlaying(sessionID)
 	})
 	streamer.SetEndCallback(func(sessionID string) {
 		sessionMgr.Stop(sessionID)
+		upnpHandler.NotifyEnded(sessionID)
 	})
 	streamer.SetErrorCallback(func(sessionID string, err error) {
 		sessionMgr.SetError(sessionID, err.Error())
 	})
-	maAdapter := maadapter.New(cfg)
-	upnpHandler := upnp.NewHandler(cfg, sessionMgr, maAdapter)
 	sessionMgr.SetErrorNotifier(func(sessionID string, err error) {
 		upnpHandler.NotifyError(sessionID)
 	})
