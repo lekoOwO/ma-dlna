@@ -594,6 +594,7 @@ func (h *Handler) validateCallback(callback string) error {
 		}
 		for _, ip := range ips {
 			if ip.IsLoopback() && !h.cfg.Security.AllowLoopbackSources {
+				return fmt.Errorf("callback IP blocked: %s (loopback)", ip)
 			}
 			if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 				ip.IsMulticast() || ip.IsUnspecified() {
@@ -629,7 +630,12 @@ func (h *Handler) sendInitialEvent(callback, sid, service string) {
 		req.Header.Set("SEQ", "0")
 		req.Header.Set("SERVER", serverString())
 
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			slog.Warn("Event NOTIFY network error", "url", u, "error", err)
@@ -737,7 +743,12 @@ func (h *Handler) sendStateChange(snap subSnapshot, lastChangeXML string) {
 		req.Header.Set("SEQ", fmt.Sprintf("%d", snap.seq))
 		req.Header.Set("SERVER", serverString())
 
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			slog.Warn("State change NOTIFY error", "url", u, "error", err)
@@ -925,7 +936,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		uri := ""
 		if h.sessionMgr != nil {
 			if active := h.sessionMgr.ActiveSession(); active != nil {
-				uri = safeURL(active.StreamURL)
+				uri = safeURL(active.SourceURI)
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -1069,12 +1080,12 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		desired := extractSOAPField(body, "DesiredVolume")
 		vol := 50
 		if _, err := fmt.Sscanf(desired, "%d", &vol); err != nil {
-			if vol < 0 {
-				vol = 0
-			} else if vol > 100 {
-				vol = 100
-			}
 			vol = 50
+		}
+		if vol < 0 {
+			vol = 0
+		} else if vol > 100 {
+			vol = 100
 		}
 
 		h.mu.Lock()
@@ -1084,7 +1095,10 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
 			slog.Error("SetVolume failed", "error", err)
 		} else {
-			go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, h.muted))
+			h.mu.RLock()
+			muted := h.muted
+			h.mu.RUnlock()
+			go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
 		}
 
 		response = renderingResponse(action, `

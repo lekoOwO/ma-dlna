@@ -134,7 +134,7 @@ func (a *Adapter) callHAService(service string, payload map[string]any) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		slog.Error("HA service error", "service", service, "status", resp.StatusCode, "body", string(body))
+		slog.Error("HA service error", "service", service, "status", resp.StatusCode, "body", sanitizeURL(string(body)))
 		return fmt.Errorf("HA service %s returned status %d", service, resp.StatusCode)
 	}
 

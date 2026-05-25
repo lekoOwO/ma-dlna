@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -46,6 +44,9 @@ func main() {
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string) {
 		sessionMgr.SetPlaying(sessionID)
+	})
+	streamer.SetEndCallback(func(sessionID string) {
+		sessionMgr.Stop(sessionID)
 	})
 	streamer.SetErrorCallback(func(sessionID string, err error) {
 		sessionMgr.SetError(sessionID, err.Error())
@@ -190,11 +191,8 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 func httpLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" || r.Method == "NOTIFY" {
-			body, _ := io.ReadAll(r.Body)
-			r.Body.Close()
-			r.Body = io.NopCloser(bytes.NewReader(body))
 			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr,
-				"body_bytes", len(body))
+				"content_length", r.ContentLength)
 		} else {
 			slog.Debug("HTTP request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		}

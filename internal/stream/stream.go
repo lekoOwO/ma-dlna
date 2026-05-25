@@ -32,7 +32,10 @@ type Streamer struct {
 	tokenValidator TokenValidator
 	firstClientCB  FirstClientCallback
 	errorCB        ErrorCallback
+	endCB          EndCallback
 }
+
+type EndCallback func(sessionID string)
 
 type stream struct {
 	sessionID    string
@@ -42,10 +45,10 @@ type stream struct {
 	ffmpegCfg    config.FFmpegConfig
 	startTime    time.Time
 	resumeOffset time.Duration
-	ffmpegTime   atomic.Int64
 	runsInFlight atomic.Int32
 	genMu        sync.Mutex
 	errorCB      ErrorCallback
+	endCB        EndCallback
 
 	gen *streamGeneration
 }
@@ -62,15 +65,16 @@ type clientWriter struct {
 // streamGeneration holds the per-run mutable state for a single ffmpeg instance.
 // It is replaced on each Pause/Seek/Resume cycle.
 type streamGeneration struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started chan struct{}
-	done    chan struct{}
-	ringBuf *RingBuffer
-	cmd     *exec.Cmd
-	clients map[string]*clientWriter
-	offset  time.Duration
-	err     error
+	ctx        context.Context
+	cancel     context.CancelFunc
+	started    chan struct{}
+	done       chan struct{}
+	ringBuf    *RingBuffer
+	cmd        *exec.Cmd
+	clients    map[string]*clientWriter
+	offset     time.Duration
+	err        error
+	ffmpegTime atomic.Int64
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -105,6 +109,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		sourceURI: sourceURI,
 		ffmpegCfg: s.cfg.FFmpeg,
 		errorCB:   s.errorCB,
+		endCB:     s.endCB,
 		gen: &streamGeneration{
 			ctx:     ctx,
 			cancel:  cancel,
@@ -214,7 +219,6 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	}
 	st.genMu.Lock()
 	st.gen = newGen
-	st.ffmpegTime.Store(0)
 	st.active.Store(true)
 	st.genMu.Unlock()
 }
@@ -242,7 +246,6 @@ func (s *Streamer) Resume(sessionID string) {
 	}
 	st.gen = newGen
 	st.startTime = time.Now()
-	st.ffmpegTime.Store(0)
 	st.genMu.Unlock()
 	go st.run(newGen)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", newGen.offset.Round(time.Second))
@@ -255,24 +258,22 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if !ok {
 		return 0
 	}
-	st.genMu.Lock()
-	gen := st.gen
+	gen := st.currentGen()
 	var resumeOff time.Duration
 	if gen != nil {
 		resumeOff = gen.offset
+		ft := gen.ffmpegTime.Load()
+		if ft > 0 {
+			return resumeOff + time.Duration(ft)
+		}
 	} else {
 		resumeOff = st.resumeOffset
 	}
-	startT := st.startTime
-	st.genMu.Unlock()
-	ft := st.ffmpegTime.Load()
-	if ft > 0 {
-		return resumeOff + time.Duration(ft)
-	}
-	if startT.IsZero() {
+	if st.startTime.IsZero() {
 		return 0
 	}
-	return resumeOff + time.Since(startT)
+	return resumeOff + time.Since(st.startTime)
+
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {
@@ -286,6 +287,10 @@ func (s *Streamer) IsRunning(sessionID string) bool {
 
 func (s *Streamer) SetFirstClientCallback(cb FirstClientCallback) {
 	s.firstClientCB = cb
+}
+
+func (s *Streamer) SetEndCallback(cb EndCallback) {
+	s.endCB = cb
 }
 
 func (s *Streamer) SetErrorCallback(cb ErrorCallback) {
@@ -394,6 +399,12 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
+	// Reject if generation changed while we waited
+	if st.currentGen() != gen {
+		st.clientsMu.Unlock()
+		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
+		return
+	}
 	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
@@ -434,7 +445,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			current := s.streams[sessionID]
 			s.mu.Unlock()
 			snapshot.clientsMu.Lock()
-			currentGen := snapshot.gen
+			currentGen := snapshot.currentGen()
 			empty := len(capturedGen.clients) == 0
 			snapshot.clientsMu.Unlock()
 			if current == snapshot && currentGen == capturedGen && empty {
@@ -452,18 +463,19 @@ func (st *stream) run(gen *streamGeneration) {
 			// Natural exit: close clients so /live connections don't hang.
 			st.closeClients(gen)
 			st.active.Store(false)
+			if st.endCB != nil {
+				st.endCB(st.sessionID)
+			}
 		}
 		close(gen.done)
 	}()
 
 	args := st.buildFFmpegArgs(gen.offset)
-	slog.Debug("ffmpeg command", "args", args)
-	slog.Info("Starting ffmpeg", "session_id", st.sessionID)
-
 	bin := st.ffmpegCfg.Binary
 	if bin == "" {
 		bin = "ffmpeg"
 	}
+	slog.Debug("ffmpeg command", "bin", bin, "arg_count", len(args))
 	cmd := exec.CommandContext(gen.ctx, bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -494,7 +506,7 @@ func (st *stream) run(gen *streamGeneration) {
 	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", cmd.Process.Pid)
 	close(gen.started)
 
-	go st.readProgress(stderr)
+	go st.readProgress(gen, stderr)
 
 	buf := make([]byte, 65536)
 	for {
@@ -585,14 +597,14 @@ func (st *stream) buildFFmpegArgs(offset time.Duration) []string {
 	return args
 }
 
-func (st *stream) readProgress(stderr io.Reader) {
+func (st *stream) readProgress(gen *streamGeneration, stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
 	var errLines []string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "out_time_us=") {
 			if ms, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_us="), 10, 64); err == nil {
-				st.ffmpegTime.Store(ms * int64(time.Microsecond))
+				gen.ffmpegTime.Store(ms * int64(time.Microsecond))
 			}
 		} else if strings.HasPrefix(line, "out_time=") {
 			if t, err := time.Parse("15:04:05.000000", strings.TrimPrefix(line, "out_time=")); err == nil {
@@ -600,7 +612,7 @@ func (st *stream) readProgress(stderr io.Reader) {
 					int64(t.Minute())*int64(time.Minute) +
 					int64(t.Second())*int64(time.Second) +
 					int64(t.Nanosecond())
-				st.ffmpegTime.Store(ns)
+				gen.ffmpegTime.Store(ns)
 			}
 		} else if !isProgressLine(line) {
 			errLines = append(errLines, line)
