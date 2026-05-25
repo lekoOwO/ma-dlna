@@ -122,7 +122,7 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 
 func statusHandler(cfg *config.Config, mgr *session.Manager, streamer *stream.Streamer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		active := mgr.ActiveSession()
+		active := mgr.StatusSession()
 		resp := map[string]any{
 			"status":             "ok",
 			"upnp_friendly_name": cfg.UPnP.FriendlyName,

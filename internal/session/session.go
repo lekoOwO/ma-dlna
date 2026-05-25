@@ -223,6 +223,23 @@ func (m *Manager) ActiveSession() *Session {
 	return nil
 }
 
+// StatusSession returns the active session for status reporting,
+// including StateError sessions that ActiveSession excludes.
+func (m *Manager) StatusSession() *Session {
+	s := m.ActiveSession()
+	if s != nil {
+		return s
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		if s.State == StateError {
+			return s.snapshot()
+		}
+	}
+	return nil
+}
+
 func (m *Manager) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

@@ -101,6 +101,8 @@ func Load(path string) (*Config, error) {
 	if cfg.Server.PublicBaseURL == "" {
 		cfg.Server.PublicBaseURL = fmt.Sprintf("http://%s:%d", cfg.Server.BindHost, cfg.Server.HTTPPort)
 	}
+	cfg.Server.PublicBaseURL = strings.TrimRight(cfg.Server.PublicBaseURL, "/")
+	cfg.Server.StreamPublicBaseURL = strings.TrimRight(cfg.Server.StreamPublicBaseURL, "/")
 	if strings.Contains(cfg.Server.PublicBaseURL, "0.0.0.0") && !cfg.UPnP.AutoBaseURL {
 		return nil, fmt.Errorf("public_base_url resolves to 0.0.0.0; set public_base_url to the bridge's LAN IP or enable auto_base_url")
 	}

@@ -97,9 +97,21 @@ func (h *Handler) Stop() {
 	slog.Info("UPnP handler stopped")
 }
 
+func (h *Handler) setCurrentSessionID(id string) {
+	h.mu.Lock()
+	h.currentSessionID = id
+	h.mu.Unlock()
+}
+
+func (h *Handler) getCurrentSessionID() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.currentSessionID
+}
+
 func (h *Handler) activeSession() *session.Session {
-	if h.currentSessionID != "" {
-		if s := h.sessionMgr.Get(h.currentSessionID); s != nil {
+	if sid := h.getCurrentSessionID(); sid != "" {
+		if s := h.sessionMgr.Get(sid); s != nil {
 			return s
 		}
 	}
@@ -562,7 +574,7 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 	cb := r.Header.Get("CALLBACK")
 	svc := eventServiceFromPath(r.URL.Path)
 	slog.Debug("Event subscription", "method", r.Method, "path", r.URL.Path,
-		"remote", r.RemoteAddr, "sid", r.Header.Get("SID"), "callback", cb)
+		"remote", r.RemoteAddr, "sid", r.Header.Get("SID"), "callback", safeURL(cb))
 
 	switch r.Method {
 	case "SUBSCRIBE":
@@ -652,21 +664,23 @@ func (h *Handler) validateCallback(callback string, remoteAddr string) (string, 
 		if err != nil {
 			return "", fmt.Errorf("cannot resolve callback host: %w", err)
 		}
-		if pinIP == "" {
-			pinIP = ips[0].String()
-		}
-		// If we can determine the requester IP, only allow callback to same IP
+		// Pin to the requester IP if we can verify it, otherwise use first resolved IP.
 		if remoteIP != "" {
 			matched := false
 			for _, ip := range ips {
 				if ip.String() == remoteIP {
 					matched = true
+					if pinIP == "" {
+						pinIP = ip.String()
+					}
 					break
 				}
 			}
 			if !matched {
 				return "", fmt.Errorf("callback host does not match requester IP")
 			}
+		} else if pinIP == "" {
+			pinIP = ips[0].String()
 		}
 		for _, ip := range ips {
 			if ip.IsLoopback() && !h.cfg.Security.AllowLoopbackSources {
@@ -750,7 +764,7 @@ func initialEventBody(service string) string {
 		return `<?xml version="1.0"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
-    <SinkProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*</SinkProtocolInfo>
+    <SinkProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/aac:*</SinkProtocolInfo>
   </e:property>
   <e:property>
     <SourceProtocolInfo></SourceProtocolInfo>
@@ -924,7 +938,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
 		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
-		h.currentSessionID = s.ID
+		h.setCurrentSessionID(s.ID)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -1044,59 +1058,66 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 </u:GetPositionInfoResponse>`, relTime))
 
 	case "GetMediaInfo":
-		uri := ""
-		if h.sessionMgr != nil {
-			if active := h.activeSession(); active != nil {
-				uri = ""
-			}
-		}
-		response = avTransportResponse(action, fmt.Sprintf(`
+		response = avTransportResponse(action, `
 <u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
   <NrTracks>1</NrTracks>
   <MediaDuration>00:00:00</MediaDuration>
-  <CurrentURI>%s</CurrentURI>
+  <CurrentURI></CurrentURI>
   <CurrentURIMetaData></CurrentURIMetaData>
   <NextURI></NextURI>
   <NextURIMetaData></NextURIMetaData>
   <PlayMedium>NETWORK</PlayMedium>
   <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
   <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
-</u:GetMediaInfoResponse>`, escapeXML(uri)))
+</u:GetMediaInfoResponse>`)
 
 	case "Seek":
 		instanceID := extractSOAPField(body, "InstanceID")
 		unit := extractSOAPField(body, "Unit")
 		target := extractSOAPField(body, "Target")
 		_ = instanceID
-		if unit == "REL_TIME" && h.sessionMgr != nil {
-			active := h.activeSession()
-			if active != nil {
-				if offset, err := parseRelTime(target); err == nil {
-					slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
-					wasPaused := active.State == session.StatePaused
-					h.sessionMgr.Seek(active.ID, offset)
-					if !wasPaused {
-						h.sessionMgr.Resume(active.ID)
-						go func() {
-							if err := h.maAdapter.PlayMedia(
-								h.cfg.HA.TargetEntityID,
-								active.StreamURL,
-								contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-							); err != nil {
-								slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
-								h.sessionMgr.Stop(active.ID)
-								h.sessionMgr.SetError(active.ID, err.Error())
-								h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
-								return
-							}
-							h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
-						}()
-					}
+		if unit != "REL_TIME" {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("710", "Seek mode not supported")))
+			return
+		}
+		offset, err := parseRelTime(target)
+		if err != nil {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("711", "Illegal seek target")))
+			return
+		}
+		active := h.activeSession()
+		if active == nil {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
+			return
+		}
+		slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
+		wasPaused := active.State == session.StatePaused
+		h.sessionMgr.Seek(active.ID, offset)
+		if !wasPaused {
+			h.sessionMgr.Resume(active.ID)
+			go func() {
+				if err := h.maAdapter.PlayMedia(
+					h.cfg.HA.TargetEntityID,
+					active.StreamURL,
+					contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
+				); err != nil {
+					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
+					h.sessionMgr.Stop(active.ID)
+					h.sessionMgr.SetError(active.ID, err.Error())
+					h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+					return
 				}
-			}
+				h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+			}()
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
-<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+	<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
 	case "Next":
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -1238,33 +1259,47 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 
 	case "SetMute":
 		muteStr := extractSOAPField(body, "DesiredMute")
+		targetMuted := muteStr == "1"
+
 		h.mu.Lock()
 		wasMuted := h.muted
-		h.muted = muteStr == "1"
-		if h.muted {
-			if !wasMuted {
-				h.prevVolume = h.volume
-			}
-			h.mu.Unlock()
+		if targetMuted && !wasMuted {
+			h.prevVolume = h.volume
+		}
+		h.muted = targetMuted
+		curVol := h.volume
+		prevVol := h.prevVolume
+		h.mu.Unlock()
+
+		if targetMuted && !wasMuted {
 			go func() {
 				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0); err != nil {
 					slog.Error("SetMute failed", "error", err)
+					h.mu.Lock()
+					h.muted = false
+					h.mu.Unlock()
+					go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, false))
+					return
 				}
+				go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
 			}()
-		} else {
-			vol := h.volume
-			h.mu.Unlock()
+		} else if !targetMuted && wasMuted {
+			restoreVol := curVol
+			if prevVol > 0 {
+				restoreVol = prevVol
+			}
 			go func() {
-				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
+				if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol); err != nil {
 					slog.Error("SetMute unmute failed", "error", err)
+					go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, true))
+					return
 				}
+				h.mu.Lock()
+				h.volume = restoreVol
+				h.mu.Unlock()
+				go h.notifySubscribers("RenderingControl", renderingControlLastChange(restoreVol, false))
 			}()
 		}
-		h.mu.RLock()
-		curVol := h.volume
-		curMuted := h.muted
-		h.mu.RUnlock()
-		go h.notifySubscribers("RenderingControl", renderingControlLastChange(curVol, curMuted))
 
 		response = renderingResponse(action, `
 <u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
@@ -1296,17 +1331,17 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 
 	switch action {
 	case "GetProtocolInfo":
-		source := fmt.Sprintf(
-			"http-get:*:audio/mpeg:*,http-get:*:audio/opus:*,http-get:*:audio/wav:*,"+
-				"http-get:*:audio/flac:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*,"+
+		sink := fmt.Sprintf(
+			"http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,"+
+				"http-get:*:audio/flac:*,http-get:*:audio/aac:*,"+
 				"http-get:*:audio/%s:*",
 			h.cfg.FFmpeg.OutputFormat,
 		)
 		response = connectionResponse(action, fmt.Sprintf(`
-<u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-  <Sink>%s</Sink>
-  <Source></Source>
-</u:GetProtocolInfoResponse>`, source))
+	<u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
+	  <Sink>%s</Sink>
+	  <Source></Source>
+	</u:GetProtocolInfoResponse>`, sink))
 
 	case "GetCurrentConnectionIDs":
 		response = connectionResponse(action, `

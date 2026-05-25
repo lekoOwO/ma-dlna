@@ -79,6 +79,7 @@ type streamGeneration struct {
 	err         error
 	ffmpegTime  atomic.Int64
 	header      []byte
+	headerSize  int64
 }
 
 func (st *stream) currentGen() *streamGeneration {
@@ -113,12 +114,6 @@ func (gen *streamGeneration) killCmd() {
 	}
 }
 
-func (gen *streamGeneration) getCmd() *exec.Cmd {
-	gen.mu.Lock()
-	defer gen.mu.Unlock()
-	return gen.cmd
-}
-
 func (gen *streamGeneration) getHeader() []byte {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
@@ -134,6 +129,7 @@ func (gen *streamGeneration) setHeader(data []byte) {
 	if gen.header == nil {
 		gen.header = make([]byte, len(data))
 		copy(gen.header, data)
+		gen.headerSize = int64(len(data))
 	}
 }
 
@@ -317,15 +313,13 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 		return 0
 	}
 	gen := st.currentGen()
-	var resumeOff time.Duration
-	if gen != nil {
-		resumeOff = gen.offset
-		ft := gen.ffmpegTime.Load()
-		if ft > 0 {
-			return resumeOff + time.Duration(ft)
-		}
-	} else {
-		resumeOff = st.resumeOffset
+	if gen == nil {
+		return 0
+	}
+	resumeOff := gen.offset
+	ft := gen.ffmpegTime.Load()
+	if ft > 0 {
+		return resumeOff + time.Duration(ft)
 	}
 	if st.startTime.IsZero() {
 		return 0
@@ -462,20 +456,22 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	// Always send container header first so late clients can decode
+	// Send header first for new clients that need the container init segment.
+	// To avoid duplication, skip past header bytes when reading prebuffer if
+	// the prebuffer range overlaps with the header.
+	hdrSize := gen.headerSize
 	if hdr := gen.getHeader(); hdr != nil {
 		cw.ch <- append([]byte(nil), hdr...)
 	}
 
 	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
-	if start < 0 {
-		start = 0
+	if start < hdrSize {
+		start = hdrSize
 	}
 	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
 	n, _ := gen.ringBuf.Read(start, prebuf)
 	if n > 0 {
-		// Copy before enqueue so channel holds an independent slice
 		cw.ch <- append([]byte(nil), prebuf[:n]...)
 	}
 	gen.clients[clientID] = cw
@@ -596,6 +592,10 @@ func (st *stream) run(gen *streamGeneration) {
 			st.clientsMu.Unlock()
 			if empty {
 				slog.Warn("No client connected within startup timeout, stopping stream", "session_id", st.sessionID)
+				gen.setErr(fmt.Errorf("no stream client connected within startup timeout"))
+				if st.errorCB != nil {
+					st.errorCB(st.sessionID, gen.getErr())
+				}
 				st.active.Store(false)
 				gen.cancel()
 				gen.killCmd()
