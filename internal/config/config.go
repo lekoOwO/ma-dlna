@@ -226,7 +226,7 @@ func DefaultConfig() Config {
 			InitSegmentBytes:      262144,
 			MaxClientsPerSession:  16,
 			NoClientGraceSeconds:  10,
-			StartupTimeoutSeconds: 15,
+			StartupTimeoutSeconds: 30,
 		},
 		Security: SecurityConfig{
 			RequireStreamToken: true,

@@ -981,6 +981,11 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", safeURL(active.StreamURL))
+		if active.State == session.StatePlaying {
+			response = avTransportResponse(action, fmt.Sprintf(`
+	<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+			break
+		}
 		h.sessionMgr.Play(active.ID)
 		h.sessionMgr.StartStream(active.ID, active.SourceURI)
 		if err := h.maAdapter.PlayMedia(
@@ -996,7 +1001,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+		h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
@@ -1014,7 +1019,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 				return
 			}
-			h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+			h.notifyCurrentSession(active.ID, avTransportLastChange("STOPPED"))
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1045,7 +1050,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
+		h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -1138,7 +1143,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch active.State {
-		case session.StatePlaying, session.StateStarting, session.StatePaused:
+		case session.StatePlaying, session.StateStarting, session.StatePaused, session.StateError:
 		default:
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1161,7 +1166,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					h.sessionMgr.SetError(active.ID, err.Error())
 					return
 				}
-				h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+				h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
 			}()
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`

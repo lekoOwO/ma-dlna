@@ -287,6 +287,9 @@ func (s *Streamer) Pause(sessionID string) time.Duration {
 	}
 	st.lifeMu.Lock()
 	defer st.lifeMu.Unlock()
+	if !s.stillCurrent(sessionID, st) {
+		return 0
+	}
 	elapsed := s.Elapsed(sessionID)
 	s.restartWithOffset(st, sessionID, elapsed)
 	slog.Info("Stream paused", "session_id", sessionID, "position", elapsed.Round(time.Second))
@@ -302,6 +305,9 @@ func (s *Streamer) Seek(sessionID string, offset time.Duration) {
 	}
 	st.lifeMu.Lock()
 	defer st.lifeMu.Unlock()
+	if !s.stillCurrent(sessionID, st) {
+		return
+	}
 	s.restartWithOffset(st, sessionID, offset)
 	slog.Info("Stream seek", "session_id", sessionID, "to", offset.Round(time.Second))
 }
@@ -318,7 +324,10 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		st.closeClients(oldGen)
 	}
 	if st.runsInFlight.Load() > 0 && oldGen != nil {
-		<-oldGen.done
+		select {
+		case <-oldGen.done:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	st.runsInFlight.Store(0)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -340,10 +349,10 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	gid := s.nextGenID.Add(1)
 	newGen.genID = gid
 	st.currentGenID.Store(gid)
-	s.notifyGenStart(sessionID, gid)
 	st.genMu.Lock()
 	st.gen = newGen
 	st.active.Store(true)
+	s.notifyGenStart(sessionID, gid)
 	st.genMu.Unlock()
 }
 
@@ -356,7 +365,7 @@ func (s *Streamer) Resume(sessionID string) {
 	}
 	st.lifeMu.Lock()
 	defer st.lifeMu.Unlock()
-	if !st.runsInFlight.CompareAndSwap(0, 1) {
+	if !s.stillCurrent(sessionID, st) || !st.runsInFlight.CompareAndSwap(0, 1) {
 		return
 	}
 	st.genMu.Lock()
@@ -375,9 +384,9 @@ func (s *Streamer) Resume(sessionID string) {
 	gid := s.nextGenID.Add(1)
 	newGen.genID = gid
 	st.currentGenID.Store(gid)
-	s.notifyGenStart(sessionID, gid)
 	newGen.startTime = time.Now()
 	st.gen = newGen
+	s.notifyGenStart(sessionID, gid)
 	st.genMu.Unlock()
 	go st.run(newGen)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", newGen.offset.Round(time.Second))
@@ -427,6 +436,17 @@ func (s *Streamer) SetEndCallback(cb EndCallback) {
 
 func (s *Streamer) SetErrorCallback(cb ErrorCallback) {
 	s.errorCB = cb
+}
+
+// stillCurrent checks that the stream is still in the map and active.
+// Must be called under st.lifeMu to prevent races with Stop().
+// stillCurrent checks that the stream pointer is still registered in the map.
+// Must be called under st.lifeMu to prevent races with Stop() which deletes
+// the stream from the map before acquiring lifeMu.
+func (s *Streamer) stillCurrent(sessionID string, st *stream) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streams[sessionID] == st
 }
 
 func (s *Streamer) SetGenStartCallback(cb GenStartCallback) {

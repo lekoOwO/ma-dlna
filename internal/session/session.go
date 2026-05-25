@@ -238,7 +238,7 @@ func (m *Manager) MarkStopped(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
-		if s.State == StateStarting || s.State == StatePlaying {
+		if s.State == StateStarting || s.State == StatePlaying || s.State == StatePaused {
 			return
 		}
 		s.State = StateStopped
