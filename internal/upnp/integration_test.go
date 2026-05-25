@@ -876,9 +876,6 @@ func TestFullDLNALifecycle(t *testing.T) {
 	if !strings.Contains(string(protoXML), "audio/ogg") {
 		t.Error("GetProtocolInfo missing ogg")
 	}
-	if !strings.Contains(string(protoXML), cfg.FFmpeg.OutputFormat) {
-		t.Errorf("GetProtocolInfo missing configured format: %s", cfg.FFmpeg.OutputFormat)
-	}
 	t.Log("Step 12: GetProtocolInfo includes configured formats OK")
 
 	// ---- Step 13: GetCurrentTransportActions ----

@@ -53,6 +53,9 @@ func main() {
 	})
 	maAdapter := maadapter.New(cfg)
 	upnpHandler := upnp.NewHandler(cfg, sessionMgr, maAdapter)
+	sessionMgr.SetErrorNotifier(func(sessionID string, err error) {
+		upnpHandler.NotifyError(sessionID)
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live/", streamer.ServeHTTP)

@@ -97,6 +97,12 @@ func (h *Handler) Stop() {
 	slog.Info("UPnP handler stopped")
 }
 
+// NotifyError sends AVTransport LastChange on stream/session errors (ffmpeg crash,
+// first-client timeout, pipe failure) so subscribers see ERROR_OCCURRED without polling.
+func (h *Handler) NotifyError(sessionID string) {
+	go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
+}
+
 func (h *Handler) setCurrentSessionID(id string) {
 	h.mu.Lock()
 	h.currentSessionID = id
@@ -138,8 +144,8 @@ func (h *Handler) baseURLForRequest(r *http.Request) string {
 		// Determine local IP from the connection's local address, if available.
 		// Fall back to Host header validation.
 		localIP := localAddrFromConn(r)
-		if localIP != nil {
-			return fmt.Sprintf("http://%s:%d", localIP.String(), h.cfg.Server.HTTPPort)
+		if localIP != nil && !localIP.IsLoopback() && !localIP.IsUnspecified() {
+			return "http://" + net.JoinHostPort(localIP.String(), fmt.Sprintf("%d", h.cfg.Server.HTTPPort))
 		}
 		host, port, err := net.SplitHostPort(r.Host)
 		if err != nil {
@@ -988,8 +994,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
 				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
-			} else {
 				go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
+			} else {
+				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -1015,6 +1022,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
 			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
 			h.sessionMgr.SetError(active.ID, err.Error())
+			go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("PAUSED_PLAYBACK", "ERROR_OCCURRED"))
 		} else {
 			go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 		}
@@ -1249,20 +1257,20 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			vol = 100
 		}
 
-		h.mu.Lock()
-		h.volume = vol
-		wasMuted := h.muted
-		if vol > 0 && wasMuted {
-			h.muted = false
-		}
-		h.mu.Unlock()
+		h.mu.RLock()
+		oldMuted := h.muted
+		h.mu.RUnlock()
 
 		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
 			slog.Error("SetVolume failed", "error", err)
 		} else {
-			h.mu.RLock()
+			h.mu.Lock()
+			h.volume = vol
+			if vol > 0 && oldMuted {
+				h.muted = false
+			}
 			muted := h.muted
-			h.mu.RUnlock()
+			h.mu.Unlock()
 			go h.notifySubscribers("RenderingControl", renderingControlLastChange(vol, muted))
 		}
 
@@ -1359,12 +1367,12 @@ func (h *Handler) serveConnectionManager(w http.ResponseWriter, r *http.Request)
 
 	switch action {
 	case "GetProtocolInfo":
-		sink := fmt.Sprintf(
-			"http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,"+
-				"http-get:*:audio/flac:*,http-get:*:audio/aac:*,"+
-				"http-get:*:audio/%s:*",
-			h.cfg.FFmpeg.OutputFormat,
-		)
+		base := "http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*," +
+			"http-get:*:audio/flac:*,http-get:*:audio/aac:*"
+		if h.cfg.FFmpeg.OutputFormat != "opus" && h.cfg.FFmpeg.OutputFormat != "ogg" {
+			base += ",http-get:*:audio/" + h.cfg.FFmpeg.OutputFormat + ":*"
+		}
+		sink := base
 		response = connectionResponse(action, fmt.Sprintf(`
 	<u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
 	  <Sink>%s</Sink>

@@ -442,12 +442,12 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher = f
 	}
 
-	st.clientsMu.Lock()
+	// Check gen is still current before acquiring clientsMu
 	if st.currentGen() != gen || gen.ctx.Err() != nil {
-		st.clientsMu.Unlock()
 		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
 		return
 	}
+	st.clientsMu.Lock()
 	if len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
 		st.clientsMu.Unlock()
 		http.Error(w, "Too many clients", http.StatusTooManyRequests)
@@ -598,7 +598,7 @@ func (st *stream) run(gen *streamGeneration) {
 			st.clientsMu.Lock()
 			empty := len(gen.clients) == 0
 			st.clientsMu.Unlock()
-			if empty {
+			if empty && st.currentGen() == gen {
 				slog.Warn("No client connected within startup timeout, stopping stream", "session_id", st.sessionID)
 				gen.setErr(fmt.Errorf("no stream client connected within startup timeout"))
 				if st.errorCB != nil {

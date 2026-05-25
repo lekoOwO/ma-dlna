@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -50,12 +51,15 @@ type Session struct {
 
 const maxSessions = 64
 
+type ErrorNotifier func(sessionID string, err error)
+
 type Manager struct {
 	mu            sync.RWMutex
 	sessions      map[string]*Session
 	lastSessionID string
 	cfg           *config.Config
 	streamer      *stream.Streamer
+	errorNotifier ErrorNotifier
 }
 
 func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
@@ -64,6 +68,10 @@ func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
 		cfg:      cfg,
 		streamer: streamer,
 	}
+}
+
+func (m *Manager) SetErrorNotifier(n ErrorNotifier) {
+	m.errorNotifier = n
 }
 
 func (m *Manager) Create(sourceURI, metadataXML string) *Session {
@@ -202,11 +210,16 @@ func (m *Manager) SetPlaying(sessionID string) {
 
 func (m *Manager) SetError(sessionID string, errMsg string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
 		s.State = StateError
 		s.Error = errMsg
 		s.UpdatedAt = time.Now()
+	}
+	n := m.errorNotifier
+	m.mu.Unlock()
+
+	if n != nil {
+		n(sessionID, fmt.Errorf("%s", errMsg))
 	}
 }
 
