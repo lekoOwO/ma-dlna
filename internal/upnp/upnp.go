@@ -1148,7 +1148,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
 					h.sessionMgr.Stop(active.ID)
 					h.sessionMgr.SetError(active.ID, err.Error())
-					h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 					return
 				}
 				h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
@@ -1314,17 +1313,18 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		curMuted := h.muted
 		prevVol := h.prevVolume
 		h.mu.RUnlock()
-
 		// No-op but still sync HA to fix any drift
 		if targetMuted == curMuted {
+			syncVol := curVol
 			if curMuted {
-				h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0)
-			} else {
-				restoreVol := curVol
-				if prevVol > 0 {
-					restoreVol = prevVol
-				}
-				h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol)
+				syncVol = 0
+			}
+			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, syncVol); err != nil {
+				slog.Error("SetMute drift sync failed", "error", err)
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+				return
 			}
 			response = renderingResponse(action, `
 	<u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)

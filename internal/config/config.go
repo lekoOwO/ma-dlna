@@ -139,6 +139,9 @@ func (c *Config) Validate() error {
 	if c.Stream.NoClientGraceSeconds <= 0 {
 		return fmt.Errorf("stream.no_client_grace_seconds must be > 0, got %d", c.Stream.NoClientGraceSeconds)
 	}
+	if c.Stream.InitSegmentBytes < 0 {
+		return fmt.Errorf("stream.init_segment_bytes must be >= 0, got %d", c.Stream.InitSegmentBytes)
+	}
 	if c.FFmpeg.OutputFormat == "" {
 		return fmt.Errorf("ffmpeg.output_format must not be empty")
 	}

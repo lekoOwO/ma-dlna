@@ -37,6 +37,8 @@ type Streamer struct {
 
 type EndCallback func(sessionID string)
 
+// Lock order: clientsMu must be acquired before genMu (via currentGen()).
+// Never hold genMu while acquiring clientsMu to avoid deadlock.
 type stream struct {
 	sessionID      string
 	sourceURI      string
@@ -67,9 +69,9 @@ type clientWriter struct {
 // It is replaced on each Pause/Seek/Resume cycle.
 //
 // Late-client reconnect: initBuf accumulates the first initBufLimit bytes of stdout.
-// This forms a complete init segment for late clients, so formats like FLAC (metadata
-// blocks), Ogg/Opus (ID+comment+setup headers), and WAV (RIFF header) can decode
-// from any reconnect point.
+// This replays the stream prefix before recent buffered bytes, improving compatibility
+// for containerized formats (FLAC metadata blocks, Ogg/Opus headers, WAV RIFF header).
+// Best-effort: arbitrary gap-free reconnect is not guaranteed for all decoders.
 type streamGeneration struct {
 	mu              sync.Mutex
 	ctx             context.Context
@@ -123,26 +125,29 @@ func (gen *streamGeneration) killCmd() {
 	}
 }
 
-func (gen *streamGeneration) getInitBuf() []byte {
+// getInitSegment returns a copy of the accumulated init segment and its size.
+// The copy is made under lock to prevent data races with accumulateInitBuf.
+func (gen *streamGeneration) getInitSegment() ([]byte, int64) {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
 	if len(gen.initBuf) == 0 {
-		return nil
+		return nil, 0
 	}
-	return gen.initBuf
-}
-
-func (gen *streamGeneration) getInitBufSize() int64 {
-	gen.mu.Lock()
-	defer gen.mu.Unlock()
-	return gen.initBufSize
+	cp := make([]byte, len(gen.initBuf))
+	copy(cp, gen.initBuf)
+	return cp, gen.initBufSize
 }
 
 func (gen *streamGeneration) accumulateInitBuf(data []byte) {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
-	if gen.initBufDone {
+	if gen.initBufDone || gen.initBufLimit <= 0 {
+		gen.initBufDone = true
 		return
+	}
+	remaining := gen.initBufLimit - gen.initBufSize
+	if int64(len(data)) > remaining {
+		data = data[:remaining]
 	}
 	gen.initBuf = append(gen.initBuf, data...)
 	gen.initBufSize += int64(len(data))
@@ -460,8 +465,8 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st.clientsMu.Lock()
-	// Re-check atomically: gen must be current, active, stream active, and not canceled
-	if st.currentGen() != gen || !st.active.Load() || !gen.active.Load() || gen.ctx.Err() != nil {
+	// Re-check atomically: gen must be current, active, stream active, not canceled, not errored
+	if st.currentGen() != gen || !st.active.Load() || !gen.active.Load() || gen.ctx.Err() != nil || gen.getErr() != nil {
 		st.clientsMu.Unlock()
 		http.Error(w, "Stream restarted, reconnect", http.StatusServiceUnavailable)
 		return
@@ -482,11 +487,12 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	// Send accumulated init segment first so late clients can decode
-	// containerized formats (FLAC, Ogg/Opus, WAV).
-	initSize := gen.getInitBufSize()
-	if init := gen.getInitBuf(); len(init) > 0 {
-		cw.ch <- append([]byte(nil), init...)
+	// Send accumulated init segment first. Improves late-client compatibility
+	// for containerized formats by replaying the stream prefix before buffered
+	// bytes. Best-effort; not all decoders accept arbitrary reconnect points.
+	init, initSize := gen.getInitSegment()
+	if len(init) > 0 {
+		cw.ch <- init
 	}
 
 	wp := gen.ringBuf.WritePosition()
