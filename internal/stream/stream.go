@@ -327,6 +327,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		select {
 		case <-oldGen.done:
 		case <-time.After(2 * time.Second):
+			slog.Warn("Timed out waiting for old ffmpeg generation to exit", "session_id", sessionID)
 		}
 	}
 	st.runsInFlight.Store(0)
@@ -764,6 +765,10 @@ func (st *stream) buildFFmpegArgs(offset time.Duration) []string {
 	if offset > 0 {
 		slog.Debug("Seek offset applied", "session_id", st.sessionID, "offset", offset)
 		args = append(args, "-ss", formatDuration(offset))
+	}
+
+	if cfg.Realtime {
+		args = append(args, "-re")
 	}
 
 	args = append(args, "-i", st.sourceURI)

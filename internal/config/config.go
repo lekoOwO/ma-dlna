@@ -61,6 +61,7 @@ type FFmpegConfig struct {
 	Bitrate         string   `yaml:"bitrate"`
 	SampleRate      int      `yaml:"sample_rate"`
 	Channels        int      `yaml:"channels"`
+	Realtime        bool     `yaml:"realtime"`
 	Reconnect       bool     `yaml:"reconnect"`
 	ExtraInputArgs  []string `yaml:"extra_input_args"`
 	ExtraOutputArgs []string `yaml:"extra_output_args"`
@@ -218,6 +219,7 @@ func DefaultConfig() Config {
 			Bitrate:      "192k",
 			SampleRate:   48000,
 			Channels:     2,
+			Realtime:     true,
 			Reconnect:    true,
 		},
 		Stream: StreamConfig{

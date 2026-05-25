@@ -49,13 +49,12 @@ func main() {
 	})
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string) {
-		sessionMgr.SetPlaying(sessionID)
+		if sessionMgr.SetPlayingAccepted(sessionID) {
+			upnpHandler.NotifyPlaying(sessionID)
+		}
 	})
 	streamer.SetEndCallback(func(sessionID string, genID uint64) {
-		if !sessionMgr.VerifyGenID(sessionID, genID) {
-			return
-		}
-		sessionMgr.MarkStopped(sessionID)
+		sessionMgr.MarkStoppedIfGeneration(sessionID, genID)
 		upnpHandler.NotifyEnded(sessionID)
 	})
 	streamer.SetErrorCallback(func(sessionID string, genID uint64, err error) {

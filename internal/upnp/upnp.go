@@ -114,6 +114,12 @@ func (h *Handler) NotifyError(sessionID string) {
 	h.notifyCurrentSession(sessionID, avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 }
 
+// NotifyPlaying sends AVTransport LastChange when the first /live client connects,
+// meaning HA/MA has actually started consuming the stream.
+func (h *Handler) NotifyPlaying(sessionID string) {
+	h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
+}
+
 // NotifyEnded sends AVTransport LastChange on natural stream end (EOF).
 func (h *Handler) NotifyEnded(sessionID string) {
 	h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
@@ -717,7 +723,7 @@ func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
 		return
 	}
 
-	body := initialEventBody(service)
+	body := h.initialEventBody(service)
 
 	for _, u := range urls {
 		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
@@ -768,35 +774,56 @@ func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
 	}
 }
 
-func initialEventBody(service string) string {
+func (h *Handler) initialEventBody(service string) string {
 	switch service {
 	case "RenderingControl":
-		return `<?xml version="1.0"?>
-<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-  <e:property>
-    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/RCS/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;Volume val=&quot;50&quot; channel=&quot;Master&quot;/&gt;&lt;Mute val=&quot;0&quot; channel=&quot;Master&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
-  </e:property>
-</e:propertyset>`
+		h.mu.RLock()
+		vol := h.volume
+		muted := h.muted
+		h.mu.RUnlock()
+		l := renderingControlLastChange(vol, muted)
+		return fmt.Sprintf(`<?xml version="1.0"?>
+	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+	  <e:property>
+	    <LastChange>%s</LastChange>
+	  </e:property>
+	</e:propertyset>`, l)
 	case "ConnectionManager":
 		return `<?xml version="1.0"?>
-<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-  <e:property>
-    <SinkProtocolInfo>http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/aac:*</SinkProtocolInfo>
-  </e:property>
-  <e:property>
-    <SourceProtocolInfo></SourceProtocolInfo>
-  </e:property>
-  <e:property>
-    <CurrentConnectionIDs>0</CurrentConnectionIDs>
-  </e:property>
-</e:propertyset>`
-	default: // AVTransport
-		return `<?xml version="1.0"?>
-<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-  <e:property>
-    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;TransportState val=&quot;STOPPED&quot;/&gt;&lt;TransportStatus val=&quot;OK&quot;/&gt;&lt;CurrentPlayMode val=&quot;NORMAL&quot;/&gt;&lt;TransportPlaySpeed val=&quot;1&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
-  </e:property>
-</e:propertyset>`
+	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+	  <e:property>
+	    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/CM/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;SinkProtocolInfo val=&quot;http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/aac:*&quot;/&gt;&lt;SourceProtocolInfo val=&quot;&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+	  </e:property>
+	</e:propertyset>`
+	default:
+		var s *session.Session
+		if h.sessionMgr != nil {
+			s = h.sessionMgr.CurrentSession()
+		}
+		state := "STOPPED"
+		status := "OK"
+		if s != nil {
+			switch s.State {
+			case session.StatePlaying:
+				state = "PLAYING"
+			case session.StatePaused:
+				state = "PAUSED_PLAYBACK"
+			case session.StateStarting:
+				state = "TRANSITIONING"
+			case session.StateLoaded:
+				state = "STOPPED"
+			case session.StateError:
+				state = "STOPPED"
+				status = "ERROR_OCCURRED"
+			}
+		}
+		l := avTransportLastChangeStatus(state, status)
+		return fmt.Sprintf(`<?xml version="1.0"?>
+	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+	  <e:property>
+	    <LastChange>%s</LastChange>
+	  </e:property>
+	</e:propertyset>`, l)
 	}
 }
 
@@ -1085,37 +1112,46 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	case "GetPositionInfo":
 		relTime := "00:00:00"
+		uri := ""
+		metadata := ""
 		if h.sessionMgr != nil {
 			if active := h.activeSession(); active != nil {
 				elapsed := h.sessionMgr.Elapsed(active.ID)
 				relTime = formatDurationUPnP(elapsed)
+				uri = escapeXML(active.SourceURI)
+				metadata = escapeXML(active.MetadataRaw)
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
-<u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-  <Track>1</Track>
-  <TrackDuration>00:00:00</TrackDuration>
-  <TrackMetaData></TrackMetaData>
-  <TrackURI></TrackURI>
-  <RelTime>%s</RelTime>
-  <AbsTime>00:00:00</AbsTime>
-  <RelCount>2147483647</RelCount>
-  <AbsCount>2147483647</AbsCount>
-</u:GetPositionInfoResponse>`, relTime))
-
+	<u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+	  <Track>1</Track>
+	  <TrackDuration>00:00:00</TrackDuration>
+	  <TrackMetaData>%s</TrackMetaData>
+	  <TrackURI>%s</TrackURI>
+	  <RelTime>%s</RelTime>
+	  <AbsTime>00:00:00</AbsTime>
+	  <RelCount>2147483647</RelCount>
+	  <AbsCount>2147483647</AbsCount>
+	</u:GetPositionInfoResponse>`, metadata, uri, relTime))
 	case "GetMediaInfo":
-		response = avTransportResponse(action, `
-<u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-  <NrTracks>1</NrTracks>
-  <MediaDuration>00:00:00</MediaDuration>
-  <CurrentURI></CurrentURI>
-  <CurrentURIMetaData></CurrentURIMetaData>
-  <NextURI></NextURI>
-  <NextURIMetaData></NextURIMetaData>
-  <PlayMedium>NETWORK</PlayMedium>
-  <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
-  <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
-</u:GetMediaInfoResponse>`)
+		uri := ""
+		metadata := ""
+		if s := h.activeSession(); s != nil {
+			uri = escapeXML(s.SourceURI)
+			metadata = escapeXML(s.MetadataRaw)
+		}
+		response = avTransportResponse(action, fmt.Sprintf(`
+	<u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+	  <NrTracks>1</NrTracks>
+	  <MediaDuration>00:00:00</MediaDuration>
+	  <CurrentURI>%s</CurrentURI>
+	  <CurrentURIMetaData>%s</CurrentURIMetaData>
+	  <NextURI></NextURI>
+	  <NextURIMetaData></NextURIMetaData>
+	  <PlayMedium>NETWORK</PlayMedium>
+	  <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
+	  <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
+	</u:GetMediaInfoResponse>`, uri, metadata))
 
 	case "Seek":
 		instanceID := extractSOAPField(body, "InstanceID")
@@ -1143,7 +1179,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch active.State {
-		case session.StatePlaying, session.StateStarting, session.StatePaused, session.StateError:
+		case session.StatePlaying, session.StateStarting, session.StatePaused:
 		default:
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 			w.WriteHeader(http.StatusInternalServerError)

@@ -232,13 +232,22 @@ func (m *Manager) Stop(sessionID string) error {
 // Used for natural EOF callbacks where the stream has already exited and calling
 // Streamer.Stop() would race with a new stream for the same session ID.
 func (m *Manager) MarkStopped(sessionID string) {
+	m.MarkStoppedIfGeneration(sessionID, 0)
+}
+
+// MarkStoppedIfGeneration atomically verifies genID and updates state to stopped.
+// genID=0 skips the generation check (used by UPnP Stop action).
+func (m *Manager) MarkStoppedIfGeneration(sessionID string, genID uint64) {
 	if m.streamer.IsRunning(sessionID) {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
-		if s.State == StateStarting || s.State == StatePlaying || s.State == StatePaused {
+		if genID != 0 && m.sessionGenID[sessionID] != genID {
+			return
+		}
+		if s.State == StateError {
 			return
 		}
 		s.State = StateStopped
@@ -264,15 +273,24 @@ func (m *Manager) Pause(sessionID string) error {
 }
 
 func (m *Manager) SetPlaying(sessionID string) {
+	m.SetPlayingAccepted(sessionID)
+}
+
+// SetPlayingAccepted transitions the session from Starting to Playing and returns
+// true if the transition was valid. Used by first-client callback to know whether
+// to fire the PLAYING event.
+func (m *Manager) SetPlayingAccepted(sessionID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
 		if s.State != StateStarting {
-			return
+			return false
 		}
 		s.State = StatePlaying
 		s.UpdatedAt = time.Now()
+		return true
 	}
+	return false
 }
 
 func (m *Manager) SetError(sessionID string, errMsg string) {
