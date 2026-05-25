@@ -57,17 +57,16 @@ type eventSubscriber struct {
 }
 
 type Handler struct {
-	cfg              *config.Config
-	sessionMgr       *session.Manager
-	maAdapter        *maadapter.Adapter
-	mu               sync.RWMutex
-	volume           int
-	prevVolume       int
-	muted            bool
-	currentSessionID string
-	ssdpCancel       context.CancelFunc
-	deviceUUID       string
-	subscribers      map[string]*eventSubscriber
+	cfg         *config.Config
+	sessionMgr  *session.Manager
+	maAdapter   *maadapter.Adapter
+	mu          sync.RWMutex
+	volume      int
+	prevVolume  int
+	muted       bool
+	ssdpCancel  context.CancelFunc
+	deviceUUID  string
+	subscribers map[string]*eventSubscriber
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maadapter.Adapter) *Handler {
@@ -103,25 +102,8 @@ func (h *Handler) NotifyError(sessionID string) {
 	go h.notifySubscribers("AVTransport", avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 }
 
-func (h *Handler) setCurrentSessionID(id string) {
-	h.mu.Lock()
-	h.currentSessionID = id
-	h.mu.Unlock()
-}
-
-func (h *Handler) getCurrentSessionID() string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.currentSessionID
-}
-
 func (h *Handler) activeSession() *session.Session {
-	if sid := h.getCurrentSessionID(); sid != "" {
-		if s := h.sessionMgr.Get(sid); s != nil {
-			return s
-		}
-	}
-	return h.sessionMgr.ActiveSession()
+	return h.sessionMgr.CurrentSession()
 }
 
 func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
@@ -950,7 +932,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
 		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
-		h.setCurrentSessionID(s.ID)
+		h.sessionMgr.SetCurrentSessionID(s.ID)
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID

@@ -54,12 +54,12 @@ const maxSessions = 64
 type ErrorNotifier func(sessionID string, err error)
 
 type Manager struct {
-	mu            sync.RWMutex
-	sessions      map[string]*Session
-	lastSessionID string
-	cfg           *config.Config
-	streamer      *stream.Streamer
-	errorNotifier ErrorNotifier
+	mu               sync.RWMutex
+	sessions         map[string]*Session
+	currentSessionID string
+	cfg              *config.Config
+	streamer         *stream.Streamer
+	errorNotifier    ErrorNotifier
 }
 
 func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
@@ -72,6 +72,34 @@ func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
 
 func (m *Manager) SetErrorNotifier(n ErrorNotifier) {
 	m.errorNotifier = n
+}
+
+// SetCurrentSessionID is called when a new AVTransport session replaces the current one.
+func (m *Manager) SetCurrentSessionID(id string) {
+	m.mu.Lock()
+	m.currentSessionID = id
+	m.mu.Unlock()
+}
+
+// CurrentSessionID returns the ID of the current AVTransport session.
+func (m *Manager) CurrentSessionID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.currentSessionID
+}
+
+// CurrentSession returns the current session identified by currentSessionID,
+// falling back to ActiveSession() for backward compatibility.
+func (m *Manager) CurrentSession() *Session {
+	m.mu.RLock()
+	sid := m.currentSessionID
+	m.mu.RUnlock()
+	if sid != "" {
+		if s := m.Get(sid); s != nil {
+			return s
+		}
+	}
+	return m.ActiveSession()
 }
 
 func (m *Manager) Create(sourceURI, metadataXML string) *Session {
@@ -114,7 +142,7 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	s.StreamURL = baseURL + "/live/" + id + "." + ext + "?token=" + token
 
 	m.sessions[id] = s
-	m.lastSessionID = id
+	m.currentSessionID = id
 	m.mu.Unlock()
 
 	for _, sid := range toStop {
@@ -246,20 +274,7 @@ func (m *Manager) ActiveSession() *Session {
 // StatusSession returns the active session for status reporting,
 // including StateError sessions that ActiveSession excludes.
 func (m *Manager) StatusSession() *Session {
-	s := m.ActiveSession()
-	if s != nil {
-		return s
-	}
-	// Fall back to last session if it's in error state
-	m.mu.RLock()
-	sid := m.lastSessionID
-	m.mu.RUnlock()
-	if sid != "" {
-		if s := m.Get(sid); s != nil && s.State == StateError {
-			return s
-		}
-	}
-	return nil
+	return m.CurrentSession()
 }
 
 func (m *Manager) Count() int {
