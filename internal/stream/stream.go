@@ -37,15 +37,8 @@ type Streamer struct {
 type stream struct {
 	sessionID    string
 	sourceURI    string
-	ringBuf      *RingBuffer
-	cmd          *exec.Cmd
-	cmdMu        sync.Mutex
-	cancel       context.CancelFunc
 	active       atomic.Bool
-	clients      map[string]*clientWriter
 	clientsMu    sync.Mutex
-	started      chan struct{}
-	done         chan struct{}
 	err          error
 	ffmpegCfg    config.FFmpegConfig
 	startTime    time.Time
@@ -54,6 +47,8 @@ type stream struct {
 	runsInFlight atomic.Int32
 	genMu        sync.Mutex
 	errorCB      ErrorCallback
+
+	gen *streamGeneration
 }
 
 type clientWriter struct {
@@ -63,6 +58,18 @@ type clientWriter struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	ch      chan []byte
+}
+
+// streamGeneration holds the per-run mutable state for a single ffmpeg instance.
+// It is replaced on each Pause/Seek/Resume cycle.
+type streamGeneration struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started chan struct{}
+	done    chan struct{}
+	ringBuf *RingBuffer
+	cmd     *exec.Cmd
+	clients map[string]*clientWriter
 }
 
 func NewStreamer(cfg *config.Config) *Streamer {
@@ -89,20 +96,23 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 	st := &stream{
 		sessionID: sessionID,
 		sourceURI: sourceURI,
-		ringBuf:   NewRingBuffer(s.cfg.Stream.RingBufferBytes),
-		clients:   make(map[string]*clientWriter),
-		started:   make(chan struct{}),
-		cancel:    cancel,
 		ffmpegCfg: s.cfg.FFmpeg,
 		errorCB:   s.errorCB,
+		gen: &streamGeneration{
+			ctx:     ctx,
+			cancel:  cancel,
+			started: make(chan struct{}),
+			done:    make(chan struct{}),
+			ringBuf: NewRingBuffer(s.cfg.Stream.RingBufferBytes),
+			clients: make(map[string]*clientWriter),
+		},
 	}
 	st.active.Store(true)
 	st.startTime = time.Now()
 	st.resumeOffset = 0
-	st.done = make(chan struct{})
 	s.streams[sessionID] = st
 
-	go st.run(ctx)
+	go st.run(st.gen)
 	return nil
 }
 
@@ -117,20 +127,27 @@ func (s *Streamer) Stop(sessionID string) {
 	s.mu.Unlock()
 
 	if st.active.Swap(false) {
-		st.cancel()
-		st.cmdMu.Lock()
-		cmd := st.cmd
-		st.cmdMu.Unlock()
-		if cmd != nil && cmd.Process != nil {
-			cmd.Process.Kill()
+		st.genMu.Lock()
+		gen := st.gen
+		st.genMu.Unlock()
+		if gen != nil {
+			gen.cancel()
+			if gen.cmd != nil && gen.cmd.Process != nil {
+				gen.cmd.Process.Kill()
+			}
+			st.closeClients(gen)
 		}
-		st.clientsMu.Lock()
-		for _, c := range st.clients {
-			c.cancel()
-		}
-		st.clientsMu.Unlock()
 		slog.Info("Stream stopped", "session_id", sessionID)
 	}
+}
+
+func (st *stream) closeClients(gen *streamGeneration) {
+	st.clientsMu.Lock()
+	for _, c := range gen.clients {
+		c.cancel()
+	}
+	gen.clients = make(map[string]*clientWriter)
+	st.clientsMu.Unlock()
 }
 
 func (s *Streamer) Pause(sessionID string) time.Duration {
@@ -159,35 +176,35 @@ func (s *Streamer) Seek(sessionID string, offset time.Duration) {
 
 // restartWithOffset kills ffmpeg, resets the stream, and sets resume offset for restart.
 func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.Duration) {
-	if st.active.Swap(false) {
-		st.cancel()
-		st.cmdMu.Lock()
-		cmd := st.cmd
-		st.cmdMu.Unlock()
-		if cmd != nil && cmd.Process != nil {
-			cmd.Process.Kill()
+	st.genMu.Lock()
+	oldGen := st.gen
+	st.genMu.Unlock()
+	if st.active.Swap(false) && oldGen != nil {
+		oldGen.cancel()
+		if oldGen.cmd != nil && oldGen.cmd.Process != nil {
+			oldGen.cmd.Process.Kill()
 		}
-		st.clientsMu.Lock()
-		for _, c := range st.clients {
-			c.cancel()
-		}
-		st.clientsMu.Unlock()
+		st.closeClients(oldGen)
 	}
-	if st.runsInFlight.Load() > 0 && st.done != nil {
-		<-st.done
+	if st.runsInFlight.Load() > 0 && oldGen != nil {
+		<-oldGen.done
 	}
 	st.runsInFlight.Store(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	newGen := &streamGeneration{
+		ctx:     ctx,
+		cancel:  cancel,
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+		ringBuf: NewRingBuffer(oldGen.ringBuf.Size()),
+		clients: make(map[string]*clientWriter),
+	}
 	st.genMu.Lock()
-	st.active.Store(true)
-	st.ringBuf = NewRingBuffer(st.ringBuf.Size())
-	_, cancel := context.WithCancel(context.Background())
-	st.cancel = cancel
+	st.gen = newGen
 	st.resumeOffset = offset
 	st.ffmpegTime.Store(0)
 	st.err = nil
-	st.started = make(chan struct{})
-	st.clients = make(map[string]*clientWriter)
-	st.done = make(chan struct{})
+	st.active.Store(true)
 	st.genMu.Unlock()
 }
 
@@ -203,13 +220,20 @@ func (s *Streamer) Resume(sessionID string) {
 	}
 	st.genMu.Lock()
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
-	st.cancel = resumeCancel
+	newGen := &streamGeneration{
+		ctx:     resumeCtx,
+		cancel:  resumeCancel,
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+		ringBuf: NewRingBuffer(st.gen.ringBuf.Size()),
+		clients: make(map[string]*clientWriter),
+	}
+	st.gen = newGen
 	st.startTime = time.Now()
 	st.ffmpegTime.Store(0)
 	st.err = nil
-	st.done = make(chan struct{})
 	st.genMu.Unlock()
-	go st.run(resumeCtx)
+	go st.run(newGen)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
 }
 
@@ -220,11 +244,11 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if !ok {
 		return 0
 	}
-	ft := st.ffmpegTime.Load()
 	st.genMu.Lock()
 	resumeOff := st.resumeOffset
 	startT := st.startTime
 	st.genMu.Unlock()
+	ft := st.ffmpegTime.Load()
 	if ft > 0 {
 		return resumeOff + time.Duration(ft)
 	}
@@ -257,7 +281,7 @@ func (s *Streamer) TotalClients() int {
 	total := 0
 	for _, st := range s.streams {
 		st.clientsMu.Lock()
-		total += len(st.clients)
+		total += len(st.gen.clients)
 		st.clientsMu.Unlock()
 	}
 	return total
@@ -301,8 +325,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gen := st.gen
+	if gen == nil {
+		http.Error(w, "Stream not available", http.StatusNotFound)
+		return
+	}
+
 	select {
-	case <-st.started:
+	case <-gen.started:
 	case <-time.After(time.Duration(s.cfg.Stream.StartupTimeoutSeconds) * time.Second):
 		http.Error(w, "Stream startup timeout", http.StatusServiceUnavailable)
 		return
@@ -328,14 +358,6 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher = f
 	}
 
-	st.clientsMu.Lock()
-	if len(st.clients) >= s.cfg.Stream.MaxClientsPerSession {
-		st.clientsMu.Unlock()
-		http.Error(w, "Too many clients", http.StatusTooManyRequests)
-		return
-	}
-	st.clientsMu.Unlock()
-
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -346,24 +368,29 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	// Replay prebuffer before making this client visible to broadcast,
-	// so the first data the client receives is the prebuffer header.
-	st.genMu.Lock()
-	wp := st.ringBuf.WritePosition()
-	st.genMu.Unlock()
+	// Hold clientsMu across prebuffer read + client add to prevent
+	// a broadcast() from sneaking a live chunk between them.
+	gen = st.gen
+	st.clientsMu.Lock()
+	if gen == nil || len(gen.clients) >= s.cfg.Stream.MaxClientsPerSession {
+		st.clientsMu.Unlock()
+		http.Error(w, "Too many clients", http.StatusTooManyRequests)
+		return
+	}
+
+	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
 		start = 0
 	}
 	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
-	n, _ := st.ringBuf.Read(start, prebuf)
+	n, _ := gen.ringBuf.Read(start, prebuf)
 	if n > 0 {
-		cw.ch <- prebuf[:n]
+		// Copy before enqueue so channel holds an independent slice
+		cw.ch <- append([]byte(nil), prebuf[:n]...)
 	}
-
-	st.clientsMu.Lock()
-	st.clients[clientID] = cw
-	isFirst := len(st.clients) == 1
+	gen.clients[clientID] = cw
+	isFirst := len(gen.clients) == 1
 	st.clientsMu.Unlock()
 
 	if isFirst && s.firstClientCB != nil {
@@ -377,8 +404,8 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	<-ctx.Done()
 
 	st.clientsMu.Lock()
-	delete(st.clients, clientID)
-	remaining := len(st.clients)
+	delete(st.gen.clients, clientID)
+	remaining := len(st.gen.clients)
 	st.clientsMu.Unlock()
 
 	slog.Info("Client disconnected from stream", "session_id", sessionID, "client_id", clientID, "remaining", remaining)
@@ -390,7 +417,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			current := s.streams[sessionID]
 			s.mu.Unlock()
 			snapshot.clientsMu.Lock()
-			empty := len(snapshot.clients) == 0
+			empty := len(snapshot.gen.clients) == 0
 			snapshot.clientsMu.Unlock()
 			if current == snapshot && empty {
 				slog.Info("No clients remaining, stopping stream", "session_id", sessionID)
@@ -400,17 +427,16 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (st *stream) run(ctx context.Context) {
+func (st *stream) run(gen *streamGeneration) {
 	st.runsInFlight.Add(1)
 	defer func() {
 		st.runsInFlight.Store(0)
-		close(st.done)
-		// Only mark inactive if the context was NOT cancelled (natural exit).
-		// When we cancel the context (Stop/Pause), restartWithOffset/Resume
-		// manage the active flag directly — we must not overwrite it.
-		if ctx.Err() == nil {
+		if gen.ctx.Err() == nil {
+			// Natural exit: close clients so /live connections don't hang.
+			st.closeClients(gen)
 			st.active.Store(false)
 		}
+		close(gen.done)
 	}()
 
 	args := st.buildFFmpegArgs()
@@ -421,36 +447,35 @@ func (st *stream) run(ctx context.Context) {
 	if bin == "" {
 		bin = "ffmpeg"
 	}
-	st.cmdMu.Lock()
-	st.cmd = exec.CommandContext(ctx, bin, args...)
-	st.cmdMu.Unlock()
-	stdout, err := st.cmd.StdoutPipe()
+	cmd := exec.CommandContext(gen.ctx, bin, args...)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		st.err = err
 		slog.Error("Failed to create ffmpeg stdout pipe", "error", err)
-		close(st.started)
+		close(gen.started)
 		return
 	}
-	stderr, err := st.cmd.StderrPipe()
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		st.err = err
 		slog.Error("Failed to create ffmpeg stderr pipe", "error", err)
-		close(st.started)
+		close(gen.started)
 		return
 	}
 
-	if err := st.cmd.Start(); err != nil {
+	if err := cmd.Start(); err != nil {
 		st.err = err
 		slog.Error("Failed to start ffmpeg", "error", err)
-		close(st.started)
+		close(gen.started)
 		if st.errorCB != nil {
 			st.errorCB(st.sessionID, err)
 		}
 		return
 	}
 
-	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", st.cmd.Process.Pid)
-	close(st.started)
+	gen.cmd = cmd
+	slog.Info("ffmpeg started", "session_id", st.sessionID, "pid", cmd.Process.Pid)
+	close(gen.started)
 
 	go st.readProgress(stderr)
 
@@ -460,7 +485,7 @@ func (st *stream) run(ctx context.Context) {
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
-			st.ringBuf.Write(chunk)
+			gen.ringBuf.Write(chunk)
 			st.broadcast(chunk)
 		}
 		if readErr != nil {
@@ -471,14 +496,14 @@ func (st *stream) run(ctx context.Context) {
 		}
 
 		select {
-		case <-ctx.Done():
+		case <-gen.ctx.Done():
 			slog.Info("ffmpeg context cancelled", "session_id", st.sessionID)
 			return
 		default:
 		}
 	}
 
-	if err := st.cmd.Wait(); err != nil && ctx.Err() == nil {
+	if err := cmd.Wait(); err != nil && gen.ctx.Err() == nil {
 		st.err = err
 		slog.Error("ffmpeg exited with error", "session_id", st.sessionID, "error", err)
 		if st.errorCB != nil {
@@ -620,17 +645,21 @@ func (st *stream) broadcast(data []byte) {
 	if !st.active.Load() {
 		return
 	}
+	gen := st.gen
+	if gen == nil {
+		return
+	}
 	st.clientsMu.Lock()
-	for id, cw := range st.clients {
+	for id, cw := range gen.clients {
 		select {
 		case <-cw.ctx.Done():
-			delete(st.clients, id)
+			delete(gen.clients, id)
 		case cw.ch <- data:
 		default:
 			// client too slow, drop it
 			slog.Debug("Client too slow, disconnecting", "client_id", id)
 			cw.cancel()
-			delete(st.clients, id)
+			delete(gen.clients, id)
 		}
 	}
 	st.clientsMu.Unlock()

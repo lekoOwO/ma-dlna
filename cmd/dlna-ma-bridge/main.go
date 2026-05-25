@@ -149,7 +149,7 @@ func sessionsHandler(mgr *session.Manager) http.HandlerFunc {
 			}
 			redacted = append(redacted, map[string]any{
 				"session_id": s.ID,
-				"source_uri": s.SourceURI,
+				"source_uri": redactQuery(s.SourceURI),
 				"metadata":   s.Metadata,
 				"state":      s.State,
 				"stream_url": url,
@@ -176,7 +176,7 @@ func sessionByIDHandler(mgr *session.Manager) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"session_id": s.ID,
-			"source_uri": s.SourceURI,
+			"source_uri": redactQuery(s.SourceURI),
 			"metadata":   s.Metadata,
 			"state":      s.State,
 			"stream_url": url,

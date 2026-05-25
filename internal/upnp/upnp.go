@@ -646,11 +646,24 @@ func (h *Handler) notifySubscribers(service, lastChangeXML string) {
 	h.mu.Unlock()
 
 	for _, sub := range subs {
-		go h.sendStateChange(sub, sub.seq, lastChangeXML)
+		s := subSnapshot{
+			sid:      sub.sid,
+			callback: sub.callback,
+			service:  sub.service,
+			seq:      sub.seq,
+		}
+		go h.sendStateChange(s, lastChangeXML)
 	}
 }
 
-func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML string) {
+type subSnapshot struct {
+	sid      string
+	callback string
+	service  string
+	seq      int
+}
+
+func (h *Handler) sendStateChange(snap subSnapshot, lastChangeXML string) {
 	body := fmt.Sprintf(`<?xml version="1.0"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
@@ -658,7 +671,7 @@ func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML s
   </e:property>
 </e:propertyset>`, escapeXML(lastChangeXML))
 
-	for _, u := range extractCallbackURLs(sub.callback) {
+	for _, u := range extractCallbackURLs(snap.callback) {
 		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
 		if err != nil {
 			slog.Debug("Event NOTIFY create failed", "url", u, "error", err)
@@ -671,8 +684,8 @@ func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML s
 		req.Header.Set("Content-Type", "text/xml; charset=utf-8")
 		req.Header.Set("NT", "upnp:event")
 		req.Header.Set("NTS", "upnp:propchange")
-		req.Header.Set("SID", sub.sid)
-		req.Header.Set("SEQ", fmt.Sprintf("%d", seq))
+		req.Header.Set("SID", snap.sid)
+		req.Header.Set("SEQ", fmt.Sprintf("%d", snap.seq))
 		req.Header.Set("SERVER", serverString())
 
 		client := &http.Client{Timeout: 5 * time.Second}
@@ -682,7 +695,7 @@ func (h *Handler) sendStateChange(sub *eventSubscriber, seq int, lastChangeXML s
 			continue
 		}
 		resp.Body.Close()
-		slog.Debug("State change NOTIFY sent", "service", sub.service, "url", u, "seq", seq)
+		slog.Debug("State change NOTIFY sent", "service", snap.service, "url", u, "seq", snap.seq)
 	}
 }
 
@@ -896,7 +909,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				if offset, err := parseRelTime(target); err == nil {
 					slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
 					h.sessionMgr.Seek(active.ID, offset)
-					h.sessionMgr.Resume(active.ID)
+					wasPaused := active.State == session.StatePaused
+					if !wasPaused {
+					}
 				}
 			}
 		}

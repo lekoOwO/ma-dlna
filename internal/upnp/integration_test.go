@@ -428,7 +428,7 @@ func TestPlaybackActions(t *testing.T) {
 	defer ts.Close()
 
 	// Step 1: SetAVTransportURI
-	uri := "http://example.com/song.flac"
+	uri := "http://192.168.1.10/song.flac"
 	metadata := "<DIDL-Lite><item><title>Test</title></item></DIDL-Lite>"
 	body := soapEnvelope("AVTransport", "SetAVTransportURI",
 		"<InstanceID>0</InstanceID><CurrentURI>"+uri+"</CurrentURI><CurrentURIMetaData>"+escapeXMLText(metadata)+"</CurrentURIMetaData>")
@@ -521,7 +521,7 @@ func TestPlaybackActions(t *testing.T) {
 	t.Logf("Stop ok: session state=%s", s.State)
 
 	// Step 4: New session → Play → Pause
-	uri2 := "http://example.com/song2.mp3"
+	uri2 := "http://192.168.1.10/song2.mp3"
 	body = soapEnvelope("AVTransport", "SetAVTransportURI",
 		"<InstanceID>0</InstanceID><CurrentURI>"+uri2+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))

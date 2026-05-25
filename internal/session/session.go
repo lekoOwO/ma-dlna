@@ -124,6 +124,15 @@ func (m *Manager) Play(sessionID string) error {
 		return nil
 	}
 
+	if s.State == StateError {
+		s.State = StateStarting
+		s.Error = ""
+		s.UpdatedAt = time.Now()
+		m.mu.Unlock()
+		slog.Info("Session retrying from error", "session_id", sessionID)
+		return nil
+	}
+
 	if s.State != StateLoaded && s.State != StateStopped {
 		m.mu.Unlock()
 		return nil
