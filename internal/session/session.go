@@ -358,6 +358,9 @@ func (m *Manager) evictLocked() {
 	evictByState := func(states ...State) bool {
 		var oldest *Session
 		for _, s := range m.sessions {
+			if s.ID == m.currentSessionID {
+				continue
+			}
 			for _, st := range states {
 				if s.State == st {
 					if oldest == nil || s.UpdatedAt.Before(oldest.UpdatedAt) {

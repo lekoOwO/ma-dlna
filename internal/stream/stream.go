@@ -66,10 +66,10 @@ type clientWriter struct {
 // streamGeneration holds the per-run mutable state for a single ffmpeg instance.
 // It is replaced on each Pause/Seek/Resume cycle.
 //
-// Late-client reconnect note: gen.header captures ffmpeg's first stdout chunk
-// as a best-effort init segment. For MP3 this is usually sufficient; for Ogg/Opus,
-// FLAC, and WAV, the header may not form a complete decodable init segment.
-// Late reconnects to containerized formats are best-effort.
+// Late-client reconnect: initBuf accumulates the first initBufLimit bytes of stdout.
+// This forms a complete init segment for late clients, so formats like FLAC (metadata
+// blocks), Ogg/Opus (ID+comment+setup headers), and WAV (RIFF header) can decode
+// from any reconnect point.
 type streamGeneration struct {
 	mu              sync.Mutex
 	ctx             context.Context
@@ -84,8 +84,10 @@ type streamGeneration struct {
 	offset          time.Duration
 	err             error
 	ffmpegTime      atomic.Int64
-	header          []byte
-	headerSize      int64
+	initBuf         []byte
+	initBufSize     int64
+	initBufLimit    int64
+	initBufDone     bool
 	active          atomic.Bool
 }
 
@@ -121,28 +123,31 @@ func (gen *streamGeneration) killCmd() {
 	}
 }
 
-func (gen *streamGeneration) getHeader() []byte {
+func (gen *streamGeneration) getInitBuf() []byte {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
-	if gen.header == nil {
+	if len(gen.initBuf) == 0 {
 		return nil
 	}
-	return gen.header
+	return gen.initBuf
 }
 
-func (gen *streamGeneration) getHeaderSize() int64 {
+func (gen *streamGeneration) getInitBufSize() int64 {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
-	return gen.headerSize
+	return gen.initBufSize
 }
 
-func (gen *streamGeneration) setHeader(data []byte) {
+func (gen *streamGeneration) accumulateInitBuf(data []byte) {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
-	if gen.header == nil {
-		gen.header = make([]byte, len(data))
-		copy(gen.header, data)
-		gen.headerSize = int64(len(data))
+	if gen.initBufDone {
+		return
+	}
+	gen.initBuf = append(gen.initBuf, data...)
+	gen.initBufSize += int64(len(data))
+	if gen.initBufSize >= gen.initBufLimit {
+		gen.initBufDone = true
 	}
 }
 
@@ -175,13 +180,14 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		errorCB:        s.errorCB,
 		endCB:          s.endCB,
 		gen: &streamGeneration{
-			ctx:         ctx,
-			cancel:      cancel,
-			started:     make(chan struct{}),
-			done:        make(chan struct{}),
-			firstClient: make(chan struct{}),
-			ringBuf:     NewRingBuffer(s.cfg.Stream.RingBufferBytes),
-			clients:     make(map[string]*clientWriter),
+			ctx:          ctx,
+			cancel:       cancel,
+			started:      make(chan struct{}),
+			done:         make(chan struct{}),
+			firstClient:  make(chan struct{}),
+			ringBuf:      NewRingBuffer(s.cfg.Stream.RingBufferBytes),
+			clients:      make(map[string]*clientWriter),
+			initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 		},
 	}
 	st.active.Store(true)
@@ -209,6 +215,7 @@ func (s *Streamer) Stop(sessionID string) {
 		gen := st.gen
 		st.genMu.Unlock()
 		if gen != nil {
+			gen.active.Store(false)
 			gen.cancel()
 			gen.killCmd()
 			st.closeClients(gen)
@@ -260,6 +267,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	oldGen := st.gen
 	st.genMu.Unlock()
 	if st.active.Swap(false) && oldGen != nil {
+		oldGen.active.Store(false)
 		oldGen.cancel()
 		oldGen.killCmd()
 		st.closeClients(oldGen)
@@ -274,14 +282,15 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		ringBufSize = oldGen.ringBuf.Size()
 	}
 	newGen := &streamGeneration{
-		ctx:         ctx,
-		cancel:      cancel,
-		started:     make(chan struct{}),
-		done:        make(chan struct{}),
-		firstClient: make(chan struct{}),
-		ringBuf:     NewRingBuffer(ringBufSize),
-		clients:     make(map[string]*clientWriter),
-		offset:      offset,
+		ctx:          ctx,
+		cancel:       cancel,
+		started:      make(chan struct{}),
+		done:         make(chan struct{}),
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(ringBufSize),
+		clients:      make(map[string]*clientWriter),
+		offset:       offset,
+		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 	}
 	st.genMu.Lock()
 	st.gen = newGen
@@ -302,14 +311,15 @@ func (s *Streamer) Resume(sessionID string) {
 	st.genMu.Lock()
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
 	newGen := &streamGeneration{
-		ctx:         resumeCtx,
-		cancel:      resumeCancel,
-		started:     make(chan struct{}),
-		done:        make(chan struct{}),
-		firstClient: make(chan struct{}),
-		ringBuf:     NewRingBuffer(st.gen.ringBuf.Size()),
-		clients:     make(map[string]*clientWriter),
-		offset:      st.gen.offset,
+		ctx:          resumeCtx,
+		cancel:       resumeCancel,
+		started:      make(chan struct{}),
+		done:         make(chan struct{}),
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(st.gen.ringBuf.Size()),
+		clients:      make(map[string]*clientWriter),
+		offset:       st.gen.offset,
+		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 	}
 	st.gen = newGen
 	st.startTime = time.Now()
@@ -472,18 +482,17 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cw.flusher.Flush()
 	}
 
-	// Send header first for new clients that need the container init segment.
-	// To avoid duplication, skip past header bytes when reading prebuffer if
-	// the prebuffer range overlaps with the header.
-	hdrSize := gen.getHeaderSize()
-	if hdr := gen.getHeader(); hdr != nil {
-		cw.ch <- append([]byte(nil), hdr...)
+	// Send accumulated init segment first so late clients can decode
+	// containerized formats (FLAC, Ogg/Opus, WAV).
+	initSize := gen.getInitBufSize()
+	if init := gen.getInitBuf(); len(init) > 0 {
+		cw.ch <- append([]byte(nil), init...)
 	}
 
 	wp := gen.ringBuf.WritePosition()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
-	if start < hdrSize {
-		start = hdrSize
+	if start < initSize {
+		start = initSize
 	}
 	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
 	n, _ := gen.ringBuf.Read(start, prebuf)
@@ -535,6 +544,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (st *stream) run(gen *streamGeneration) {
 	hadError := false
 	defer func() {
+		gen.active.Store(false)
 		st.runsInFlight.Store(0)
 		if gen.ctx.Err() == nil {
 			st.closeClients(gen)
@@ -629,7 +639,7 @@ func (st *stream) run(gen *streamGeneration) {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			gen.ringBuf.Write(chunk)
-			gen.setHeader(chunk)
+			gen.accumulateInitBuf(chunk)
 			st.broadcast(gen, chunk)
 		}
 		if readErr != nil {

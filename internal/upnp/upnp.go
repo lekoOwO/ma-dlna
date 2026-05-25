@@ -156,6 +156,13 @@ func (h *Handler) baseURLForRequest(r *http.Request) string {
 		}
 		return h.cfg.Server.PublicBaseURL
 	}
+	// Avoid returning 0.0.0.0 if PublicBaseURL is the default; fall back to matching IP
+	if strings.Contains(h.cfg.Server.PublicBaseURL, "0.0.0.0") {
+		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if lip := matchingIP(net.ParseIP(remoteIP)); lip != nil {
+			return "http://" + net.JoinHostPort(lip.String(), fmt.Sprintf("%d", h.cfg.Server.HTTPPort))
+		}
+	}
 	return h.cfg.Server.PublicBaseURL
 }
 
@@ -992,9 +999,12 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
 				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
-			} else {
-				go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+				return
 			}
+			go h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1019,9 +1029,12 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
 			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
 			h.sessionMgr.SetError(active.ID, err.Error())
-		} else {
-			go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
 		}
+		go h.notifySubscribers("AVTransport", avTransportLastChange("PAUSED_PLAYBACK"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID
@@ -1292,22 +1305,31 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		muteStr := extractSOAPField(body, "DesiredMute")
 		targetMuted := muteStr == "1"
 
-		// Snapshot current state under h.mu
+		h.rcMu.Lock()
+		defer h.rcMu.Unlock()
+
+		// Snapshot state under rcMu to serialize with SetVolume
 		h.mu.RLock()
 		curVol := h.volume
 		curMuted := h.muted
 		prevVol := h.prevVolume
 		h.mu.RUnlock()
 
-		// No-op if target == current
+		// No-op but still sync HA to fix any drift
 		if targetMuted == curMuted {
+			if curMuted {
+				h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0)
+			} else {
+				restoreVol := curVol
+				if prevVol > 0 {
+					restoreVol = prevVol
+				}
+				h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol)
+			}
 			response = renderingResponse(action, `
 	<u:SetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/>`)
 			break
 		}
-
-		h.rcMu.Lock()
-		defer h.rcMu.Unlock()
 
 		if targetMuted {
 			// Mute: save volume, then call HA

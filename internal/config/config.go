@@ -69,6 +69,7 @@ type FFmpegConfig struct {
 type StreamConfig struct {
 	PrebufferBytes        int `yaml:"prebuffer_bytes"`
 	RingBufferBytes       int `yaml:"ring_buffer_bytes"`
+	InitSegmentBytes      int `yaml:"init_segment_bytes"`
 	MaxClientsPerSession  int `yaml:"max_clients_per_session"`
 	NoClientGraceSeconds  int `yaml:"no_client_grace_seconds"`
 	StartupTimeoutSeconds int `yaml:"startup_timeout_seconds"`
@@ -210,6 +211,7 @@ func DefaultConfig() Config {
 		Stream: StreamConfig{
 			PrebufferBytes:        524288,
 			RingBufferBytes:       8388608,
+			InitSegmentBytes:      262144,
 			MaxClientsPerSession:  16,
 			NoClientGraceSeconds:  10,
 			StartupTimeoutSeconds: 15,
