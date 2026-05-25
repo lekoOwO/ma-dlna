@@ -44,15 +44,24 @@ func main() {
 	maAdapter := maadapter.New(cfg)
 	upnpHandler := upnp.NewHandler(cfg, sessionMgr, maAdapter)
 
+	streamer.SetGenStartCallback(func(sessionID string, genID uint64) {
+		sessionMgr.SetSessionGenID(sessionID, genID)
+	})
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string) {
 		sessionMgr.SetPlaying(sessionID)
 	})
-	streamer.SetEndCallback(func(sessionID string) {
+	streamer.SetEndCallback(func(sessionID string, genID uint64) {
+		if !sessionMgr.VerifyGenID(sessionID, genID) {
+			return
+		}
 		sessionMgr.MarkStopped(sessionID)
 		upnpHandler.NotifyEnded(sessionID)
 	})
-	streamer.SetErrorCallback(func(sessionID string, err error) {
+	streamer.SetErrorCallback(func(sessionID string, genID uint64, err error) {
+		if !sessionMgr.VerifyGenID(sessionID, genID) {
+			return
+		}
 		sessionMgr.SetError(sessionID, err.Error())
 	})
 	sessionMgr.SetErrorNotifier(func(sessionID string, err error) {

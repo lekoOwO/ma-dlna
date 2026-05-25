@@ -56,6 +56,7 @@ type ErrorNotifier func(sessionID string, err error)
 type Manager struct {
 	mu               sync.RWMutex
 	sessions         map[string]*Session
+	sessionGenID     map[string]uint64
 	currentSessionID string
 	cfg              *config.Config
 	streamer         *stream.Streamer
@@ -64,14 +65,30 @@ type Manager struct {
 
 func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
 	return &Manager{
-		sessions: make(map[string]*Session),
-		cfg:      cfg,
-		streamer: streamer,
+		sessions:     make(map[string]*Session),
+		sessionGenID: make(map[string]uint64),
+		cfg:          cfg,
+		streamer:     streamer,
 	}
 }
 
 func (m *Manager) SetErrorNotifier(n ErrorNotifier) {
 	m.errorNotifier = n
+}
+
+// SetSessionGenID records the expected generation ID for a session.
+// Callbacks for old generations are rejected by VerifyGenID.
+func (m *Manager) SetSessionGenID(sessionID string, genID uint64) {
+	m.mu.Lock()
+	m.sessionGenID[sessionID] = genID
+	m.mu.Unlock()
+}
+
+// VerifyGenID returns true if genID matches the expected generation for this session.
+func (m *Manager) VerifyGenID(sessionID string, genID uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sessionGenID[sessionID] == genID
 }
 
 // SetCurrentSessionID is called when a new AVTransport session replaces the current one.

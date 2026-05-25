@@ -23,19 +23,27 @@ type TokenValidator func(sessionID, token string) bool
 
 type FirstClientCallback func(sessionID string)
 
-type ErrorCallback func(sessionID string, err error)
+// ErrorCallback receives the generation ID so the receiver can verify the error
+// is from the current generation before acting on it.
+type ErrorCallback func(sessionID string, genID uint64, err error)
+
+// EndCallback receives the generation ID so the receiver can verify the EOF
+// is from the current generation before acting on it.
+type EndCallback func(sessionID string, genID uint64)
+
+type GenStartCallback func(sessionID string, genID uint64)
 
 type Streamer struct {
 	cfg            *config.Config
 	mu             sync.Mutex
 	streams        map[string]*stream
+	nextGenID      atomic.Uint64
 	tokenValidator TokenValidator
 	firstClientCB  FirstClientCallback
 	errorCB        ErrorCallback
 	endCB          EndCallback
+	genStartCB     GenStartCallback
 }
-
-type EndCallback func(sessionID string)
 
 // Lock order: clientsMu must be acquired before genMu (via currentGen()).
 // Never hold genMu while acquiring clientsMu to avoid deadlock.
@@ -48,6 +56,7 @@ type stream struct {
 	startupTimeout time.Duration
 	runsInFlight   atomic.Int32
 	genMu          sync.Mutex
+	currentGenID   atomic.Uint64
 	errorCB        ErrorCallback
 	endCB          EndCallback
 
@@ -83,6 +92,7 @@ type streamGeneration struct {
 	clients         map[string]*clientWriter
 	offset          time.Duration
 	startTime       time.Time
+	genID           uint64
 	err             error
 	ffmpegTime      atomic.Int64
 	initBuf         []byte
@@ -96,6 +106,7 @@ type streamGeneration struct {
 // generation is still current. Prevents old-generation errors from overwriting
 // new-generation playback state for the same session ID.
 func (st *stream) reportError(gen *streamGeneration, err error) {
+	gid := gen.genID
 	if gen.ctx.Err() != nil {
 		return
 	}
@@ -104,7 +115,7 @@ func (st *stream) reportError(gen *streamGeneration, err error) {
 	}
 	gen.setErr(err)
 	if st.errorCB != nil {
-		st.errorCB(st.sessionID, err)
+		st.errorCB(st.sessionID, gid, err)
 	}
 }
 
@@ -211,6 +222,10 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 		},
 	}
 	st.gen.startTime = time.Now()
+	gid := s.nextGenID.Add(1)
+	st.gen.genID = gid
+	st.currentGenID.Store(gid)
+	s.notifyGenStart(sessionID, gid)
 	st.active.Store(true)
 	st.runsInFlight.Store(1)
 	s.streams[sessionID] = st
@@ -313,6 +328,10 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		offset:       offset,
 		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 	}
+	gid := s.nextGenID.Add(1)
+	newGen.genID = gid
+	st.currentGenID.Store(gid)
+	s.notifyGenStart(sessionID, gid)
 	st.genMu.Lock()
 	st.gen = newGen
 	st.active.Store(true)
@@ -349,6 +368,10 @@ func (s *Streamer) Resume(sessionID string) {
 		offset:       st.gen.offset,
 		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
 	}
+	gid := s.nextGenID.Add(1)
+	newGen.genID = gid
+	st.currentGenID.Store(gid)
+	s.notifyGenStart(sessionID, gid)
 	newGen.startTime = time.Now()
 	st.gen = newGen
 	st.genMu.Unlock()
@@ -400,6 +423,16 @@ func (s *Streamer) SetEndCallback(cb EndCallback) {
 
 func (s *Streamer) SetErrorCallback(cb ErrorCallback) {
 	s.errorCB = cb
+}
+
+func (s *Streamer) SetGenStartCallback(cb GenStartCallback) {
+	s.genStartCB = cb
+}
+
+func (s *Streamer) notifyGenStart(sessionID string, genID uint64) {
+	if s.genStartCB != nil {
+		s.genStartCB(sessionID, genID)
+	}
 }
 
 func (s *Streamer) TotalClients() int {
@@ -579,7 +612,7 @@ func (st *stream) run(gen *streamGeneration) {
 			st.closeClients(gen)
 			st.active.Store(false)
 			if !hadError && st.endCB != nil && st.currentGen() == gen {
-				st.endCB(st.sessionID)
+				st.endCB(st.sessionID, gen.genID)
 			}
 		}
 		close(gen.done)
