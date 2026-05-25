@@ -332,3 +332,22 @@ func TestSetError(t *testing.T) {
 		t.Errorf("expected error message, got %s", got.Error)
 	}
 }
+
+func TestSafeURLRedactsToken(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"http://example.com/song.mp3", "http://example.com/song.mp3"},
+		{"http://user:pass@example.com/song.mp3", "http://***@example.com/song.mp3"},
+		{"http://bridge:8787/live/abc.opus?token=secret123", "http://bridge:8787/live/abc.opus?..."},
+		{"http://example.com/path?a=1&token=secret&b=2", "http://example.com/path?..."},
+		{"http://example.com/path?token=secret", "http://example.com/path?..."},
+	}
+	for _, tc := range tests {
+		got := safeURL(tc.input)
+		if got != tc.expected {
+			t.Errorf("safeURL(%q) = %q, want %q", tc.input, got, tc.expected)
+		}
+	}
+}

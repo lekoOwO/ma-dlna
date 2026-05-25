@@ -392,3 +392,134 @@ func TestDLNAClientFullSession(t *testing.T) {
 	}
 	t.Logf("Step 9: Stop OK - Full session complete")
 }
+
+// TestSeekWhilePausedNoDeadlock verifies that Seek during paused state
+// does not deadlock (the done channel has no run goroutine in paused state).
+func TestSeekWhilePausedNoDeadlock(t *testing.T) {
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+
+	strm := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, strm)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cl := newDLNAClient(ts.URL)
+
+	// SetAVTransportURI (use a non-loopback-like IP in allowed range)
+	if err := cl.SetAVTransportURI("http://192.168.1.10/song.mp3", ""); err != nil {
+		t.Fatal("SetAVTransportURI:", err)
+	}
+	if err := cl.Play(); err != nil {
+		t.Fatal("Play:", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Pause
+	if _, err := cl.Pause(); err != nil {
+		t.Fatal("Pause:", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Seek while paused — must not deadlock
+	done := make(chan bool, 1)
+	go func() {
+		_, err := cl.Seek("REL_TIME", "00:00:10")
+		done <- (err == nil)
+	}()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Error("Seek while paused failed")
+		}
+		t.Log("Seek while paused completed without deadlock")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Seek while paused DEADLOCKED (timed out)")
+	}
+
+	if _, err := cl.Stop(); err != nil {
+		t.Fatal("Stop:", err)
+	}
+}
+
+// TestDoublePauseNoDeadlock verifies that calling Pause twice
+// does not deadlock.
+func TestDoublePauseNoDeadlock(t *testing.T) {
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+
+	strm := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, strm)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cl := newDLNAClient(ts.URL)
+
+	if err := cl.SetAVTransportURI("http://192.168.1.10/song.mp3", ""); err != nil {
+		t.Fatal("SetAVTransportURI:", err)
+	}
+	if err := cl.Play(); err != nil {
+		t.Fatal("Play:", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// First Pause
+	if _, err := cl.Pause(); err != nil {
+		t.Fatal("First Pause:", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Second Pause — must not deadlock
+	done := make(chan bool, 1)
+	go func() {
+		_, err := cl.Pause()
+		done <- (err == nil)
+	}()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Error("Second Pause failed")
+		}
+		t.Log("Double Pause completed without deadlock")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Double Pause DEADLOCKED (timed out)")
+	}
+
+	if _, err := cl.Stop(); err != nil {
+		t.Fatal("Stop:", err)
+	}
+}

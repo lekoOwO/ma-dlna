@@ -25,7 +25,9 @@ func serverString() string {
 }
 
 func uuidUSN(id string) string {
-	id = strings.TrimPrefix(id, "uuid:")
+	for strings.HasPrefix(id, "uuid:") {
+		id = id[5:]
+	}
 	return "uuid:" + id
 }
 

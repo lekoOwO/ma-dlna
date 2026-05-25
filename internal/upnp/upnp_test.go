@@ -736,3 +736,22 @@ func TestByeByeMessageFields(t *testing.T) {
 		t.Error("byebye should NOT contain CACHE-CONTROL")
 	}
 }
+
+func TestUUIDUSNNormalization(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"uuid:test-device", "uuid:test-device"},
+		{"test-device", "uuid:test-device"},
+		{"uuid:uuid:test-device", "uuid:test-device"},
+		{"uuid:", "uuid:"},
+		{"", "uuid:"},
+	}
+	for _, tc := range tests {
+		got := uuidUSN(tc.input)
+		if got != tc.expected {
+			t.Errorf("uuidUSN(%q) = %q, want %q", tc.input, got, tc.expected)
+		}
+	}
+}

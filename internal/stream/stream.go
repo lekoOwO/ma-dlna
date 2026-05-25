@@ -52,6 +52,7 @@ type stream struct {
 	resumeOffset time.Duration
 	ffmpegTime   atomic.Int64
 	runsInFlight atomic.Int32
+	genMu        sync.Mutex
 	errorCB      ErrorCallback
 }
 
@@ -176,6 +177,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		<-st.done
 	}
 	st.runsInFlight.Store(0)
+	st.genMu.Lock()
 	st.active.Store(true)
 	st.ringBuf = NewRingBuffer(st.ringBuf.Size())
 	_, cancel := context.WithCancel(context.Background())
@@ -186,6 +188,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 	st.started = make(chan struct{})
 	st.clients = make(map[string]*clientWriter)
 	st.done = make(chan struct{})
+	st.genMu.Unlock()
 }
 
 func (s *Streamer) Resume(sessionID string) {
@@ -198,12 +201,14 @@ func (s *Streamer) Resume(sessionID string) {
 	if !st.runsInFlight.CompareAndSwap(0, 1) {
 		return
 	}
+	st.genMu.Lock()
 	resumeCtx, resumeCancel := context.WithCancel(context.Background())
 	st.cancel = resumeCancel
 	st.startTime = time.Now()
 	st.ffmpegTime.Store(0)
 	st.err = nil
 	st.done = make(chan struct{})
+	st.genMu.Unlock()
 	go st.run(resumeCtx)
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", st.resumeOffset.Round(time.Second))
 }
@@ -216,13 +221,17 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 		return 0
 	}
 	ft := st.ffmpegTime.Load()
+	st.genMu.Lock()
+	resumeOff := st.resumeOffset
+	startT := st.startTime
+	st.genMu.Unlock()
 	if ft > 0 {
-		return st.resumeOffset + time.Duration(ft)
+		return resumeOff + time.Duration(ft)
 	}
-	if st.startTime.IsZero() {
+	if startT.IsZero() {
 		return 0
 	}
-	return st.resumeOffset + time.Since(st.startTime)
+	return resumeOff + time.Since(startT)
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {
@@ -339,7 +348,9 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Replay prebuffer before making this client visible to broadcast,
 	// so the first data the client receives is the prebuffer header.
+	st.genMu.Lock()
 	wp := st.ringBuf.WritePosition()
+	st.genMu.Unlock()
 	start := wp - int64(s.cfg.Stream.PrebufferBytes)
 	if start < 0 {
 		start = 0
