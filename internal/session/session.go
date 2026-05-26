@@ -481,6 +481,11 @@ func parseDIDL(xmlStr string) *Metadata {
 	//   <DIDL-Lite>
 	//     <item>   <title/>  <creator/>  <artist/>  <album/>  <albumArtURI/>   </item>
 	//   </DIDL-Lite>
+	type didlRes struct {
+		Duration string `xml:"duration,attr"`
+		URI      string `xml:",chardata"`
+	}
+
 	type didlItem struct {
 		XMLName     xml.Name `xml:"item"`
 		Title       string   `xml:"title"`
@@ -488,7 +493,7 @@ func parseDIDL(xmlStr string) *Metadata {
 		Artist      string   `xml:"artist"`
 		Album       string   `xml:"album"`
 		AlbumArtURI string   `xml:"albumArtURI"`
-		Res         string   `xml:"res"`
+		Res         didlRes  `xml:"res"`
 	}
 
 	// Try with DIDL-Lite wrapper (full UPnP format)
@@ -499,24 +504,24 @@ func parseDIDL(xmlStr string) *Metadata {
 	var doc didlDoc
 	if err := xml.Unmarshal([]byte(xmlStr), &doc); err == nil && len(doc.Items) > 0 {
 		it := doc.Items[0]
-		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res)
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration)
 	}
 
 	// Fallback: bare <item>
 	var it didlItem
 	if err := xml.Unmarshal([]byte(xmlStr), &it); err == nil {
-		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res)
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration)
 	}
 
 	return &Metadata{}
 }
 
-func buildMetadata(title, creator, artist, album, albumArtURI, resXML string) *Metadata {
+func buildMetadata(title, creator, artist, album, albumArtURI, duration string) *Metadata {
 	md := &Metadata{
 		Title:       title,
 		Album:       album,
 		AlbumArtURI: albumArtURI,
-		Duration:    parseResDuration(resXML),
+		Duration:    duration,
 	}
 	if artist != "" {
 		md.Artist = artist
@@ -527,23 +532,6 @@ func buildMetadata(title, creator, artist, album, albumArtURI, resXML string) *M
 }
 
 var ErrNotFound = errors.New("session not found")
-
-// parseResDuration extracts the duration attribute from a <res> element.
-// Example: <res duration="00:03:45.000">http://...</res>
-func parseResDuration(resXML string) string {
-	// Find duration="..." in the res element
-	const attr = `duration="`
-	i := strings.Index(resXML, attr)
-	if i < 0 {
-		return ""
-	}
-	start := i + len(attr)
-	end := strings.IndexByte(resXML[start:], '"')
-	if end < 0 {
-		return ""
-	}
-	return resXML[start : start+end]
-}
 
 func safeURL(raw string) string {
 	if i := strings.Index(raw, "://"); i > 0 {

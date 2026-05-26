@@ -145,11 +145,18 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 		defer ticker.Stop()
 
 		wasPlaying := false
+		lastEmitted := "" // prevent duplicate event storms
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// Self-clean: exit if session is no longer current
+				cur := h.sessionMgr.CurrentSession()
+				if cur == nil || cur.ID != sessionID || !h.sessionMgr.VerifyGenID(sessionID, genID) {
+					return
+				}
+
 				state, err := h.maAdapter.GetEntityState(h.cfg.HA.TargetEntityID)
 				if err != nil {
 					slog.Debug("Playback monitor poll failed", "entity", h.cfg.HA.TargetEntityID, "error", err)
@@ -159,15 +166,17 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 				case "playing":
 					wasPlaying = true
 				case "idle", "off", "standby":
-					if wasPlaying {
+					if wasPlaying && lastEmitted != "STOPPED" {
 						slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
 						h.sessionMgr.MarkStoppedIfGeneration(sessionID, genID)
 						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
+						lastEmitted = "STOPPED"
 						return
 					}
 				case "paused":
-					if wasPlaying {
+					if wasPlaying && lastEmitted != "PAUSED_PLAYBACK" {
 						h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
+						lastEmitted = "PAUSED_PLAYBACK"
 					}
 				}
 			}
@@ -852,7 +861,7 @@ func (h *Handler) initialEventBody(service string) string {
 	  <e:property>
 	    <LastChange>%s</LastChange>
 	  </e:property>
-	</e:propertyset>`, l)
+	</e:propertyset>`, escapeXML(l))
 	case "ConnectionManager":
 		return `<?xml version="1.0"?>
 	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
@@ -888,7 +897,7 @@ func (h *Handler) initialEventBody(service string) string {
 	  <e:property>
 	    <LastChange>%s</LastChange>
 	  </e:property>
-	</e:propertyset>`, l)
+	</e:propertyset>`, escapeXML(l))
 	}
 }
 
@@ -1103,6 +1112,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		instanceID := extractSOAPField(body, "InstanceID")
 		active := h.activeSession()
 		if active != nil {
+			h.stopPlaybackMonitor()
 			h.sessionMgr.Stop(active.ID)
 			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
 				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)

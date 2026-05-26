@@ -54,7 +54,6 @@ func main() {
 		}
 	})
 	streamer.SetEndCallback(func(sessionID string, genID uint64) {
-		sessionMgr.MarkStoppedIfGeneration(sessionID, genID)
 		upnpHandler.NotifyDeliveryEnded(sessionID)
 	})
 	streamer.SetErrorCallback(func(sessionID string, genID uint64, err error) {
