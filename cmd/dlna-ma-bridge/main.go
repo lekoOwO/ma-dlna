@@ -49,7 +49,7 @@ func main() {
 	})
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string, genID uint64) {
-		if sessionMgr.SetPlayingAccepted(sessionID) {
+		if sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, genID) {
 			upnpHandler.NotifyPlaying(sessionID, genID)
 		}
 	})

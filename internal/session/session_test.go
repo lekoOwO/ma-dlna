@@ -523,6 +523,192 @@ func TestDIDLDurationParsing(t *testing.T) {
 	}
 }
 
+func TestSeekPlayingTransitionsToStarting(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.Seek(s.ID, 30*time.Second)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Errorf("expected StateStarting after Seek on playing session, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSeekPausedStaysPaused(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	mgr.Pause(s.ID)
+	if mgr.Get(s.ID).State != StatePaused {
+		t.Fatalf("expected paused state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.Seek(s.ID, 30*time.Second)
+	if mgr.Get(s.ID).State != StatePaused {
+		t.Errorf("expected StatePaused after Seek on paused session, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSeekStartingAllowsSetPlayingAccepted(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.Seek(s.ID, 30*time.Second)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Seek, got %s", mgr.Get(s.ID).State)
+	}
+
+	if !mgr.SetPlayingAccepted(s.ID) {
+		t.Fatal("SetPlayingAccepted should return true when state is StateStarting")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected StatePlaying after SetPlayingAccepted, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSeekStartingKeepsStarting(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Play, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.Seek(s.ID, 30*time.Second)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Errorf("expected StateStarting after Seek on starting session, got %s", mgr.Get(s.ID).State)
+	}
+
+	if !mgr.SetPlayingAccepted(s.ID) {
+		t.Fatal("SetPlayingAccepted should return true when state is StateStarting")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected StatePlaying after SetPlayingAccepted, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSetPlayingAcceptedIfGenerationMatchingGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Play, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if !mgr.SetPlayingAcceptedIfGeneration(s.ID, 42) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return true for matching gen")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected StatePlaying, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSetPlayingAcceptedIfGenerationRejectsStaleGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Play, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if mgr.SetPlayingAcceptedIfGeneration(s.ID, 99) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return false for stale gen")
+	}
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Errorf("state should remain StateStarting after stale gen rejection, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSetPlayingAcceptedIfGenerationZeroGenSkipsCheck(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Play, got %s", mgr.Get(s.ID).State)
+	}
+
+	// genID=0 should skip generation check (backward compatibility)
+	if !mgr.SetPlayingAcceptedIfGeneration(s.ID, 0) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return true when genID=0")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected StatePlaying, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSetPlayingAcceptedIfGenerationWrongState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	// State is Loaded, not Starting
+	mgr.SetSessionGenID(s.ID, 42)
+	if mgr.SetPlayingAcceptedIfGeneration(s.ID, 42) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return false when not StateStarting")
+	}
+	if mgr.Get(s.ID).State != StateLoaded {
+		t.Errorf("state should remain StateLoaded, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestSeekFromStartingInvalidatesOldGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetSessionGenID(s.ID, 42)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Play, got %s", mgr.Get(s.ID).State)
+	}
+
+	// Seek should invalidate the old generation
+	mgr.Seek(s.ID, 30*time.Second)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected StateStarting after Seek, got %s", mgr.Get(s.ID).State)
+	}
+
+	// Old gen should now be rejected
+	if mgr.SetPlayingAcceptedIfGeneration(s.ID, 42) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return false for invalidated old gen after Seek")
+	}
+
+	// Set a new gen to simulate a new stream generation
+	mgr.SetSessionGenID(s.ID, 99)
+	if !mgr.SetPlayingAcceptedIfGeneration(s.ID, 99) {
+		t.Fatal("SetPlayingAcceptedIfGeneration should return true for new gen after Seek")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("expected StatePlaying after new gen acceptance, got %s", mgr.Get(s.ID).State)
+	}
+}
+
 func TestSafeURLRedactsToken(t *testing.T) {
 	tests := []struct {
 		input    string

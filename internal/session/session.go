@@ -327,10 +327,20 @@ func (m *Manager) SetPlaying(sessionID string) {
 // true if the transition was valid. Used by first-client callback to know whether
 // to fire the PLAYING event.
 func (m *Manager) SetPlayingAccepted(sessionID string) bool {
+	return m.SetPlayingAcceptedIfGeneration(sessionID, 0)
+}
+
+// SetPlayingAcceptedIfGeneration transitions the session from Starting to Playing
+// only if genID matches the expected generation. It returns true on success.
+// genID=0 skips the generation check.
+func (m *Manager) SetPlayingAcceptedIfGeneration(sessionID string, genID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
 		if s.State != StateStarting {
+			return false
+		}
+		if genID != 0 && m.sessionGenID[sessionID] != genID {
 			return false
 		}
 		s.State = StatePlaying
@@ -418,6 +428,15 @@ func (m *Manager) Elapsed(sessionID string) time.Duration {
 }
 
 func (m *Manager) Seek(sessionID string, offset time.Duration) {
+	m.mu.Lock()
+	if s, ok := m.sessions[sessionID]; ok {
+		if s.State == StatePlaying || s.State == StateStarting {
+			s.State = StateStarting
+			s.UpdatedAt = time.Now()
+			m.sessionGenID[sessionID] = 0
+		}
+	}
+	m.mu.Unlock()
 	m.streamer.Seek(sessionID, offset)
 }
 
