@@ -110,8 +110,14 @@ func TestPublicBaseURLDefault(t *testing.T) {
 func TestStreamDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if cfg.Stream.PrebufferBytes != 524288 {
-		t.Errorf("expected 512KB prebuffer, got %d", cfg.Stream.PrebufferBytes)
+	if cfg.Stream.PrebufferBytes != 32768 {
+		t.Errorf("expected 32KB prebuffer, got %d", cfg.Stream.PrebufferBytes)
+	}
+	if cfg.Stream.InitSegmentBytes != 32768 {
+		t.Errorf("expected 32KB init segment, got %d", cfg.Stream.InitSegmentBytes)
+	}
+	if cfg.Stream.MaxReplayBytes != 65536 {
+		t.Errorf("expected 64KB replay cap, got %d", cfg.Stream.MaxReplayBytes)
 	}
 	if cfg.Stream.MaxClientsPerSession != 16 {
 		t.Errorf("expected 16 max clients, got %d", cfg.Stream.MaxClientsPerSession)

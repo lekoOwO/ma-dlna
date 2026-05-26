@@ -137,10 +137,17 @@ const avTransportSCPD = `<?xml version="1.0"?>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Track</name><dataType>ui4</dataType><defaultValue>0</defaultValue></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_NrTracks</name><dataType>ui4</dataType><defaultValue>0</defaultValue></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_MediaDuration</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SeekMode</name><dataType>string</dataType>
+      <allowedValueList>
+        <allowedValue>REL_TIME</allowedValue>
+      </allowedValueList>
+    </stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SeekTarget</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURI</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURIMetaData</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>NextAVTransportURI</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>NextAVTransportURIMetaData</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>TrackDuration</name><dataType>time</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>TransportState</name><dataType>string</dataType>
       <allowedValueList>
         <allowedValue>STOPPED</allowedValue>
@@ -158,6 +165,9 @@ const avTransportSCPD = `<?xml version="1.0"?>
     <stateVariable sendEvents="no"><name>TransportPlaySpeed</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>RecordStorageMedium</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>PlaybackStorageMedium</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossiblePlaybackStorageMedia</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossibleRecordStorageMedia</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossibleRecordQualityModes</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>CurrentTransportActions</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>CurrentRecordQualityMode</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>RecordMediumWriteStatus</name><dataType>string</dataType></stateVariable>

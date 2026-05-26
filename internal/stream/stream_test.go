@@ -357,6 +357,41 @@ func TestStreamerElapsedKeepsAcceptedPresentationPositionWhenRunStops(t *testing
 	}
 }
 
+func TestStreamerInitSegmentLimitHonorsReplayCap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Stream.InitSegmentBytes = 262144
+	cfg.Stream.MaxReplayBytes = 65536
+
+	streamer := NewStreamer(&cfg)
+	if got := streamer.initSegmentLimit(); got != 65536 {
+		t.Fatalf("init segment limit should be capped to 64KB, got %d", got)
+	}
+
+	cfg.Stream.MaxReplayBytes = 0
+	streamer = NewStreamer(&cfg)
+	if got := streamer.initSegmentLimit(); got != 262144 {
+		t.Fatalf("init segment limit should be uncapped when max_replay_bytes=0, got %d", got)
+	}
+}
+
+func TestAllowReplayBytesExhaustsPositiveReplayCap(t *testing.T) {
+	remaining := 65536
+	if got := allowReplayBytes(32768, 65536, &remaining); got != 32768 {
+		t.Fatalf("first replay allowance = %d, want 32768", got)
+	}
+	if got := allowReplayBytes(65536, 65536, &remaining); got != 32768 {
+		t.Fatalf("second replay allowance = %d, want remaining 32768", got)
+	}
+	if got := allowReplayBytes(1, 65536, &remaining); got != 0 {
+		t.Fatalf("exhausted replay allowance = %d, want 0", got)
+	}
+
+	remaining = 0
+	if got := allowReplayBytes(1024, 0, &remaining); got != 1024 {
+		t.Fatalf("uncapped replay allowance = %d, want 1024", got)
+	}
+}
+
 func TestOldGenerationExitDoesNotClearCurrentRunTracking(t *testing.T) {
 	dir := t.TempDir()
 	releasePath := filepath.Join(dir, "release")

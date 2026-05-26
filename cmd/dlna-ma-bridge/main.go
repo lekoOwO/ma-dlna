@@ -46,9 +46,7 @@ func main() {
 
 	streamer.SetTokenValidator(sessionMgr.ValidateToken)
 	streamer.SetFirstClientCallback(func(sessionID string, genID uint64) {
-		if sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, genID) {
-			upnpHandler.NotifyPlaying(sessionID, genID)
-		}
+		slog.Debug("First stream client connected", "session_id", sessionID, "gen_id", genID)
 	})
 	streamer.SetEndCallback(func(sessionID string, genID uint64) {
 		upnpHandler.NotifyDeliveryEnded(sessionID)

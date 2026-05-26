@@ -519,10 +519,11 @@ func TestPlaybackActions(t *testing.T) {
 		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
 	}
 
-	// Session should be in "starting" state (Play sets it to starting)
+	// Session is starting until play_media succeeds; fast test handlers may
+	// accept playback before this assertion runs.
 	s = sm.Get(s.ID)
-	if s.State != session.StateStarting {
-		t.Errorf("State after Play: expected starting, got %s", s.State)
+	if s.State != session.StateStarting && s.State != session.StatePlaying {
+		t.Errorf("State after Play: expected starting or playing, got %s", s.State)
 	}
 
 	playCall := waitForHACall(t, haCalls, "play_media")
@@ -1017,13 +1018,19 @@ func TestStateChangeNotify(t *testing.T) {
 	cfg.HA.TargetEntityID = "media_player.test"
 	cfg.Server.PublicBaseURL = "http://bridge:8787"
 	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
 
 	streamer := stream.NewStreamer(&cfg)
 	sm := session.NewManager(&cfg, streamer)
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	streamer.SetTokenValidator(sm.ValidateToken)
-	streamer.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
+
+	t.Cleanup(func() {
+		if s := sm.CurrentSession(); s != nil {
+			_ = sm.Stop(s.ID)
+		}
+	})
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)
@@ -1068,14 +1075,25 @@ func TestStateChangeNotify(t *testing.T) {
 		t.Fatal("Timed out waiting for SetAVTransportURI NOTIFY")
 	}
 
-	// Play → PLAYING event now only fires from first /live client callback,
-	// not from Play handler. Skip PLAYING expectation.
+	// Play returns immediately; PLAYING is emitted after play_media succeeds.
 	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+
+	select {
+	case playNotify := <-cbCh:
+		playBody2, _ := io.ReadAll(playNotify.Body)
+		playBodyStr := string(playBody2)
+		if !strings.Contains(playBodyStr, "PLAYING") {
+			t.Errorf("Play NOTIFY should contain PLAYING, got: %s", playBodyStr)
+		}
+		t.Logf("Play state change NOTIFY received, SEQ=%s", playNotify.Header.Get("SEQ"))
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for Play state change NOTIFY")
+	}
 
 	// Pause
 	pauseBody := soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")
@@ -1142,7 +1160,6 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	streamer.SetTokenValidator(sm.ValidateToken)
-	streamer.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)
@@ -1495,6 +1512,152 @@ func TestGetPositionInfoWaitsForPlayMediaSuccessBeforeAdvancing(t *testing.T) {
 	t.Fatal("RelTime should advance after play_media succeeds")
 }
 
+func TestPlayMediaSuccessDrivesPlayingStateAndNotify(t *testing.T) {
+	playStarted := make(chan struct{})
+	releasePlay := make(chan struct{})
+	var releaseOnce sync.Once
+	var signaled atomic.Bool
+
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "play_media") {
+			if signaled.CompareAndSwap(false, true) {
+				close(playStarted)
+			}
+			<-releasePlay
+		}
+		w.WriteHeader(http.StatusOK)
+		if strings.Contains(r.URL.Path, "/api/states/") {
+			w.Write([]byte(`{"state":"playing"}`))
+			return
+		}
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+	defer releaseOnce.Do(func() { close(releasePlay) })
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+
+	t.Cleanup(func() {
+		if s := sm.CurrentSession(); s != nil {
+			_ = sm.Stop(s.ID)
+		}
+	})
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	cl := newDLNAClient(ts.URL)
+
+	cbServer, cbCh := mockCallback(t)
+	defer cbServer.Close()
+
+	w := &testRespWriter{header: make(http.Header)}
+	r, _ := http.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r.Header.Set("CALLBACK", callbackURL(cbServer))
+	r.Header.Set("NT", "upnp:event")
+	r.Header.Set("TIMEOUT", "Second-1800")
+	h.serveEvent(w, r)
+	if w.status != http.StatusOK {
+		t.Fatalf("SUBSCRIBE failed: %d", w.status)
+	}
+
+	select {
+	case <-cbCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for initial NOTIFY")
+	}
+
+	if err := cl.SetAVTransportURI("http://192.168.1.10/song.mp3", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case stoppedNotify := <-cbCh:
+		body, _ := io.ReadAll(stoppedNotify.Body)
+		if !strings.Contains(string(body), "STOPPED") {
+			t.Fatalf("SetAVTransportURI NOTIFY should contain STOPPED, got: %s", string(body))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for SetAVTransportURI NOTIFY")
+	}
+
+	if err := cl.Play(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-playStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async play_media request")
+	}
+
+	state, err := cl.GetTransportInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "TRANSITIONING" {
+		t.Fatalf("GetTransportInfo before play_media success = %s, want TRANSITIONING", state)
+	}
+
+	select {
+	case notify := <-cbCh:
+		body, _ := io.ReadAll(notify.Body)
+		if strings.Contains(string(body), "PLAYING") {
+			t.Fatalf("PLAYING NOTIFY fired before play_media success: %s", string(body))
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(releasePlay) })
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		state, err = cl.GetTransportInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state == "PLAYING" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if state != "PLAYING" {
+		t.Fatalf("GetTransportInfo after play_media success = %s, want PLAYING", state)
+	}
+
+	select {
+	case playNotify := <-cbCh:
+		body, _ := io.ReadAll(playNotify.Body)
+		if !strings.Contains(string(body), "PLAYING") {
+			t.Fatalf("play_media success NOTIFY should contain PLAYING, got: %s", string(body))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timed out waiting for PLAYING NOTIFY after play_media success")
+	}
+
+	select {
+	case extra := <-cbCh:
+		body, _ := io.ReadAll(extra.Body)
+		if strings.Contains(string(body), "PLAYING") {
+			t.Fatalf("unexpected duplicate PLAYING NOTIFY: %s", string(body))
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 // TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
 // sends SetAVTransportURI twice then Play, it plays the LAST URI.
 func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
@@ -1515,13 +1678,19 @@ func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
 	cfg.HA.TargetEntityID = "media_player.test"
 	cfg.Server.PublicBaseURL = "http://bridge:8787"
 	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
 
 	strm := stream.NewStreamer(&cfg)
 	sm := session.NewManager(&cfg, strm)
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	strm.SetTokenValidator(sm.ValidateToken)
-	strm.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
+
+	t.Cleanup(func() {
+		if s := sm.CurrentSession(); s != nil {
+			_ = sm.Stop(s.ID)
+		}
+	})
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)
@@ -1578,10 +1747,11 @@ func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// The active session should now be in "starting" state
+	// The active session should now be the second URI. A fast play_media
+	// success may already have accepted it as playing.
 	active = sm.Get(active.ID)
-	if active.State != session.StateStarting {
-		t.Errorf("expected starting state after Play, got %s", active.State)
+	if active.State != session.StateStarting && active.State != session.StatePlaying {
+		t.Errorf("expected starting or playing state after Play, got %s", active.State)
 	}
 	t.Logf("Correct session played: %s with URI %s", active.ID, active.SourceURI)
 }

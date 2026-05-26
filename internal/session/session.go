@@ -442,6 +442,16 @@ func (m *Manager) IsCurrentGenerationActive(sessionID string, genID uint64) bool
 	return m.isCurrentGenerationActiveLocked(sessionID, genID)
 }
 
+func (m *Manager) IsCurrentGenerationState(sessionID string, genID uint64, state State) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		return false
+	}
+	s, ok := m.sessions[sessionID]
+	return ok && s.State == state
+}
+
 func (m *Manager) isCurrentGenerationActiveLocked(sessionID string, genID uint64) bool {
 	if m.currentSessionID != sessionID {
 		return false
@@ -478,6 +488,36 @@ func (m *Manager) MarkPlaybackAcceptedIfGeneration(sessionID string, genID uint6
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.isCurrentGenerationActiveLocked(sessionID, genID)
+}
+
+// AcceptPlaybackIfGeneration accepts the current generation as real playback
+// after the downstream play_media call succeeds, then transitions Starting to
+// Playing. It returns true only for the state transition that should emit a
+// PLAYING event.
+func (m *Manager) AcceptPlaybackIfGeneration(sessionID string, genID uint64) bool {
+	m.mu.RLock()
+	if !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		m.mu.RUnlock()
+		return false
+	}
+	m.mu.RUnlock()
+
+	if !m.streamer.MarkPlaybackAcceptedIfGeneration(sessionID, genID) {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		return false
+	}
+	s := m.sessions[sessionID]
+	if s.State != StateStarting {
+		return false
+	}
+	s.State = StatePlaying
+	s.UpdatedAt = time.Now()
+	return true
 }
 
 // StopWithErrorIfGenerationActive stops the matching stream generation and sets

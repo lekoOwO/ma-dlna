@@ -323,8 +323,10 @@ Recommended MVP:
 
 ```yaml
 stream:
-  prebuffer_bytes: 524288       # 512 KiB
+  prebuffer_bytes: 32768        # 32 KiB
   ring_buffer_bytes: 8388608    # 8 MiB
+  init_segment_bytes: 32768     # 32 KiB
+  max_replay_bytes: 65536       # 64 KiB cap for init + prebuffer replay
   max_clients_per_session: 16
 ```
 
@@ -472,8 +474,10 @@ ffmpeg:
   extra_output_args: []
 
 stream:
-  prebuffer_bytes: 524288
+  prebuffer_bytes: 32768
   ring_buffer_bytes: 8388608
+  init_segment_bytes: 32768
+  max_replay_bytes: 65536
   max_clients_per_session: 16
   no_client_grace_seconds: 10
   startup_timeout_seconds: 15

@@ -136,10 +136,13 @@ func (h *Handler) NotifyError(sessionID string) {
 	h.notifyCurrentSession(sessionID, avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 }
 
-// NotifyPlaying sends AVTransport LastChange when the first /live client connects,
-// meaning HA/MA has actually started consuming the stream. It also starts the
-// playback monitor to detect when HA/MA reports playback ended.
+// NotifyPlaying sends AVTransport LastChange after HA/MA has accepted the
+// stream for the current generation. It also starts the playback monitor to
+// detect when HA/MA reports playback ended.
 func (h *Handler) NotifyPlaying(sessionID string, genID uint64) {
+	if !h.sessionMgr.IsCurrentGenerationState(sessionID, genID, session.StatePlaying) {
+		return
+	}
 	h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
 	h.startPlaybackMonitor(sessionID, genID)
 }
@@ -1272,7 +1275,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			if !h.sessionMgr.MarkPlaybackAcceptedIfGeneration(sessionID, playGen) {
+			if h.sessionMgr.AcceptPlaybackIfGeneration(sessionID, playGen) {
+				h.NotifyPlaying(sessionID, playGen)
+			} else {
 				slog.Debug("PlayMedia success ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
 			}
 		}()
@@ -1443,7 +1448,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		elapsed := h.sessionMgr.Elapsed(active.ID)
-		if active.State == session.StateStarting && offset == 0 && elapsed < 1*time.Second {
+		if (active.State == session.StateStarting || active.State == session.StatePlaying) && offset == 0 && elapsed < 1*time.Second {
 			slog.Debug("Seek ignored: no-op startup seek to 00:00:00", "session_id", active.ID, "elapsed", elapsed)
 			response = avTransportResponse(action, fmt.Sprintf(`
 		<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1479,7 +1484,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					}
 					return
 				}
-				if !h.sessionMgr.MarkPlaybackAcceptedIfGeneration(active.ID, seekGen) {
+				if h.sessionMgr.AcceptPlaybackIfGeneration(active.ID, seekGen) {
+					h.NotifyPlaying(active.ID, seekGen)
+				} else {
 					slog.Debug("Seek PlayMedia success ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
 				}
 			}()

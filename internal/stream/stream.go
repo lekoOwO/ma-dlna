@@ -231,6 +231,29 @@ func NewStreamer(cfg *config.Config) *Streamer {
 	}
 }
 
+func (s *Streamer) initSegmentLimit() int64 {
+	limit := int64(s.cfg.Stream.InitSegmentBytes)
+	maxReplay := int64(s.cfg.Stream.MaxReplayBytes)
+	if maxReplay > 0 && limit > maxReplay {
+		return maxReplay
+	}
+	return limit
+}
+
+func allowReplayBytes(n, maxReplayBytes int, remaining *int) int {
+	if maxReplayBytes <= 0 {
+		return n
+	}
+	if *remaining <= 0 {
+		return 0
+	}
+	if n > *remaining {
+		n = *remaining
+	}
+	*remaining -= n
+	return n
+}
+
 func (s *Streamer) SetTokenValidator(v TokenValidator) {
 	s.tokenValidator = v
 }
@@ -260,7 +283,7 @@ func (s *Streamer) Start(sessionID, sourceURI string) error {
 			firstClient:  make(chan struct{}),
 			ringBuf:      NewRingBuffer(s.cfg.Stream.RingBufferBytes),
 			clients:      make(map[string]*clientWriter),
-			initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
+			initBufLimit: s.initSegmentLimit(),
 		},
 	}
 	st.gen.startTime = time.Now()
@@ -426,7 +449,7 @@ func (s *Streamer) restartWithOffset(st *stream, sessionID string, offset time.D
 		ringBuf:      NewRingBuffer(ringBufSize),
 		clients:      make(map[string]*clientWriter),
 		offset:       offset,
-		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
+		initBufLimit: s.initSegmentLimit(),
 	}
 	gid := s.nextGenID.Add(1)
 	newGen.genID = gid
@@ -461,7 +484,7 @@ func (s *Streamer) Resume(sessionID string) {
 		ringBuf:      NewRingBuffer(st.gen.ringBuf.Size()),
 		clients:      make(map[string]*clientWriter),
 		offset:       st.gen.offset,
-		initBufLimit: int64(s.cfg.Stream.InitSegmentBytes),
+		initBufLimit: s.initSegmentLimit(),
 	}
 	gid := s.nextGenID.Add(1)
 	newGen.genID = gid
@@ -681,20 +704,34 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send accumulated init segment first. Improves late-client compatibility
 	// for containerized formats by replaying the stream prefix before buffered
 	// bytes. Best-effort; not all decoders accept arbitrary reconnect points.
+	maxReplayBytes := s.cfg.Stream.MaxReplayBytes
+	replayRemaining := maxReplayBytes
+	allowReplay := func(n int) int {
+		return allowReplayBytes(n, maxReplayBytes, &replayRemaining)
+	}
 	init, initSize := gen.getInitSegment()
+	sentInitSize := initSize
 	if len(init) > 0 {
-		cw.ch <- init
+		if n := allowReplay(len(init)); n > 0 {
+			cw.ch <- init[:n]
+			sentInitSize = int64(n)
+		} else {
+			sentInitSize = 0
+		}
 	}
 
 	wp := gen.ringBuf.WritePosition()
-	start := wp - int64(s.cfg.Stream.PrebufferBytes)
-	if start < initSize {
-		start = initSize
-	}
-	prebuf := make([]byte, s.cfg.Stream.PrebufferBytes)
-	n, _ := gen.ringBuf.Read(start, prebuf)
-	if n > 0 {
-		cw.ch <- append([]byte(nil), prebuf[:n]...)
+	prebufferBytes := allowReplay(s.cfg.Stream.PrebufferBytes)
+	if prebufferBytes > 0 {
+		start := wp - int64(prebufferBytes)
+		if start < sentInitSize {
+			start = sentInitSize
+		}
+		prebuf := make([]byte, prebufferBytes)
+		n, _ := gen.ringBuf.Read(start, prebuf)
+		if n > 0 {
+			cw.ch <- append([]byte(nil), prebuf[:n]...)
+		}
 	}
 	gen.clients[clientID] = cw
 	st.clientsMu.Unlock()

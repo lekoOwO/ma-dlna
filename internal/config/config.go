@@ -74,6 +74,7 @@ type StreamConfig struct {
 	PrebufferBytes        int `yaml:"prebuffer_bytes"`
 	RingBufferBytes       int `yaml:"ring_buffer_bytes"`
 	InitSegmentBytes      int `yaml:"init_segment_bytes"`
+	MaxReplayBytes        int `yaml:"max_replay_bytes"`
 	MaxClientsPerSession  int `yaml:"max_clients_per_session"`
 	NoClientGraceSeconds  int `yaml:"no_client_grace_seconds"`
 	StartupTimeoutSeconds int `yaml:"startup_timeout_seconds"`
@@ -149,6 +150,9 @@ func (c *Config) Validate() error {
 	if c.Stream.InitSegmentBytes < 0 {
 		return fmt.Errorf("stream.init_segment_bytes must be >= 0, got %d", c.Stream.InitSegmentBytes)
 	}
+	if c.Stream.MaxReplayBytes < 0 {
+		return fmt.Errorf("stream.max_replay_bytes must be >= 0, got %d", c.Stream.MaxReplayBytes)
+	}
 	if c.Stream.InitSegmentBytes > c.Stream.RingBufferBytes {
 		return fmt.Errorf("stream.init_segment_bytes must not exceed ring_buffer_bytes (%d), got %d", c.Stream.RingBufferBytes, c.Stream.InitSegmentBytes)
 	}
@@ -223,9 +227,10 @@ func DefaultConfig() Config {
 			Reconnect:    true,
 		},
 		Stream: StreamConfig{
-			PrebufferBytes:        524288,
+			PrebufferBytes:        32768,
 			RingBufferBytes:       8388608,
-			InitSegmentBytes:      262144,
+			InitSegmentBytes:      32768,
+			MaxReplayBytes:        65536,
 			MaxClientsPerSession:  16,
 			NoClientGraceSeconds:  10,
 			StartupTimeoutSeconds: 30,

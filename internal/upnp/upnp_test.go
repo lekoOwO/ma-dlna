@@ -13,6 +13,37 @@ import (
 	"github.com/leko/ma-dlna/internal/config"
 )
 
+func TestAVTransportSCPDRelatedStateVariablesExist(t *testing.T) {
+	var doc struct {
+		Actions []struct {
+			Arguments []struct {
+				Related string `xml:"relatedStateVariable"`
+			} `xml:"argumentList>argument"`
+		} `xml:"actionList>action"`
+		StateVariables []struct {
+			Name string `xml:"name"`
+		} `xml:"serviceStateTable>stateVariable"`
+	}
+	if err := xml.Unmarshal([]byte(avTransportSCPD), &doc); err != nil {
+		t.Fatalf("parse AVTransport SCPD: %v", err)
+	}
+
+	defined := make(map[string]bool)
+	for _, sv := range doc.StateVariables {
+		defined[sv.Name] = true
+	}
+	for _, action := range doc.Actions {
+		for _, arg := range action.Arguments {
+			if arg.Related == "" {
+				continue
+			}
+			if !defined[arg.Related] {
+				t.Fatalf("AVTransport SCPD argument references missing state variable %q", arg.Related)
+			}
+		}
+	}
+}
+
 func TestExtractSOAPAction(t *testing.T) {
 	tests := []struct {
 		name   string
