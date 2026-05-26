@@ -77,7 +77,7 @@ type eventSubscriber struct {
 type Handler struct {
 	cfg               *config.Config
 	sessionMgr        *session.Manager
-	maAdapter         *maadapter.Adapter
+	maAdapter         maadapter.PlayerClient
 	mu                sync.RWMutex
 	rcMu              sync.Mutex
 	playbackMonMu     sync.Mutex
@@ -90,7 +90,7 @@ type Handler struct {
 	subscribers       map[string]*eventSubscriber
 }
 
-func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maadapter.Adapter) *Handler {
+func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter maadapter.PlayerClient) *Handler {
 	return &Handler{
 		cfg:         cfg,
 		sessionMgr:  sessionMgr,
@@ -136,9 +136,9 @@ func (h *Handler) NotifyError(sessionID string) {
 	h.notifyCurrentSession(sessionID, avTransportLastChangeStatus("STOPPED", "ERROR_OCCURRED"))
 }
 
-// NotifyPlaying sends AVTransport LastChange after HA/MA has accepted the
+// NotifyPlaying sends AVTransport LastChange after the backend has accepted the
 // stream for the current generation. It also starts the playback monitor to
-// detect when HA/MA reports playback ended.
+// detect when the backend reports playback ended.
 func (h *Handler) NotifyPlaying(sessionID string, genID uint64) {
 	if !h.sessionMgr.IsCurrentGenerationState(sessionID, genID, session.StatePlaying) {
 		return
@@ -147,15 +147,16 @@ func (h *Handler) NotifyPlaying(sessionID string, genID uint64) {
 	h.startPlaybackMonitor(sessionID, genID)
 }
 
-// idleDebounce tracks HA state debounce logic for the playback monitor.
+// idleDebounce tracks backend state debounce logic for the playback monitor.
 // It encapsulates idle/off/standby timing so tests can inject time.
 type idleDebounce struct {
-	wasPlaying  bool
-	idleSince   time.Time
-	lastEmitted string
+	wasPlaying       bool
+	idleSince        time.Time
+	startupGraceTill time.Time
+	lastEmitted      string
 }
 
-// update processes one HA state poll. now is injected for testability.
+// update processes one backend state poll. now is injected for testability.
 // Returns (shouldStop, event). event is non-empty when a state-change
 // notification should be sent. shouldStop means the monitor exits.
 func (d *idleDebounce) update(haState string, now time.Time) (shouldStop bool, event string) {
@@ -163,12 +164,16 @@ func (d *idleDebounce) update(haState string, now time.Time) (shouldStop bool, e
 	case "playing":
 		d.wasPlaying = true
 		d.idleSince = time.Time{}
+		d.startupGraceTill = time.Time{}
 	case "idle", "off", "standby":
 		if !d.wasPlaying {
 			return false, ""
 		}
 		if d.idleSince.IsZero() {
 			d.idleSince = now
+			return false, ""
+		}
+		if !d.startupGraceTill.IsZero() && now.Before(d.startupGraceTill) {
 			return false, ""
 		}
 		if now.Sub(d.idleSince) < 10*time.Second {
@@ -180,18 +185,20 @@ func (d *idleDebounce) update(haState string, now time.Time) (shouldStop bool, e
 		}
 	case "paused":
 		d.idleSince = time.Time{}
+		d.startupGraceTill = time.Time{}
 		if d.wasPlaying && d.lastEmitted != "PAUSED_PLAYBACK" {
 			d.lastEmitted = "PAUSED_PLAYBACK"
 			return false, "PAUSED_PLAYBACK"
 		}
 	default:
 		d.idleSince = time.Time{}
+		d.startupGraceTill = time.Time{}
 	}
 	return false, ""
 }
 
-// startPlaybackMonitor polls HA/MA media_player state periodically and fires
-// STOPPED when the entity reports playback has ended (state != "playing").
+// startPlaybackMonitor polls backend playback state periodically and fires
+// STOPPED after idle/off/standby has remained stable past the debounce window.
 // This is the long-term replacement for relying on ffmpeg EOF as playback-ended.
 func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 	h.playbackMonMu.Lock()
@@ -209,7 +216,11 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
-		debounce := &idleDebounce{}
+		startupGrace := time.Duration(h.cfg.Stream.StartupTimeoutSeconds) * time.Second
+		if startupGrace < 10*time.Second {
+			startupGrace = 10 * time.Second
+		}
+		debounce := &idleDebounce{wasPlaying: true, startupGraceTill: time.Now().Add(startupGrace)}
 
 		for {
 			select {
@@ -228,9 +239,9 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					}
 				}
 
-				state, err := h.maAdapter.GetEntityState(h.cfg.HA.TargetEntityID)
+				state, err := h.maAdapter.GetState()
 				if err != nil {
-					slog.Debug("Playback monitor poll failed", "entity", h.cfg.HA.TargetEntityID, "error", err)
+					slog.Debug("Playback monitor poll failed", "target", h.maAdapter.Target(), "error", err)
 					continue
 				}
 
@@ -243,7 +254,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					idleDur = now.Sub(debounce.idleSince).Round(time.Second)
 				}
 				slog.Debug("Playback monitor poll",
-					"entity", h.cfg.HA.TargetEntityID,
+					"target", h.maAdapter.Target(),
 					"session_id", sessionID,
 					"gen_id", genID,
 					"ha_state", state,
@@ -255,7 +266,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 
 				switch event {
 				case "STOPPED":
-					slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
+					slog.Info("Playback monitor detected playback ended", "target", h.maAdapter.Target(), "state", state, "session_id", sessionID)
 					if h.sessionMgr.StopIfGeneration(sessionID, genID) {
 						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
 					}
@@ -1243,7 +1254,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
-		slog.Info("Play requested, calling MA", "entity", h.cfg.HA.TargetEntityID, "stream_url", safeURL(active.StreamURL))
+		slog.Info("Play requested, calling MA", "target", h.maAdapter.Target(), "stream_url", safeURL(active.StreamURL))
 		if active.State == session.StatePlaying {
 			response = avTransportResponse(action, fmt.Sprintf(`
 	<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1259,12 +1270,22 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		playGen := h.sessionMgr.CurrentGenID(active.ID)
 		sessionID := active.ID
 		streamURL := active.StreamURL
+		sourceURI := active.SourceURI
+		meta := active.Metadata
 		go func() {
-			if err := h.maAdapter.PlayMedia(
-				h.cfg.HA.TargetEntityID,
-				streamURL,
-				contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-			); err != nil {
+			req := maadapter.PlayRequest{
+				StreamURL:   streamURL,
+				SourceURL:   sourceURI,
+				ContentType: contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
+			}
+			if meta != nil {
+				req.Title = meta.Title
+				req.Artist = meta.Artist
+				req.Album = meta.Album
+				req.AlbumArtURI = meta.AlbumArtURI
+				req.Duration = meta.Duration
+			}
+			if err := h.maAdapter.PlayMedia(req); err != nil {
 				slog.Error("PlayMedia failed", "session_id", sessionID, "gen_id", playGen, "error", err)
 				if !h.sessionMgr.IsCurrentGenerationActive(sessionID, playGen) {
 					slog.Debug("PlayMedia late error ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
@@ -1291,8 +1312,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if active != nil {
 			h.stopPlaybackMonitor()
 			h.sessionMgr.Stop(active.ID)
-			if err := h.maAdapter.Stop(h.cfg.HA.TargetEntityID); err != nil {
-				slog.Error("HA Stop failed", "session_id", active.ID, "error", err)
+			if err := h.maAdapter.Stop(); err != nil {
+				slog.Error("Stop failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
 				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
@@ -1321,8 +1342,8 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.sessionMgr.Pause(active.ID)
-		if err := h.maAdapter.Pause(h.cfg.HA.TargetEntityID); err != nil {
-			slog.Error("HA Pause failed", "session_id", active.ID, "error", err)
+		if err := h.maAdapter.Pause(); err != nil {
+			slog.Error("Pause failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
 			h.sessionMgr.Stop(active.ID)
 			h.sessionMgr.SetError(active.ID, err.Error())
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -1371,6 +1392,13 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if h.sessionMgr != nil {
 			if active := h.activeSession(); active != nil {
 				elapsed := h.sessionMgr.Elapsed(active.ID)
+				if active.State == session.StatePlaying || active.State == session.StatePaused {
+					if pos, ok, err := h.maAdapter.PlaybackPosition(); err == nil && ok {
+						elapsed = pos
+					} else if err != nil {
+						slog.Debug("Playback position poll failed", "target", h.maAdapter.Target(), "error", err)
+					}
+				}
 				relTime = formatDurationUPnP(elapsed)
 				uri = escapeXML(active.SourceURI)
 				metadata = escapeXML(active.MetadataRaw)
@@ -1468,12 +1496,23 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 				return
 			}
+			seekStreamURL := active.StreamURL
+			seekSourceURI := active.SourceURI
+			seekMeta := active.Metadata
 			go func() {
-				if err := h.maAdapter.PlayMedia(
-					h.cfg.HA.TargetEntityID,
-					active.StreamURL,
-					contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-				); err != nil {
+				req := maadapter.PlayRequest{
+					StreamURL:   seekStreamURL,
+					SourceURL:   seekSourceURI,
+					ContentType: contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
+				}
+				if seekMeta != nil {
+					req.Title = seekMeta.Title
+					req.Artist = seekMeta.Artist
+					req.Album = seekMeta.Album
+					req.AlbumArtURI = seekMeta.AlbumArtURI
+					req.Duration = seekMeta.Duration
+				}
+				if err := h.maAdapter.PlayMedia(req); err != nil {
 					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "gen_id", seekGen, "error", err)
 					if !h.sessionMgr.IsCurrentGenerationActive(active.ID, seekGen) {
 						slog.Debug("Seek PlayMedia late error ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
@@ -1610,8 +1649,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 		h.rcMu.Lock()
 		defer h.rcMu.Unlock()
 
-		if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, vol); err != nil {
-			slog.Error("SetVolume failed", "error", err)
+		if err := h.maAdapter.SetVolume(vol); err != nil {
+			slog.Error("SetVolume failed", "target", h.maAdapter.Target(), "error", err)
 			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
@@ -1661,8 +1700,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			if curMuted {
 				syncVol = 0
 			}
-			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, syncVol); err != nil {
-				slog.Error("SetMute drift sync failed", "error", err)
+			if err := h.maAdapter.SetVolume(syncVol); err != nil {
+				slog.Error("SetMute drift sync failed", "target", h.maAdapter.Target(), "error", err)
 				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
@@ -1675,8 +1714,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 
 		if targetMuted {
 			// Mute: save volume, then call HA
-			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, 0); err != nil {
-				slog.Error("SetMute failed", "error", err)
+			if err := h.maAdapter.SetVolume(0); err != nil {
+				slog.Error("SetMute failed", "target", h.maAdapter.Target(), "error", err)
 				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
@@ -1693,8 +1732,8 @@ func (h *Handler) serveRenderingControl(w http.ResponseWriter, r *http.Request) 
 			if prevVol > 0 {
 				restoreVol = prevVol
 			}
-			if err := h.maAdapter.SetVolume(h.cfg.HA.TargetEntityID, restoreVol); err != nil {
-				slog.Error("SetMute unmute failed", "error", err)
+			if err := h.maAdapter.SetVolume(restoreVol); err != nil {
+				slog.Error("SetMute unmute failed", "target", h.maAdapter.Target(), "error", err)
 				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(soapFaultResponse("501", "Action Failed")))

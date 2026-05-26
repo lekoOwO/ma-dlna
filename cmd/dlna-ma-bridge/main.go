@@ -35,7 +35,7 @@ func main() {
 	setupLogging(cfg)
 
 	slog.Info("Starting dlna-ma-bridge", "version", version.Version, "commit", version.Commit)
-	slog.Debug("Config", "ha_url", cfg.HA.URL, "target", cfg.HA.TargetEntityID,
+	slog.Debug("Config", "adapter_mode", cfg.MAAdapter.Mode, "ha_url", cfg.HA.URL, "ha_target", cfg.HA.TargetEntityID, "ma_url", cfg.MusicAssistant.URL, "ma_target", cfg.MusicAssistant.TargetPlayerID,
 		"output", cfg.FFmpeg.OutputFormat, "codec", cfg.FFmpeg.Codec, "bitrate", cfg.FFmpeg.Bitrate,
 		"auto_base_url", cfg.UPnP.AutoBaseURL, "public_base_url", cfg.Server.PublicBaseURL)
 

@@ -839,6 +839,54 @@ func TestIdleDebounceAfterDeadlineStops(t *testing.T) {
 	}
 }
 
+func TestIdleDebounceStartupGraceSuppressesInitialIdleStop(t *testing.T) {
+	now := time.Now()
+	d := &idleDebounce{
+		wasPlaying:       true,
+		startupGraceTill: now.Add(30 * time.Second),
+	}
+
+	d.update("idle", now)
+
+	shouldStop, event := d.update("idle", now.Add(15*time.Second))
+	if shouldStop {
+		t.Error("idle during startup grace should not stop")
+	}
+	if event != "" {
+		t.Errorf("idle during startup grace should not emit, got %q", event)
+	}
+
+	shouldStop, event = d.update("idle", now.Add(30*time.Second))
+	if !shouldStop {
+		t.Error("idle after startup grace and debounce should stop")
+	}
+	if event != "STOPPED" {
+		t.Errorf("expected STOPPED after startup grace, got %q", event)
+	}
+}
+
+func TestIdleDebouncePlayingClearsStartupGrace(t *testing.T) {
+	now := time.Now()
+	d := &idleDebounce{
+		wasPlaying:       true,
+		startupGraceTill: now.Add(30 * time.Second),
+	}
+
+	d.update("playing", now.Add(2*time.Second))
+	if !d.startupGraceTill.IsZero() {
+		t.Error("playing should clear startup grace")
+	}
+
+	d.update("idle", now.Add(3*time.Second))
+	shouldStop, event := d.update("idle", now.Add(13*time.Second))
+	if !shouldStop {
+		t.Error("idle should stop after normal debounce once playing was observed")
+	}
+	if event != "STOPPED" {
+		t.Errorf("expected STOPPED after normal debounce, got %q", event)
+	}
+}
+
 func TestIdleDebouncePlayingResetsIdle(t *testing.T) {
 	d := &idleDebounce{wasPlaying: true}
 	now := time.Now()

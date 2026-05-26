@@ -13,13 +13,56 @@ import (
 	"github.com/leko/ma-dlna/internal/config"
 )
 
-type Adapter struct {
+// PlayerStatus holds enriched player state from the backend.
+type PlayerStatus struct {
+	State            string
+	QueueID          string
+	Elapsed          time.Duration
+	ElapsedUpdatedAt time.Time
+	HasElapsed       bool
+}
+
+// PlayerClient is the interface for controlling a media player backend.
+type PlayerClient interface {
+	Target() string
+	PlayMedia(req PlayRequest) error
+	Stop() error
+	Pause() error
+	SetVolume(volume int) error
+	GetState() (string, error)
+	GetStatus() (PlayerStatus, error)
+	PlaybackPosition() (time.Duration, bool, error)
+}
+
+// PlayRequest carries the stream and metadata to send to the player backend.
+type PlayRequest struct {
+	StreamURL   string
+	SourceURL   string
+	ContentType string
+	Title       string
+	Artist      string
+	Album       string
+	AlbumArtURI string
+	Duration    string
+}
+
+// New returns a PlayerClient for the configured mode.
+func New(cfg *config.Config) PlayerClient {
+	switch cfg.MAAdapter.Mode {
+	case "direct":
+		return newDirectAdapter(cfg)
+	default:
+		return newHAAdapter(cfg)
+	}
+}
+
+type HAAdapter struct {
 	cfg    *config.Config
 	client *http.Client
 }
 
-func New(cfg *config.Config) *Adapter {
-	return &Adapter{
+func newHAAdapter(cfg *config.Config) *HAAdapter {
+	return &HAAdapter{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 15 * time.Second,
@@ -27,32 +70,20 @@ func New(cfg *config.Config) *Adapter {
 	}
 }
 
-// validMAType reports whether contentType is a MA-native media type (not a MIME).
-func validMAType(contentType string) bool {
-	switch contentType {
-	case "artist", "album", "track", "playlist", "radio":
-		return true
-	}
-	return false
+func (a *HAAdapter) Target() string {
+	return a.cfg.HA.TargetEntityID
 }
 
-// haMediaType returns contentType if it is a valid MA type, otherwise "music".
-// MIME types like "audio/flac" are not meaningful for HA media_content_type.
-func haMediaType(contentType string) string {
-	if validMAType(contentType) {
-		return contentType
-	}
-	return "music"
-}
+func (a *HAAdapter) PlayMedia(req PlayRequest) error {
+	targetEntity := a.cfg.HA.TargetEntityID
+	contentID := req.StreamURL
+	contentType := req.ContentType
 
-func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
-	// Try primary service with MA-style payload first, then fallback with HA-native payload.
 	if a.cfg.MAAdapter.PlayService != "" {
 		maPayload := map[string]any{
 			"entity_id": targetEntity,
 			"media_id":  contentID,
 		}
-		// Only include media_type for MA-native types; let MA auto-detect for URLs.
 		if validMAType(contentType) {
 			maPayload["media_type"] = contentType
 		}
@@ -60,7 +91,6 @@ func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
 			return nil
 		}
 		slog.Warn("Primary play_media failed, trying with HA-native field names")
-		// Also try primary with HA-native field names
 		haPayload := map[string]any{
 			"entity_id":        targetEntity,
 			"media_content_id": contentID,
@@ -85,28 +115,42 @@ func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
 	return fmt.Errorf("no play service configured")
 }
 
-func (a *Adapter) Stop(targetEntity string) error {
+func (a *HAAdapter) Stop() error {
 	return a.callHAService(a.cfg.MAAdapter.StopService, map[string]any{
-		"entity_id": targetEntity,
+		"entity_id": a.cfg.HA.TargetEntityID,
 	})
 }
 
-func (a *Adapter) Pause(targetEntity string) error {
+func (a *HAAdapter) Pause() error {
 	return a.callHAService(a.cfg.MAAdapter.PauseService, map[string]any{
-		"entity_id": targetEntity,
+		"entity_id": a.cfg.HA.TargetEntityID,
 	})
 }
 
-func (a *Adapter) SetVolume(targetEntity string, volume int) error {
+func (a *HAAdapter) SetVolume(volume int) error {
 	return a.callHAService(a.cfg.MAAdapter.VolumeService, map[string]any{
-		"entity_id":    targetEntity,
+		"entity_id":    a.cfg.HA.TargetEntityID,
 		"volume_level": float64(volume) / 100.0,
 	})
 }
 
-// GetEntityState queries the HA REST API for the current state of an entity.
-// Returns the state string (e.g. "playing", "paused", "idle", "off").
-func (a *Adapter) GetEntityState(entityID string) (string, error) {
+func (a *HAAdapter) GetState() (string, error) {
+	return a.getEntityState(a.cfg.HA.TargetEntityID)
+}
+
+func (a *HAAdapter) GetStatus() (PlayerStatus, error) {
+	state, err := a.getEntityState(a.cfg.HA.TargetEntityID)
+	if err != nil {
+		return PlayerStatus{}, err
+	}
+	return PlayerStatus{State: state}, nil
+}
+
+func (a *HAAdapter) PlaybackPosition() (time.Duration, bool, error) {
+	return 0, false, nil
+}
+
+func (a *HAAdapter) getEntityState(entityID string) (string, error) {
 	url := fmt.Sprintf("%s/api/states/%s", a.cfg.HA.URL, entityID)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -130,31 +174,22 @@ func (a *Adapter) GetEntityState(entityID string) (string, error) {
 	return result.State, nil
 }
 
-func bodyRedacted(body []byte) string {
-	s := string(body)
-	// Strip token=... from URLs in JSON
-	for _, key := range []string{`"media_id":"`, `"media_content_id":"`} {
-		if i := strings.Index(s, key); i >= 0 {
-			start := i + len(key)
-			if j := strings.IndexByte(s[start:], '"'); j >= 0 {
-				url := s[start : start+j]
-				s = s[:start] + sanitizeURL(url) + s[start+j:]
-			}
-		}
+func validMAType(contentType string) bool {
+	switch contentType {
+	case "artist", "album", "track", "playlist", "radio":
+		return true
 	}
-	return s
+	return false
 }
 
-func sanitizeURL(u string) string {
-	if i := strings.IndexByte(u, '?'); i >= 0 {
-		return u[:i] + "?token=***"
+func haMediaType(contentType string) string {
+	if validMAType(contentType) {
+		return contentType
 	}
-	return u
+	return "music"
 }
 
-func (a *Adapter) callHAService(service string, payload map[string]any) error {
-	// HA REST API expects /api/services/{domain}/{service}, but config uses
-	// domain.service notation (consistent with HA YAML). Replace last dot with /.
+func (a *HAAdapter) callHAService(service string, payload map[string]any) error {
 	apiPath := service
 	if i := strings.LastIndex(service, "."); i > 0 {
 		apiPath = service[:i] + "/" + service[i+1:]
@@ -191,4 +226,25 @@ func (a *Adapter) callHAService(service string, payload map[string]any) error {
 
 	slog.Info("HA service call succeeded", "service", service)
 	return nil
+}
+
+func bodyRedacted(body []byte) string {
+	s := string(body)
+	for _, key := range []string{`"media_id":"`, `"media_content_id":"`} {
+		if i := strings.Index(s, key); i >= 0 {
+			start := i + len(key)
+			if j := strings.IndexByte(s[start:], '"'); j >= 0 {
+				url := s[start : start+j]
+				s = s[:start] + sanitizeURL(url) + s[start+j:]
+			}
+		}
+	}
+	return s
+}
+
+func sanitizeURL(u string) string {
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		return u[:i] + "?token=***"
+	}
+	return u
 }

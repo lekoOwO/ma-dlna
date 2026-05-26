@@ -209,6 +209,21 @@ func TestStreamURLGeneration(t *testing.T) {
 	}
 }
 
+func TestRelativeAlbumArtURIResolvedAgainstSource(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create(
+		"http://source.local/music/song.flac?token=abc",
+		`<item><title>Song</title><albumArtURI>covers/song.jpg</albumArtURI></item>`,
+	)
+
+	expected := "http://source.local/music/covers/song.jpg"
+	if s.Metadata.AlbumArtURI != expected {
+		t.Fatalf("expected album art %q, got %q", expected, s.Metadata.AlbumArtURI)
+	}
+}
+
 func TestSessionTimestamps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))

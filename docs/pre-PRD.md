@@ -38,7 +38,7 @@ Therefore, the bridge should act as a controlled media ingest and re-publishing 
    * `Pause` if practical
 3. Ingest the DLNA-provided source URI using ffmpeg.
 4. Publish a stable local HTTP live stream URL from the bridge.
-5. Call Home Assistant / Music Assistant to play the bridge stream URL on a configured MA player or group.
+5. Call Music Assistant directly, or Home Assistant as a legacy compatibility path, to play the bridge stream URL on a configured MA player or group.
 6. Support common audio sources with minimal configuration.
 7. Work well in Docker / HA add-on style deployment with host networking.
 
@@ -102,7 +102,7 @@ ffmpeg ingest/transcode process
         ↓
 Bridge HTTP live stream endpoint
         ↓
-Music Assistant / Home Assistant play_media call
+Music Assistant direct API / Home Assistant play_media call
         ↓
 Configured MA player or MA group
         ↓
@@ -340,9 +340,25 @@ Behavior:
 * If a client is too slow and falls behind the ring buffer, disconnect it.
 * If no clients remain for a grace period, terminate ffmpeg.
 
-### 8.5 HA / MA Adapter
+### 8.5 MA Adapter
 
-MVP should support calling Home Assistant services through the HA REST API.
+The preferred control path is Music Assistant's direct HTTP API. The legacy Home Assistant service path remains available for deployments that cannot expose MA's API to the bridge.
+
+Direct MA mode calls `/api` with commands such as `player_queues/play_media`, `player_queues/pause`, `player_queues/stop`, `player_queues/get_active_queue`, and `players/cmd/volume_set`. The bridge sends a metadata-bearing MA track object backed by the bridge stream URL, so MA can display the controller-provided title/artist instead of deriving a name from `/live/<session-id>.<ext>`.
+
+Direct MA config:
+
+```yaml
+ma_adapter:
+  mode: "direct"
+
+music_assistant:
+  url: "http://music-assistant.local:8095"
+  token: "${MA_TOKEN}"
+  target_player_id: "whole_home"
+```
+
+The HA service path calls Home Assistant services through the HA REST API.
 
 Required config:
 
@@ -370,7 +386,7 @@ Example conceptual payload for HA service call:
 
 The exact service schema should be implementation-configurable because MA and HA versions may differ.
 
-Recommended config shape:
+Recommended HA-service config shape:
 
 ```yaml
 ma_adapter:
@@ -379,14 +395,6 @@ ma_adapter:
   stop_service: "media_player.media_stop"
   pause_service: "media_player.media_pause"
   volume_service: "media_player.volume_set"
-```
-
-Future option:
-
-```yaml
-ma_adapter:
-  mode: "ma_api"
-  ma_url: "http://music-assistant.local:8095"
 ```
 
 ### 8.6 Metadata Handling
@@ -402,7 +410,7 @@ Best effort parsing:
 * resource protocolInfo
 * source MIME type if present
 
-Metadata may be used for logging and future MA metadata display. It is not required for MVP playback success.
+Metadata is used for logging, UPnP responses, and direct MA API playback payloads. It is not required for HA-service playback success.
 
 ### 8.7 Volume Handling
 
@@ -461,6 +469,11 @@ ma_adapter:
   stop_service: "media_player.media_stop"
   pause_service: "media_player.media_pause"
   volume_service: "media_player.volume_set"
+
+music_assistant:
+  url: "http://music-assistant.local:8095"
+  token: "${MA_TOKEN}"
+  target_player_id: "whole_home"
 
 ffmpeg:
   binary: "ffmpeg"
@@ -838,16 +851,12 @@ Package as Home Assistant add-on with configuration UI.
 ## 19. Open Questions
 
 1. Which implementation language should be used: Go or Python?
-2. Which MA control path should be primary:
-
-   * HA REST service call
-   * direct MA API
-3. Does the target MA setup fetch media through MA server, or do individual players fetch the URL directly?
-4. Should pause kill ffmpeg in MVP, or keep ingest running?
-5. Should output default to MP3 192k, MP3 320k, AAC, or FLAC?
-6. Should MVP support only one active session, or multiple virtual renderers / targets?
-7. How much UPnP compliance is needed for target controller apps?
-8. What controllers should be considered must-work for v0.1?
+2. Does the target MA setup fetch media through MA server, or do individual players fetch the URL directly?
+3. Should pause kill ffmpeg in MVP, or keep ingest running?
+4. Should output default to MP3 192k, MP3 320k, AAC, or FLAC?
+5. Should MVP support only one active session, or multiple virtual renderers / targets?
+6. How much UPnP compliance is needed for target controller apps?
+7. What controllers should be considered must-work for v0.1?
 
 ## 20. Recommended v0.1 Scope
 

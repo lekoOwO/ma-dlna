@@ -10,10 +10,24 @@ import (
 	"github.com/leko/ma-dlna/internal/config"
 )
 
+func haCfg() config.Config {
+	cfg := config.DefaultConfig()
+	cfg.HA.URL = ""
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.MAAdapter.Mode = "ha_service"
+	return cfg
+}
+
+func haAdapter(cfg *config.Config, srvURL string) PlayerClient {
+	cfg.HA.URL = srvURL
+	return New(cfg)
+}
+
 // TestPlayMedia_MA_Primary_NoMediaTypeForMIME verifies that MA primary
 // play_media omits media_type when contentType is a MIME like "audio/flac".
 func TestPlayMedia_MA_Primary_NoMediaTypeForMIME(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PlayService = "music_assistant.play_media"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -22,7 +36,6 @@ func TestPlayMedia_MA_Primary_NoMediaTypeForMIME(t *testing.T) {
 		}
 		var payload map[string]any
 		json.NewDecoder(r.Body).Decode(&payload)
-		// Must not include media_type for MIME types
 		if _, exists := payload["media_type"]; exists {
 			t.Error("media_type must not be present for MIME content type audio/flac")
 		}
@@ -34,21 +47,19 @@ func TestPlayMedia_MA_Primary_NoMediaTypeForMIME(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.flac?token=abc",
+		ContentType: "audio/flac",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia failed: %v", err)
 	}
 }
 
-// TestPlayMedia_MA_Primary_PreservesValidMAType verifies that MA-native types
-// like "track" are still sent as media_type.
 func TestPlayMedia_MA_Primary_PreservesValidMAType(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PlayService = "music_assistant.play_media"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,21 +76,19 @@ func TestPlayMedia_MA_Primary_PreservesValidMAType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "track")
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.flac?token=abc",
+		ContentType: "track",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia failed: %v", err)
 	}
 }
 
-// TestPlayMedia_Fallback_ConvertsMIMEToMusic verifies that the fallback
-// media_player.play_media converts audio/flac to media_content_type "music".
 func TestPlayMedia_Fallback_ConvertsMIMEToMusic(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PlayService = ""
 	cfg.MAAdapter.FallbackPlayService = "media_player.play_media"
 
@@ -97,21 +106,19 @@ func TestPlayMedia_Fallback_ConvertsMIMEToMusic(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.flac?token=abc",
+		ContentType: "audio/flac",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia failed: %v", err)
 	}
 }
 
-// TestPlayMedia_HANativeRetryForMIME verifies that when MA primary fails on a MIME
-// type, the HA-native retry uses media_content_type "music".
 func TestPlayMedia_HANativeRetryForMIME(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PlayService = "music_assistant.play_media"
 
 	var callCount atomic.Int32
@@ -122,13 +129,11 @@ func TestPlayMedia_HANativeRetryForMIME(t *testing.T) {
 
 		switch count {
 		case 1:
-			// First call: MA-style, no media_type
 			if _, exists := payload["media_type"]; exists {
 				t.Error("first call must not include media_type for MIME")
 			}
-			w.WriteHeader(http.StatusInternalServerError) // force retry
+			w.WriteHeader(http.StatusInternalServerError)
 		case 2:
-			// Retry: HA-native, media_content_type must be "music"
 			if mct, exists := payload["media_content_type"]; !exists || mct != "music" {
 				t.Errorf("retry media_content_type must be 'music', got %v", payload["media_content_type"])
 			}
@@ -140,12 +145,12 @@ func TestPlayMedia_HANativeRetryForMIME(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.flac?token=abc",
+		ContentType: "audio/flac",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia failed: %v", err)
 	}
@@ -154,22 +159,10 @@ func TestPlayMedia_HANativeRetryForMIME(t *testing.T) {
 	}
 }
 
-func TestSetVolumePayload(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.MAAdapter.VolumeService = "media_player.volume_set"
-
-	adapter := New(&cfg)
-
-	_ = adapter
-}
-
 func TestServiceURLConstruction(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.HA.URL = "http://ha.local:8123"
 
-	adapter := New(&cfg)
-
-	// Verify URL construction by making a real HTTP call to a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
@@ -186,7 +179,6 @@ func TestServiceURLConstruction(t *testing.T) {
 		if payload["entity_id"] != "media_player.test" {
 			t.Errorf("expected entity_id media_player.test, got %v", payload["entity_id"])
 		}
-		// Check either MA-style or HA-native field names
 		cid := payload["media_id"]
 		if cid == nil {
 			cid = payload["media_content_id"]
@@ -200,54 +192,45 @@ func TestServiceURLConstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
+	adapter := haAdapter(&cfg, server.URL)
 
-	adapter = New(&cfg)
-
-	err := adapter.PlayMedia(
-		"media_player.test",
-		"http://bridge:8787/live/test.opus?token=abc",
-		"music",
-	)
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.opus?token=abc",
+		ContentType: "music",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia failed: %v", err)
 	}
 }
 
 func TestStopPayload(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.StopService = "media_player.media_stop"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/services/media_player/media_stop" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
-
 		var payload map[string]any
 		json.NewDecoder(r.Body).Decode(&payload)
 		if payload["entity_id"] != "media_player.test" {
 			t.Errorf("unexpected entity_id: %v", payload["entity_id"])
 		}
-
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`[{"success": true}]`))
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.Stop("media_player.test")
+	err := adapter.Stop()
 	if err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 }
 
 func TestPausePayload(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PauseService = "media_player.media_pause"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -259,40 +242,33 @@ func TestPausePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.Pause("media_player.test")
+	err := adapter.Pause()
 	if err != nil {
 		t.Fatalf("Pause failed: %v", err)
 	}
 }
 
 func TestSetVolume(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.VolumeService = "media_player.volume_set"
 
-	// Volume 75 should translate to 0.75
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]any
 		json.NewDecoder(r.Body).Decode(&payload)
-
 		vol, ok := payload["volume_level"].(float64)
 		if !ok || vol != 0.75 {
 			t.Errorf("expected volume_level 0.75, got %v", payload["volume_level"])
 		}
-
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`[{"success": true}]`))
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.SetVolume("media_player.test", 75)
+	err := adapter.SetVolume(75)
 	if err != nil {
 		t.Fatalf("SetVolume failed: %v", err)
 	}
@@ -304,19 +280,17 @@ func TestServiceCallError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := config.DefaultConfig()
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	adapter := New(&cfg)
+	cfg := haCfg()
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.Stop("media_player.test")
+	err := adapter.Stop()
 	if err == nil {
 		t.Error("expected error for 500 response")
 	}
 }
 
 func TestFallbackPlayService(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := haCfg()
 	cfg.MAAdapter.PlayService = ""
 	cfg.MAAdapter.FallbackPlayService = "media_player.play_media"
 
@@ -329,12 +303,21 @@ func TestFallbackPlayService(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg.HA.URL = server.URL
-	cfg.HA.Token = "test-token"
-	adapter := New(&cfg)
+	adapter := haAdapter(&cfg, server.URL)
 
-	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.mp3?token=abc", "music")
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   "http://bridge:8787/live/test.mp3?token=abc",
+		ContentType: "music",
+	})
 	if err != nil {
 		t.Fatalf("PlayMedia with fallback failed: %v", err)
+	}
+}
+
+func TestHATarget(t *testing.T) {
+	cfg := haCfg()
+	adapter := haAdapter(&cfg, "http://localhost:8123")
+	if adapter.Target() != "media_player.test" {
+		t.Errorf("expected Target 'media_player.test', got %q", adapter.Target())
 	}
 }

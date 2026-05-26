@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -150,6 +151,7 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	id := generateID()
 	token := generateToken()
 	parsed := parseDIDL(metadataXML)
+	resolveMetadataURIs(parsed, sourceURI)
 	slog.Info("DIDL metadata parsed", "title", parsed.Title, "artist", parsed.Artist, "duration", parsed.Duration)
 
 	s := &Session{
@@ -788,6 +790,21 @@ func buildMetadata(title, creator, artist, album, albumArtURI, duration string) 
 		md.Artist = creator
 	}
 	return md
+}
+
+func resolveMetadataURIs(md *Metadata, sourceURI string) {
+	if md == nil || md.AlbumArtURI == "" {
+		return
+	}
+	art, err := neturl.Parse(md.AlbumArtURI)
+	if err != nil || art.IsAbs() {
+		return
+	}
+	base, err := neturl.Parse(sourceURI)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return
+	}
+	md.AlbumArtURI = base.ResolveReference(art).String()
 }
 
 var ErrNotFound = errors.New("session not found")

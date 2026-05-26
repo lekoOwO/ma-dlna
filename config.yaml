@@ -27,6 +27,13 @@ ma_adapter:
   pause_service: "media_player.media_pause"
   volume_service: "media_player.volume_set"
 
+# Direct Music Assistant API mode bypasses Home Assistant service calls.
+# To use it, set ma_adapter.mode to "direct" and configure this block.
+music_assistant:
+  url: "http://musicassistant.local:8095"
+  token: "${MA_TOKEN}"
+  target_player_id: "whole_home"
+
 ffmpeg:
   binary: "ffmpeg"
   output_format: "opus"

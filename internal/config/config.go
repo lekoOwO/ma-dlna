@@ -13,14 +13,15 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `yaml:"server"`
-	UPnP      UPnPConfig      `yaml:"upnp"`
-	HA        HAConfig        `yaml:"ha"`
-	MAAdapter MAAdapterConfig `yaml:"ma_adapter"`
-	FFmpeg    FFmpegConfig    `yaml:"ffmpeg"`
-	Stream    StreamConfig    `yaml:"stream"`
-	Security  SecurityConfig  `yaml:"security"`
-	Logging   LoggingConfig   `yaml:"logging"`
+	Server         ServerConfig         `yaml:"server"`
+	UPnP           UPnPConfig           `yaml:"upnp"`
+	HA             HAConfig             `yaml:"ha"`
+	MusicAssistant MusicAssistantConfig `yaml:"music_assistant"`
+	MAAdapter      MAAdapterConfig      `yaml:"ma_adapter"`
+	FFmpeg         FFmpegConfig         `yaml:"ffmpeg"`
+	Stream         StreamConfig         `yaml:"stream"`
+	Security       SecurityConfig       `yaml:"security"`
+	Logging        LoggingConfig        `yaml:"logging"`
 }
 
 type ServerConfig struct {
@@ -43,6 +44,12 @@ type HAConfig struct {
 	URL            string `yaml:"url"`
 	Token          string `yaml:"token"`
 	TargetEntityID string `yaml:"target_entity_id"`
+}
+
+type MusicAssistantConfig struct {
+	URL            string `yaml:"url"`
+	Token          string `yaml:"token"`
+	TargetPlayerID string `yaml:"target_player_id"`
 }
 
 type MAAdapterConfig struct {
@@ -178,7 +185,25 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("server.stream_public_base_url scheme must be http or https, got %q", u.Scheme)
 		}
 	}
-	if c.HA.URL != "" {
+	if c.MAAdapter.Mode != "ha_service" && c.MAAdapter.Mode != "direct" {
+		return fmt.Errorf("ma_adapter.mode must be 'ha_service' or 'direct', got %q", c.MAAdapter.Mode)
+	}
+	if c.MAAdapter.Mode == "direct" {
+		if c.MusicAssistant.URL == "" {
+			return fmt.Errorf("music_assistant.url is required in direct mode")
+		}
+		u, err := url.Parse(c.MusicAssistant.URL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("music_assistant.url must have a scheme and host, got %q", c.MusicAssistant.URL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("music_assistant.url scheme must be http or https, got %q", u.Scheme)
+		}
+		if c.MusicAssistant.TargetPlayerID == "" {
+			return fmt.Errorf("music_assistant.target_player_id is required in direct mode")
+		}
+	}
+	if c.MAAdapter.Mode == "ha_service" && c.HA.URL != "" {
 		u, err := url.Parse(c.HA.URL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("ha.url must have a scheme and host, got %q", c.HA.URL)
