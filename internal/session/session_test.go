@@ -1,12 +1,67 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/leko/ma-dlna/internal/config"
 	"github.com/leko/ma-dlna/internal/stream"
 )
+
+func newManagerWithFakeFFmpeg(t *testing.T) (*Manager, *stream.Streamer) {
+	t.Helper()
+
+	cfg := config.DefaultConfig()
+	cfg.FFmpeg.Binary = writeFakeFFmpeg(t)
+	streamer := stream.NewStreamer(&cfg)
+
+	return NewManager(&cfg, streamer), streamer
+}
+
+func writeFakeFFmpeg(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "ffmpeg")
+	script := `#!/bin/sh
+exec sleep 3600
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func waitForStreamRunning(t *testing.T, streamer *stream.Streamer, sessionID string) {
+	t.Helper()
+	waitForCondition(t, 500*time.Millisecond, "stream to be running", func() bool {
+		return streamer.IsRunning(sessionID)
+	})
+}
+
+func waitForStreamStopped(t *testing.T, streamer *stream.Streamer, sessionID string) {
+	t.Helper()
+	waitForCondition(t, 500*time.Millisecond, "stream to stop", func() bool {
+		return !streamer.IsRunning(sessionID)
+	})
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, description string, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if condition() {
+		return
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
 
 func TestStateTransitions(t *testing.T) {
 	cfg := config.DefaultConfig()
@@ -331,6 +386,121 @@ func TestSetError(t *testing.T) {
 	if got.Error != "test error" {
 		t.Errorf("expected error message, got %s", got.Error)
 	}
+}
+
+func TestStopIfGenerationStopsMatchingGenerationStream(t *testing.T) {
+	mgr, streamer := newManagerWithFakeFFmpeg(t)
+
+	s := mgr.Create("http://source.local/test", "")
+	var genID uint64
+	streamer.SetGenStartCallback(func(sessionID string, gid uint64) {
+		mgr.SetSessionGenID(sessionID, gid)
+		if sessionID == s.ID {
+			genID = gid
+		}
+	})
+	mgr.StartStream(s.ID, s.SourceURI)
+	t.Cleanup(func() {
+		streamer.Stop(s.ID)
+	})
+
+	waitForStreamRunning(t, streamer, s.ID)
+	if genID == 0 {
+		t.Fatal("expected stream generation to be recorded")
+	}
+
+	if !mgr.StopIfGeneration(s.ID, genID) {
+		t.Fatal("StopIfGeneration should return true for matching gen")
+	}
+	if got := mgr.Get(s.ID).State; got != StateStopped {
+		t.Errorf("expected stopped state, got %s", got)
+	}
+	waitForStreamStopped(t, streamer, s.ID)
+}
+
+func TestStopIfGenerationRejectsStaleGenAndLeavesStreamRunning(t *testing.T) {
+	mgr, streamer := newManagerWithFakeFFmpeg(t)
+
+	s := mgr.Create("http://source.local/test", "")
+	mgr.SetSessionGenID(s.ID, 42)
+	mgr.StartStream(s.ID, s.SourceURI)
+	t.Cleanup(func() {
+		streamer.Stop(s.ID)
+	})
+
+	waitForStreamRunning(t, streamer, s.ID)
+
+	if mgr.StopIfGeneration(s.ID, 42) {
+		t.Fatal("StopIfGeneration should return false when streamer rejects mismatched gen")
+	}
+	if got := mgr.Get(s.ID).State; got != StateLoaded {
+		t.Errorf("state should remain loaded, got %s", got)
+	}
+	if !streamer.IsRunning(s.ID) {
+		t.Error("stream should remain running after stale generation is rejected")
+	}
+	streamer.Stop(s.ID)
+	waitForStreamStopped(t, streamer, s.ID)
+}
+
+func TestStopIfGenerationRejectsErrorState(t *testing.T) {
+	mgr, streamer := newManagerWithFakeFFmpeg(t)
+
+	s := mgr.Create("http://source.local/test", "")
+	mgr.SetSessionGenID(s.ID, 42)
+	mgr.StartStream(s.ID, s.SourceURI)
+	t.Cleanup(func() {
+		streamer.Stop(s.ID)
+	})
+	waitForStreamRunning(t, streamer, s.ID)
+
+	mgr.SetError(s.ID, "some error")
+
+	if mgr.StopIfGeneration(s.ID, 42) {
+		t.Fatal("StopIfGeneration should return false for error state")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StateError {
+		t.Errorf("state should remain error, got %s", got.State)
+	}
+	if got.Error != "some error" {
+		t.Errorf("error message should be preserved, got %s", got.Error)
+	}
+	if !streamer.IsRunning(s.ID) {
+		t.Error("stream should remain running when error state rejects StopIfGeneration")
+	}
+	streamer.Stop(s.ID)
+	waitForStreamStopped(t, streamer, s.ID)
+}
+
+func TestStopIfGenerationMissingSessionReturnsFalse(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	if mgr.StopIfGeneration("missing", 42) {
+		t.Fatal("StopIfGeneration should return false for a missing session")
+	}
+}
+
+func TestStopIfGenerationZeroGenSkipsGenerationCheck(t *testing.T) {
+	mgr, streamer := newManagerWithFakeFFmpeg(t)
+
+	s := mgr.Create("http://source.local/test", "")
+	mgr.SetSessionGenID(s.ID, 42)
+	mgr.StartStream(s.ID, s.SourceURI)
+	t.Cleanup(func() {
+		streamer.Stop(s.ID)
+	})
+
+	waitForStreamRunning(t, streamer, s.ID)
+
+	if !mgr.StopIfGeneration(s.ID, 0) {
+		t.Fatal("StopIfGeneration should return true when genID=0 skips generation check")
+	}
+	if got := mgr.Get(s.ID).State; got != StateStopped {
+		t.Errorf("expected stopped state, got %s", got)
+	}
+	waitForStreamStopped(t, streamer, s.ID)
 }
 
 func TestSafeURLRedactsToken(t *testing.T) {

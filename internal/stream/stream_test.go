@@ -2,7 +2,10 @@ package stream
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/leko/ma-dlna/internal/config"
 )
@@ -192,6 +195,73 @@ func TestStreamerStartStop(t *testing.T) {
 	}
 }
 
+func TestStreamerStopIfGenerationStopsMatchingGeneration(t *testing.T) {
+	cfg := streamTestConfig(t)
+	streamer := NewStreamer(&cfg)
+	var genID uint64
+	streamer.SetGenStartCallback(func(_ string, gid uint64) {
+		genID = gid
+	})
+
+	if err := streamer.Start("matching-gen", "http://source.local/test.mp3"); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	t.Cleanup(func() {
+		streamer.Stop("matching-gen")
+	})
+	waitForStreamRunning(t, streamer, "matching-gen")
+	if genID == 0 {
+		t.Fatal("expected start callback to record generation")
+	}
+
+	if !streamer.StopIfGeneration("matching-gen", genID) {
+		t.Fatal("StopIfGeneration should accept the current generation")
+	}
+	waitForStreamStopped(t, streamer, "matching-gen")
+	if streamExists(streamer, "matching-gen") {
+		t.Fatal("stream should be removed after matching generation stop")
+	}
+}
+
+func TestStreamerStopIfGenerationRejectsOldGenerationAfterResume(t *testing.T) {
+	cfg := streamTestConfig(t)
+	streamer := NewStreamer(&cfg)
+	var gens []uint64
+	streamer.SetGenStartCallback(func(_ string, gid uint64) {
+		gens = append(gens, gid)
+	})
+
+	const sessionID = "stale-gen"
+	if err := streamer.Start(sessionID, "http://source.local/test.mp3"); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	t.Cleanup(func() {
+		streamer.Stop(sessionID)
+	})
+	waitForStreamRunning(t, streamer, sessionID)
+	if len(gens) != 1 {
+		t.Fatalf("expected one generation after start, got %d", len(gens))
+	}
+	oldGen := gens[0]
+
+	streamer.Seek(sessionID, 5*time.Second)
+	streamer.Resume(sessionID)
+	waitForStreamRunning(t, streamer, sessionID)
+	if len(gens) < 3 {
+		t.Fatalf("expected seek and resume to create new generations, got %d", len(gens))
+	}
+
+	if streamer.StopIfGeneration(sessionID, oldGen) {
+		t.Fatal("StopIfGeneration should reject an old generation")
+	}
+	if !streamer.IsRunning(sessionID) {
+		t.Fatal("new generation should still be running")
+	}
+	if !streamExists(streamer, sessionID) {
+		t.Fatal("stream should remain registered after stale generation rejection")
+	}
+}
+
 func TestStreamerServeInvalidPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	streamer := NewStreamer(&cfg)
@@ -280,4 +350,60 @@ func (w *testResponseWriter) Write(b []byte) (int, error) {
 
 func (w *testResponseWriter) WriteHeader(status int) {
 	w.status = status
+}
+
+func streamTestConfig(t *testing.T) config.Config {
+	t.Helper()
+
+	cfg := config.DefaultConfig()
+	cfg.FFmpeg.Binary = writeFakeFFmpeg(t)
+	return cfg
+}
+
+func writeFakeFFmpeg(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\nexec sleep 3600\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func waitForStreamRunning(t *testing.T, streamer *Streamer, sessionID string) {
+	t.Helper()
+	waitForCondition(t, 500*time.Millisecond, "stream to be running", func() bool {
+		return streamer.IsRunning(sessionID)
+	})
+}
+
+func waitForStreamStopped(t *testing.T, streamer *Streamer, sessionID string) {
+	t.Helper()
+	waitForCondition(t, 500*time.Millisecond, "stream to stop", func() bool {
+		return !streamer.IsRunning(sessionID)
+	})
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, description string, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if condition() {
+		return
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
+func streamExists(streamer *Streamer, sessionID string) bool {
+	streamer.mu.Lock()
+	defer streamer.mu.Unlock()
+	_, ok := streamer.streams[sessionID]
+	return ok
 }

@@ -249,24 +249,65 @@ func (s *Streamer) Stop(sessionID string) {
 	st.lifeMu.Lock()
 	defer st.lifeMu.Unlock()
 
-	if st.active.Swap(false) {
-		st.genMu.Lock()
-		gen := st.gen
-		st.genMu.Unlock()
-		if gen != nil {
-			gen.active.Store(false)
-			gen.cancel()
-			gen.killCmd()
-			st.closeClients(gen)
-			if st.runsInFlight.Load() > 0 {
-				select {
-				case <-gen.done:
-				case <-time.After(2 * time.Second):
-				}
-			}
-		}
+	if st.stopLocked() {
 		slog.Info("Stream stopped", "session_id", sessionID)
 	}
+}
+
+func (s *Streamer) StopIfGeneration(sessionID string, genID uint64) bool {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return true
+	}
+
+	st.lifeMu.Lock()
+	defer st.lifeMu.Unlock()
+
+	s.mu.Lock()
+	current, ok := s.streams[sessionID]
+	if !ok {
+		s.mu.Unlock()
+		return true
+	}
+	if current != st {
+		s.mu.Unlock()
+		return false
+	}
+	if genID != 0 && st.currentGenID.Load() != genID {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.streams, sessionID)
+	s.mu.Unlock()
+
+	if st.stopLocked() {
+		slog.Info("Stream stopped with generation check", "session_id", sessionID, "gen_id", genID)
+	}
+	return true
+}
+
+func (st *stream) stopLocked() bool {
+	if !st.active.Swap(false) {
+		return false
+	}
+	st.genMu.Lock()
+	gen := st.gen
+	st.genMu.Unlock()
+	if gen != nil {
+		gen.active.Store(false)
+		gen.cancel()
+		gen.killCmd()
+		st.closeClients(gen)
+		if st.runsInFlight.Load() > 0 {
+			select {
+			case <-gen.done:
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	return true
 }
 
 func (st *stream) closeClients(gen *streamGeneration) {

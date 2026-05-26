@@ -193,7 +193,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					}
 					if lastEmitted != "STOPPED" {
 						slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
-						if h.sessionMgr.MarkStoppedIfGeneration(sessionID, genID) {
+						if h.sessionMgr.StopIfGeneration(sessionID, genID) {
 							h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
 						}
 						lastEmitted = "STOPPED"

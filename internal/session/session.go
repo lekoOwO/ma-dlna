@@ -229,6 +229,51 @@ func (m *Manager) Stop(sessionID string) error {
 	return nil
 }
 
+// StopIfGeneration verifies genID, cleans up the matching stream generation,
+// then re-verifies before marking the session stopped.
+func (m *Manager) StopIfGeneration(sessionID string, genID uint64) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	if genID != 0 && m.sessionGenID[sessionID] != genID {
+		m.mu.Unlock()
+		return false
+	}
+	if s.State == StateError {
+		m.mu.Unlock()
+		return false
+	}
+	m.mu.Unlock()
+
+	if !m.streamer.StopIfGeneration(sessionID, genID) {
+		return false
+	}
+
+	m.mu.Lock()
+	s, ok = m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	if genID != 0 && m.sessionGenID[sessionID] != genID {
+		m.mu.Unlock()
+		return false
+	}
+	if s.State == StateError {
+		m.mu.Unlock()
+		return false
+	}
+	s.State = StateStopped
+	s.UpdatedAt = time.Now()
+	m.mu.Unlock()
+
+	slog.Info("Session stopped with generation check", "session_id", sessionID)
+	return true
+}
+
 // MarkStopped updates the session state to stopped without touching the streamer.
 // Used for natural EOF callbacks where the stream has already exited and calling
 // Streamer.Stop() would race with a new stream for the same session ID.
@@ -237,7 +282,8 @@ func (m *Manager) MarkStopped(sessionID string) {
 }
 
 // MarkStoppedIfGeneration atomically verifies genID and updates state to stopped.
-// genID=0 skips the generation check (used by UPnP Stop action).
+// genID=0 skips the generation check. Unlike StopIfGeneration, this does not
+// touch the streamer — used where the stream has already exited (EOF).
 func (m *Manager) MarkStoppedIfGeneration(sessionID string, genID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
