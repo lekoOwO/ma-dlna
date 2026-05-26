@@ -144,8 +144,13 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
-		wasPlaying := false
-		lastEmitted := "" // prevent duplicate event storms
+		// The monitor starts after first /live client, so HA/MA is expected to be
+		// playing. If HA state briefly flickers idle (buffer handoff), debounce it.
+		startedAt := time.Now()
+		wasPlaying := true
+		lastEmitted := ""
+		var idleSince time.Time
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -156,24 +161,46 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 				if cur == nil || cur.ID != sessionID || !h.sessionMgr.VerifyGenID(sessionID, genID) {
 					return
 				}
+				// Also exit if session has been transitioned away from playing
+				if cur.State != session.StatePlaying && cur.State != session.StateStarting {
+					if cur.State == session.StateStopped || cur.State == session.StateError {
+						return
+					}
+				}
 
 				state, err := h.maAdapter.GetEntityState(h.cfg.HA.TargetEntityID)
 				if err != nil {
 					slog.Debug("Playback monitor poll failed", "entity", h.cfg.HA.TargetEntityID, "error", err)
 					continue
 				}
+
+				slog.Debug("Playback monitor poll", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID, "gen_id", genID)
+
 				switch state {
 				case "playing":
 					wasPlaying = true
+					idleSince = time.Time{}
 				case "idle", "off", "standby":
-					if wasPlaying && lastEmitted != "STOPPED" {
+					// Debounce: require 10s consecutive idle before treating as ended.
+					// Also allow immediate idle if started more than 30s ago (safety).
+					if idleSince.IsZero() {
+						idleSince = time.Now()
+						continue
+					}
+					sinceStart := time.Since(startedAt)
+					if time.Since(idleSince) < 10*time.Second && sinceStart < 30*time.Second {
+						continue
+					}
+					if lastEmitted != "STOPPED" {
 						slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
-						h.sessionMgr.MarkStoppedIfGeneration(sessionID, genID)
-						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
+						if h.sessionMgr.MarkStoppedIfGeneration(sessionID, genID) {
+							h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
+						}
 						lastEmitted = "STOPPED"
 						return
 					}
 				case "paused":
+					idleSince = time.Time{}
 					if wasPlaying && lastEmitted != "PAUSED_PLAYBACK" {
 						h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
 						lastEmitted = "PAUSED_PLAYBACK"
@@ -1103,7 +1130,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
@@ -1286,7 +1312,6 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					h.sessionMgr.SetError(active.ID, err.Error())
 					return
 				}
-				h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
 			}()
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`

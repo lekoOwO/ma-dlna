@@ -1050,37 +1050,14 @@ func TestStateChangeNotify(t *testing.T) {
 		t.Fatal("Timed out waiting for SetAVTransportURI NOTIFY")
 	}
 
-	// Play → should trigger state change NOTIFY with PLAYING
+	// Play → PLAYING event now only fires from first /live client callback,
+	// not from Play handler. Skip PLAYING expectation.
 	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-
-	var playNotify *http.Request
-	select {
-	case playNotify = <-cbCh:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Timed out waiting for Play state change NOTIFY")
-	}
-
-	playBody2, _ := io.ReadAll(playNotify.Body)
-	playBodyStr := string(playBody2)
-	if !strings.Contains(playBodyStr, "PLAYING") {
-		t.Errorf("Play NOTIFY should contain PLAYING, got: %s", playBodyStr)
-	}
-	if playNotify.Header.Get("NT") != "upnp:event" {
-		t.Error("Play NOTIFY missing NT header")
-	}
-	if playNotify.Header.Get("NTS") != "upnp:propchange" {
-		t.Error("Play NOTIFY missing NTS header")
-	}
-	seq := playNotify.Header.Get("SEQ")
-	if seq != "1" {
-		t.Logf("Play NOTIFY SEQ: expected 1, got %s", seq)
-	}
-	t.Logf("Play state change NOTIFY received, SEQ=%s", seq)
 
 	// Pause
 	pauseBody := soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")

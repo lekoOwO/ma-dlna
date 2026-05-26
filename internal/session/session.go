@@ -238,23 +238,22 @@ func (m *Manager) MarkStopped(sessionID string) {
 
 // MarkStoppedIfGeneration atomically verifies genID and updates state to stopped.
 // genID=0 skips the generation check (used by UPnP Stop action).
-func (m *Manager) MarkStoppedIfGeneration(sessionID string, genID uint64) {
-	if m.streamer.IsRunning(sessionID) {
-		return
-	}
+func (m *Manager) MarkStoppedIfGeneration(sessionID string, genID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[sessionID]; ok {
 		if genID != 0 && m.sessionGenID[sessionID] != genID {
-			return
+			return false
 		}
 		if s.State == StateError {
-			return
+			return false
 		}
 		s.State = StateStopped
 		s.UpdatedAt = time.Now()
 		slog.Info("Session marked stopped", "session_id", sessionID)
+		return true
 	}
+	return false
 }
 
 func (m *Manager) Pause(sessionID string) error {
