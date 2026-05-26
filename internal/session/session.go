@@ -433,6 +433,68 @@ func (m *Manager) MarkPausedIfGeneration(sessionID string, genID uint64) bool {
 	return false
 }
 
+// IsCurrentGenerationActive returns true only if sessionID is the current
+// session, its state is StateStarting or StatePlaying, and genID matches
+// the expected generation (when nonzero). genID=0 skips the generation check.
+func (m *Manager) IsCurrentGenerationActive(sessionID string, genID uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.isCurrentGenerationActiveLocked(sessionID, genID)
+}
+
+func (m *Manager) isCurrentGenerationActiveLocked(sessionID string, genID uint64) bool {
+	if m.currentSessionID != sessionID {
+		return false
+	}
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false
+	}
+
+	if s.State != StateStarting && s.State != StatePlaying {
+		return false
+	}
+
+	if genID != 0 && m.sessionGenID[sessionID] != genID {
+		return false
+	}
+
+	return true
+}
+
+// StopWithErrorIfGenerationActive stops the matching stream generation and sets
+// ERROR only if the session is still current and actively starting/playing.
+func (m *Manager) StopWithErrorIfGenerationActive(sessionID string, genID uint64, errMsg string) bool {
+	m.mu.RLock()
+	if !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		m.mu.RUnlock()
+		return false
+	}
+	m.mu.RUnlock()
+
+	if !m.streamer.StopIfGeneration(sessionID, genID) {
+		return false
+	}
+
+	m.mu.Lock()
+	s, ok := m.sessions[sessionID]
+	if !ok || !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		m.mu.Unlock()
+		return false
+	}
+	s.State = StateError
+	s.Error = errMsg
+	s.UpdatedAt = time.Now()
+	n := m.errorNotifier
+	m.mu.Unlock()
+
+	if n != nil {
+		n(sessionID, fmt.Errorf("%s", errMsg))
+	}
+	return true
+}
+
 // CurrentGenID returns the expected generation ID for a session.
 func (m *Manager) CurrentGenID(sessionID string) uint64 {
 	m.mu.RLock()

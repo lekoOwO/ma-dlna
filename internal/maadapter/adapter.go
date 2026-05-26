@@ -27,13 +27,34 @@ func New(cfg *config.Config) *Adapter {
 	}
 }
 
+// validMAType reports whether contentType is a MA-native media type (not a MIME).
+func validMAType(contentType string) bool {
+	switch contentType {
+	case "artist", "album", "track", "playlist", "radio":
+		return true
+	}
+	return false
+}
+
+// haMediaType returns contentType if it is a valid MA type, otherwise "music".
+// MIME types like "audio/flac" are not meaningful for HA media_content_type.
+func haMediaType(contentType string) string {
+	if validMAType(contentType) {
+		return contentType
+	}
+	return "music"
+}
+
 func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
 	// Try primary service with MA-style payload first, then fallback with HA-native payload.
 	if a.cfg.MAAdapter.PlayService != "" {
 		maPayload := map[string]any{
-			"entity_id":  targetEntity,
-			"media_id":   contentID,
-			"media_type": contentType,
+			"entity_id": targetEntity,
+			"media_id":  contentID,
+		}
+		// Only include media_type for MA-native types; let MA auto-detect for URLs.
+		if validMAType(contentType) {
+			maPayload["media_type"] = contentType
 		}
 		if err := a.callHAService(a.cfg.MAAdapter.PlayService, maPayload); err == nil {
 			return nil
@@ -41,9 +62,13 @@ func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
 		slog.Warn("Primary play_media failed, trying with HA-native field names")
 		// Also try primary with HA-native field names
 		haPayload := map[string]any{
-			"entity_id":          targetEntity,
-			"media_content_id":   contentID,
-			"media_content_type": contentType,
+			"entity_id":        targetEntity,
+			"media_content_id": contentID,
+		}
+		if validMAType(contentType) {
+			haPayload["media_content_type"] = contentType
+		} else {
+			haPayload["media_content_type"] = "music"
 		}
 		if err := a.callHAService(a.cfg.MAAdapter.PlayService, haPayload); err == nil {
 			return nil
@@ -53,7 +78,7 @@ func (a *Adapter) PlayMedia(targetEntity, contentID, contentType string) error {
 		haPayload := map[string]any{
 			"entity_id":          targetEntity,
 			"media_content_id":   contentID,
-			"media_content_type": contentType,
+			"media_content_type": haMediaType(contentType),
 		}
 		return a.callHAService(a.cfg.MAAdapter.FallbackPlayService, haPayload)
 	}

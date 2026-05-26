@@ -1243,21 +1243,32 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 			break
 		}
+		if active.State == session.StateStarting {
+			response = avTransportResponse(action, fmt.Sprintf(`
+<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+			break
+		}
 		h.sessionMgr.Play(active.ID)
 		h.sessionMgr.StartStream(active.ID, active.SourceURI)
-		if err := h.maAdapter.PlayMedia(
-			h.cfg.HA.TargetEntityID,
-			active.StreamURL,
-			contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-		); err != nil {
-			slog.Error("PlayMedia failed, stopping stream", "session_id", active.ID, "error", err)
-			h.sessionMgr.Stop(active.ID)
-			h.sessionMgr.SetError(active.ID, err.Error())
-			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
-			return
-		}
+		playGen := h.sessionMgr.CurrentGenID(active.ID)
+		sessionID := active.ID
+		streamURL := active.StreamURL
+		go func() {
+			if err := h.maAdapter.PlayMedia(
+				h.cfg.HA.TargetEntityID,
+				streamURL,
+				contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
+			); err != nil {
+				slog.Error("PlayMedia failed", "session_id", sessionID, "gen_id", playGen, "error", err)
+				if !h.sessionMgr.IsCurrentGenerationActive(sessionID, playGen) {
+					slog.Debug("PlayMedia late error ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
+					return
+				}
+				if !h.sessionMgr.StopWithErrorIfGenerationActive(sessionID, playGen, err.Error()) {
+					slog.Debug("PlayMedia error ignored after active generation check", "session_id", sessionID, "gen_id", playGen)
+				}
+			}
+		}()
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
@@ -1444,17 +1455,14 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					active.StreamURL,
 					contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
 				); err != nil {
-					if !h.sessionMgr.VerifyGenID(active.ID, seekGen) {
-						slog.Debug("Seek PlayMedia failure ignored, generation has changed", "session_id", active.ID, "gen_id", seekGen)
+					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "gen_id", seekGen, "error", err)
+					if !h.sessionMgr.IsCurrentGenerationActive(active.ID, seekGen) {
+						slog.Debug("Seek PlayMedia late error ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
 						return
 					}
-					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
-					if !h.sessionMgr.StopIfGeneration(active.ID, seekGen) {
-						slog.Debug("Seek StopIfGeneration failed, generation has changed", "session_id", active.ID, "gen_id", seekGen)
-						return
+					if !h.sessionMgr.StopWithErrorIfGenerationActive(active.ID, seekGen, err.Error()) {
+						slog.Debug("Seek PlayMedia error ignored after active generation check", "session_id", active.ID, "gen_id", seekGen)
 					}
-					h.sessionMgr.SetErrorIfGeneration(active.ID, seekGen, err.Error())
-					return
 				}
 			}()
 		}

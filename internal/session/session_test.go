@@ -886,3 +886,50 @@ func TestSetErrorIfNoGenerationRejectsWhenGenNonzero(t *testing.T) {
 		t.Errorf("error should remain empty, got '%s'", got.Error)
 	}
 }
+
+func TestStopWithErrorIfGenerationActiveSetsError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	if err := mgr.Play(s.ID); err != nil {
+		t.Fatalf("Play failed: %v", err)
+	}
+	mgr.SetSessionGenID(s.ID, 42)
+
+	if !mgr.StopWithErrorIfGenerationActive(s.ID, 42, "play failed") {
+		t.Fatal("StopWithErrorIfGenerationActive should accept current active generation")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StateError {
+		t.Errorf("expected StateError, got %s", got.State)
+	}
+	if got.Error != "play failed" {
+		t.Errorf("expected error message, got %q", got.Error)
+	}
+}
+
+func TestStopWithErrorIfGenerationActiveIgnoresStoppedSession(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	if err := mgr.Play(s.ID); err != nil {
+		t.Fatalf("Play failed: %v", err)
+	}
+	mgr.SetSessionGenID(s.ID, 42)
+	if err := mgr.Stop(s.ID); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	if mgr.StopWithErrorIfGenerationActive(s.ID, 42, "late play failed") {
+		t.Fatal("StopWithErrorIfGenerationActive should reject stopped session")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StateStopped {
+		t.Errorf("state should remain StateStopped, got %s", got.State)
+	}
+	if got.Error != "" {
+		t.Errorf("error should remain empty, got %q", got.Error)
+	}
+}

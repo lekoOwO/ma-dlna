@@ -4,20 +4,154 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/leko/ma-dlna/internal/config"
 )
 
-func TestPlayMediaPayload(t *testing.T) {
+// TestPlayMedia_MA_Primary_NoMediaTypeForMIME verifies that MA primary
+// play_media omits media_type when contentType is a MIME like "audio/flac".
+func TestPlayMedia_MA_Primary_NoMediaTypeForMIME(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.HA.Token = "test-token"
-	cfg.HA.TargetEntityID = "media_player.test"
 	cfg.MAAdapter.PlayService = "music_assistant.play_media"
 
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/services/music_assistant/play_media" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		// Must not include media_type for MIME types
+		if _, exists := payload["media_type"]; exists {
+			t.Error("media_type must not be present for MIME content type audio/flac")
+		}
+		if payload["media_id"] != "http://bridge:8787/live/test.flac?token=abc" {
+			t.Errorf("unexpected media_id: %v", payload["media_id"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer server.Close()
+
+	cfg.HA.URL = server.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
 	adapter := New(&cfg)
 
-	_ = adapter
+	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	if err != nil {
+		t.Fatalf("PlayMedia failed: %v", err)
+	}
+}
+
+// TestPlayMedia_MA_Primary_PreservesValidMAType verifies that MA-native types
+// like "track" are still sent as media_type.
+func TestPlayMedia_MA_Primary_PreservesValidMAType(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.MAAdapter.PlayService = "music_assistant.play_media"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/services/music_assistant/play_media" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		if mt, exists := payload["media_type"]; !exists || mt != "track" {
+			t.Errorf("media_type must be 'track', got %v", payload["media_type"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer server.Close()
+
+	cfg.HA.URL = server.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	adapter := New(&cfg)
+
+	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "track")
+	if err != nil {
+		t.Fatalf("PlayMedia failed: %v", err)
+	}
+}
+
+// TestPlayMedia_Fallback_ConvertsMIMEToMusic verifies that the fallback
+// media_player.play_media converts audio/flac to media_content_type "music".
+func TestPlayMedia_Fallback_ConvertsMIMEToMusic(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.MAAdapter.PlayService = ""
+	cfg.MAAdapter.FallbackPlayService = "media_player.play_media"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/services/media_player/play_media" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		if mct, exists := payload["media_content_type"]; !exists || mct != "music" {
+			t.Errorf("media_content_type must be 'music' for MIME input, got %v", payload["media_content_type"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer server.Close()
+
+	cfg.HA.URL = server.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	adapter := New(&cfg)
+
+	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	if err != nil {
+		t.Fatalf("PlayMedia failed: %v", err)
+	}
+}
+
+// TestPlayMedia_HANativeRetryForMIME verifies that when MA primary fails on a MIME
+// type, the HA-native retry uses media_content_type "music".
+func TestPlayMedia_HANativeRetryForMIME(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.MAAdapter.PlayService = "music_assistant.play_media"
+
+	var callCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := callCount.Add(1)
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+
+		switch count {
+		case 1:
+			// First call: MA-style, no media_type
+			if _, exists := payload["media_type"]; exists {
+				t.Error("first call must not include media_type for MIME")
+			}
+			w.WriteHeader(http.StatusInternalServerError) // force retry
+		case 2:
+			// Retry: HA-native, media_content_type must be "music"
+			if mct, exists := payload["media_content_type"]; !exists || mct != "music" {
+				t.Errorf("retry media_content_type must be 'music', got %v", payload["media_content_type"])
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`[{"success": true}]`))
+		default:
+			t.Errorf("unexpected call count: %d", count)
+		}
+	}))
+	defer server.Close()
+
+	cfg.HA.URL = server.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	adapter := New(&cfg)
+
+	err := adapter.PlayMedia("media_player.test", "http://bridge:8787/live/test.flac?token=abc", "audio/flac")
+	if err != nil {
+		t.Fatalf("PlayMedia failed: %v", err)
+	}
+	if got := callCount.Load(); got != 2 {
+		t.Errorf("expected 2 calls (MA fail + HA-native retry success), got %d", got)
+	}
 }
 
 func TestSetVolumePayload(t *testing.T) {

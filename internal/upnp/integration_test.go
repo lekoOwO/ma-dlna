@@ -4,7 +4,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +17,11 @@ import (
 	"github.com/leko/ma-dlna/internal/session"
 	"github.com/leko/ma-dlna/internal/stream"
 )
+
+type haCall struct {
+	service string
+	body    string
+}
 
 // startTestServer creates a bridge HTTP server for integration testing.
 func startTestServer(t *testing.T) (*httptest.Server, *Handler) {
@@ -58,6 +66,50 @@ func mockCallback(t *testing.T) (*httptest.Server, chan *http.Request) {
 
 func callbackURL(ts *httptest.Server) string {
 	return "<" + ts.URL + "/callback>"
+}
+
+func waitForHACall(t *testing.T, calls <-chan haCall, servicePart string) haCall {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case c := <-calls:
+			if strings.Contains(c.service, servicePart) {
+				return c
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for HA call containing %q", servicePart)
+		}
+	}
+}
+
+func waitForSessionState(t *testing.T, sm *session.Manager, sessionID string, want session.State) *session.Session {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := sm.Get(sessionID); s != nil && s.State == want {
+			return s
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s := sm.Get(sessionID)
+	if s == nil {
+		t.Fatalf("timed out waiting for session %s state %s; session missing", sessionID, want)
+	}
+	t.Fatalf("timed out waiting for session %s state %s; got %s", sessionID, want, s.State)
+	return nil
+}
+
+func writeSleepFFmpeg(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ffmpeg")
+	script := `#!/bin/sh
+exec sleep 3600
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
 }
 
 // TestFullSubscriptionFlow tests SUBSCRIBE → receive initial NOTIFY → UNSUBSCRIBE.
@@ -395,15 +447,10 @@ func TestEventEndpointsPerService(t *testing.T) {
 
 // TestPlaybackActions tests the full SetAVTransportURI → Play → Stop → Pause flow.
 func TestPlaybackActions(t *testing.T) {
-	// Mock HA server that records calls
-	type haCall struct {
-		service string
-		body    string
-	}
-	var haCalls []haCall
+	haCalls := make(chan haCall, 16)
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		haCalls = append(haCalls, haCall{service: r.URL.Path, body: string(body)})
+		haCalls <- haCall{service: r.URL.Path, body: string(body)}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`[{"success": true}]`))
 	}))
@@ -417,6 +464,7 @@ func TestPlaybackActions(t *testing.T) {
 	cfg.HA.TargetEntityID = "media_player.test"
 	cfg.Server.PublicBaseURL = "http://bridge:8787"
 	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
 
 	streamer := stream.NewStreamer(&cfg)
 	sm := session.NewManager(&cfg, streamer)
@@ -461,7 +509,6 @@ func TestPlaybackActions(t *testing.T) {
 	t.Logf("SetAVTransportURI ok: session=%s, state=%s, stream_url=%s", s.ID, s.State, s.StreamURL)
 
 	// Step 2: Play
-	haCalls = nil
 	body = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
 	if err != nil {
@@ -478,24 +525,13 @@ func TestPlaybackActions(t *testing.T) {
 		t.Errorf("State after Play: expected starting, got %s", s.State)
 	}
 
-	// MA should have been called
-	found := false
-	for _, c := range haCalls {
-		if strings.Contains(c.service, "play_media") {
-			found = true
-			if !strings.Contains(c.body, s.StreamURL) {
-				t.Errorf("play_media payload should contain stream URL, got: %s", c.body)
-			}
-			break
-		}
-	}
-	if !found {
-		t.Error("Play did not call play_media service")
+	playCall := waitForHACall(t, haCalls, "play_media")
+	if !strings.Contains(playCall.body, s.StreamURL) {
+		t.Errorf("play_media payload should contain stream URL, got: %s", playCall.body)
 	}
 	t.Logf("Play ok: session state=%s, MA play_media called", s.State)
 
 	// Step 3: Stop
-	haCalls = nil
 	body = soapEnvelope("AVTransport", "Stop", "<InstanceID>0</InstanceID>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
 	if err != nil {
@@ -509,16 +545,7 @@ func TestPlaybackActions(t *testing.T) {
 	if s.State != session.StateStopped {
 		t.Errorf("State after Stop: expected stopped, got %s", s.State)
 	}
-	found = false
-	for _, c := range haCalls {
-		if strings.Contains(c.service, "media_stop") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Stop did not call media_stop service")
-	}
+	waitForHACall(t, haCalls, "media_stop")
 	t.Logf("Stop ok: session state=%s", s.State)
 
 	// Step 4: New session → Play → Pause
@@ -538,7 +565,6 @@ func TestPlaybackActions(t *testing.T) {
 	resp, _ = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
 	resp.Body.Close()
 
-	haCalls = nil
 	body = soapEnvelope("AVTransport", "Pause", "<InstanceID>0</InstanceID>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
 	if err != nil {
@@ -549,16 +575,7 @@ func TestPlaybackActions(t *testing.T) {
 	if s2.State != session.StatePaused {
 		t.Errorf("State after Pause: expected paused, got %s", s2.State)
 	}
-	found = false
-	for _, c := range haCalls {
-		if strings.Contains(c.service, "media_pause") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Pause did not call media_pause service")
-	}
+	waitForHACall(t, haCalls, "media_pause")
 	t.Logf("Pause ok: session state=%s", s2.State)
 }
 
@@ -1101,10 +1118,9 @@ func TestStateChangeNotify(t *testing.T) {
 	}
 }
 
-// TestHAErrorSetsSessionError verifies that when HA returns an error,
-// the session is set to error state and GetTransportInfo reports ERROR_OCCURRED.
+// TestHAErrorSetsSessionError verifies that an async HA play_media failure
+// eventually puts the current active generation in ERROR_OCCURRED.
 func TestHAErrorSetsSessionError(t *testing.T) {
-	// HA server that returns errors for play_media
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error": "service unavailable"}`))
@@ -1119,6 +1135,7 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	cfg.HA.TargetEntityID = "media_player.test"
 	cfg.Server.PublicBaseURL = "http://bridge:8787"
 	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
 
 	streamer := stream.NewStreamer(&cfg)
 	sm := session.NewManager(&cfg, streamer)
@@ -1141,26 +1158,23 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Play — HA will return error, now returns SOAP fault
+	// Play returns immediately; HA failure is applied asynchronously to the
+	// still-current stream generation.
 	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 500 {
-		t.Errorf("Play with failing HA should return 500 SOAP fault, got %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Errorf("Play with failing HA should return immediate success, got %d", resp.StatusCode)
 	}
 
-	// Session should be in error state
 	sessions := sm.AllSessions()
 	if len(sessions) == 0 {
 		t.Fatal("No session created")
 	}
-	s := sessions[0]
-	if s.State != session.StateError {
-		t.Errorf("expected session error state, got %s", s.State)
-	}
+	s := waitForSessionState(t, sm, sessions[0].ID, session.StateError)
 	if s.Error == "" {
 		t.Error("session should have error message")
 	}
@@ -1175,6 +1189,115 @@ func TestHAErrorSetsSessionError(t *testing.T) {
 		t.Errorf("ActiveSession should return nil for error-only sessions, got %v", act)
 	}
 	t.Logf("Session error state verified, ActiveSession correctly excludes error sessions")
+}
+
+func TestLatePlayMediaErrorAfterStopDoesNotSetSessionError(t *testing.T) {
+	playStarted := make(chan struct{})
+	releasePlay := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releasePlay) })
+	})
+	var signaled atomic.Bool
+	var playRequests atomic.Int32
+
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "play_media") {
+			playRequests.Add(1)
+			if signaled.CompareAndSwap(false, true) {
+				close(playStarted)
+			}
+			<-releasePlay
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error": "service unavailable"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	setBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	sessions := sm.AllSessions()
+	if len(sessions) == 0 {
+		t.Fatal("No session created")
+	}
+	sessionID := sessions[0].ID
+
+	start := time.Now()
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Play should not wait for HA play_media, took %s", elapsed)
+	}
+
+	select {
+	case <-playStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async play_media request")
+	}
+
+	stopBody := soapEnvelope("AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(stopBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Stop expected 200, got %d", resp.StatusCode)
+	}
+
+	releaseOnce.Do(func() { close(releasePlay) })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && playRequests.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if playRequests.Load() < 3 {
+		t.Fatalf("timed out waiting for play_media retries, got %d requests", playRequests.Load())
+	}
+
+	s := sm.Get(sessionID)
+	if s.State != session.StateStopped {
+		t.Fatalf("late play_media failure after Stop should leave session stopped, got %s with error %q", s.State, s.Error)
+	}
+	if s.Error != "" {
+		t.Fatalf("late play_media failure after Stop should not set error, got %q", s.Error)
+	}
 }
 
 // TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
