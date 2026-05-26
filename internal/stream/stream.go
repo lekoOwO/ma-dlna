@@ -673,13 +673,31 @@ func (st *stream) run(gen *streamGeneration) {
 	hadError := false
 	defer func() {
 		gen.active.Store(false)
-		st.runsInFlight.Store(0)
+
+		// Hold genMu while checking generation equality and mutating
+		// aggregate stream state to prevent a TOCTOU race: a Seek/Resume
+		// can change st.gen between the check and the stores, causing the
+		// old generation to clear a newer generation's tracking.
+		var emitEnd bool
+		var endGenID uint64
+		st.genMu.Lock()
+		if st.gen == gen {
+			st.runsInFlight.Store(0)
+			if gen.ctx.Err() == nil {
+				st.active.Store(false)
+				if !hadError && st.endCB != nil {
+					emitEnd = true
+					endGenID = gen.genID
+				}
+			}
+		}
+		st.genMu.Unlock()
+
 		if gen.ctx.Err() == nil {
 			st.closeClients(gen)
-			st.active.Store(false)
-			if !hadError && st.endCB != nil && st.currentGen() == gen {
-				st.endCB(st.sessionID, gen.genID)
-			}
+		}
+		if emitEnd {
+			st.endCB(st.sessionID, endGenID)
 		}
 		close(gen.done)
 	}()

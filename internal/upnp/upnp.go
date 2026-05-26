@@ -236,7 +236,9 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					}
 					return
 				case "PAUSED_PLAYBACK":
-					h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
+					if h.sessionMgr.MarkPausedIfGeneration(sessionID, genID) {
+						h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
+					}
 				}
 			}
 		}
@@ -1333,15 +1335,31 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		h.sessionMgr.Seek(active.ID, offset)
 		if !wasPaused {
 			h.sessionMgr.Resume(active.ID)
+			seekGen := h.sessionMgr.CurrentGenID(active.ID)
+			if seekGen == 0 {
+				slog.Warn("Seek aborted, stream generation is zero", "session_id", active.ID)
+				h.sessionMgr.SetErrorIfNoGeneration(active.ID, "seek did not create a stream generation")
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("701", "Transition not available")))
+				return
+			}
 			go func() {
 				if err := h.maAdapter.PlayMedia(
 					h.cfg.HA.TargetEntityID,
 					active.StreamURL,
 					contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
 				); err != nil {
+					if !h.sessionMgr.VerifyGenID(active.ID, seekGen) {
+						slog.Debug("Seek PlayMedia failure ignored, generation has changed", "session_id", active.ID, "gen_id", seekGen)
+						return
+					}
 					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "error", err)
-					h.sessionMgr.Stop(active.ID)
-					h.sessionMgr.SetError(active.ID, err.Error())
+					if !h.sessionMgr.StopIfGeneration(active.ID, seekGen) {
+						slog.Debug("Seek StopIfGeneration failed, generation has changed", "session_id", active.ID, "gen_id", seekGen)
+						return
+					}
+					h.sessionMgr.SetErrorIfGeneration(active.ID, seekGen, err.Error())
 					return
 				}
 			}()

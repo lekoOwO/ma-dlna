@@ -709,6 +709,113 @@ func TestSeekFromStartingInvalidatesOldGen(t *testing.T) {
 	}
 }
 
+func TestSetErrorIfGenerationMatchingGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if !mgr.SetErrorIfGeneration(s.ID, 42, "playback error") {
+		t.Fatal("SetErrorIfGeneration should return true for matching gen")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StateError {
+		t.Errorf("expected StateError, got %s", got.State)
+	}
+	if got.Error != "playback error" {
+		t.Errorf("expected error 'playback error', got '%s'", got.Error)
+	}
+}
+
+func TestSetErrorIfGenerationRejectsStaleGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if mgr.SetErrorIfGeneration(s.ID, 99, "stale error") {
+		t.Fatal("SetErrorIfGeneration should return false for stale gen")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StatePlaying {
+		t.Errorf("state should remain StatePlaying after stale gen rejection, got %s", got.State)
+	}
+	if got.Error != "" {
+		t.Errorf("error should remain empty after stale gen rejection, got '%s'", got.Error)
+	}
+}
+
+func TestMarkPausedIfGenerationMatchingGenFromPlaying(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if !mgr.MarkPausedIfGeneration(s.ID, 42) {
+		t.Fatal("MarkPausedIfGeneration should return true for matching gen")
+	}
+	if mgr.Get(s.ID).State != StatePaused {
+		t.Errorf("expected StatePaused, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestMarkPausedIfGenerationMatchingGenFromStarting(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	if mgr.Get(s.ID).State != StateStarting {
+		t.Fatalf("expected starting state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if !mgr.MarkPausedIfGeneration(s.ID, 42) {
+		t.Fatal("MarkPausedIfGeneration should return true for matching gen from starting")
+	}
+	if mgr.Get(s.ID).State != StatePaused {
+		t.Errorf("expected StatePaused, got %s", mgr.Get(s.ID).State)
+	}
+}
+
+func TestMarkPausedIfGenerationRejectsStaleGen(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+	if mgr.MarkPausedIfGeneration(s.ID, 99) {
+		t.Fatal("MarkPausedIfGeneration should return false for stale gen")
+	}
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Errorf("state should remain StatePlaying after stale gen rejection, got %s", mgr.Get(s.ID).State)
+	}
+}
+
 func TestSafeURLRedactsToken(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -725,5 +832,57 @@ func TestSafeURLRedactsToken(t *testing.T) {
 		if got != tc.expected {
 			t.Errorf("safeURL(%q) = %q, want %q", tc.input, got, tc.expected)
 		}
+	}
+}
+
+func TestSetErrorIfNoGenerationSetsErrorWhenGenZero(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	if gen := mgr.CurrentGenID(s.ID); gen != 0 {
+		t.Fatalf("expected gen 0, got %d", gen)
+	}
+
+	if !mgr.SetErrorIfNoGeneration(s.ID, "seek without generation") {
+		t.Fatal("SetErrorIfNoGeneration should return true when gen is zero")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StateError {
+		t.Errorf("expected StateError, got %s", got.State)
+	}
+	if got.Error != "seek without generation" {
+		t.Errorf("expected error message, got '%s'", got.Error)
+	}
+}
+
+func TestSetErrorIfNoGenerationRejectsWhenGenNonzero(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))
+
+	s := mgr.Create("http://source.local/test.flac", "")
+	mgr.Play(s.ID)
+	mgr.SetPlaying(s.ID)
+	if mgr.Get(s.ID).State != StatePlaying {
+		t.Fatalf("expected playing state, got %s", mgr.Get(s.ID).State)
+	}
+
+	mgr.SetSessionGenID(s.ID, 42)
+
+	if mgr.SetErrorIfNoGeneration(s.ID, "should not apply") {
+		t.Fatal("SetErrorIfNoGeneration should return false when gen is nonzero")
+	}
+	got := mgr.Get(s.ID)
+	if got.State != StatePlaying {
+		t.Errorf("state should remain StatePlaying, got %s", got.State)
+	}
+	if got.Error != "" {
+		t.Errorf("error should remain empty, got '%s'", got.Error)
 	}
 }

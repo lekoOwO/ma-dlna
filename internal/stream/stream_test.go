@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -259,6 +260,90 @@ func TestStreamerStopIfGenerationRejectsOldGenerationAfterResume(t *testing.T) {
 	}
 	if !streamExists(streamer, sessionID) {
 		t.Fatal("stream should remain registered after stale generation rejection")
+	}
+}
+
+func TestOldGenerationExitDoesNotClearCurrentRunTracking(t *testing.T) {
+	dir := t.TempDir()
+	releasePath := filepath.Join(dir, "release")
+	fakeFFmpeg := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+while [ ! -f "$FAKE_FFMPEG_RELEASE" ]; do
+  sleep 0.01
+done
+exit 0
+`
+	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("FAKE_FFMPEG_RELEASE", releasePath)
+
+	cfg := config.DefaultConfig()
+	cfg.FFmpeg.Binary = fakeFFmpeg
+
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	oldGen := &streamGeneration{
+		ctx:          oldCtx,
+		cancel:       oldCancel,
+		started:      make(chan struct{}),
+		done:         make(chan struct{}),
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(cfg.Stream.RingBufferBytes),
+		clients:      make(map[string]*clientWriter),
+		genID:        1,
+		initBufLimit: int64(cfg.Stream.InitSegmentBytes),
+	}
+	st := &stream{
+		sessionID:      "late-old-generation",
+		sourceURI:      "http://source.local/song.mp3",
+		ffmpegCfg:      cfg.FFmpeg,
+		startupTimeout: time.Second,
+		gen:            oldGen,
+	}
+	st.active.Store(true)
+	st.currentGenID.Store(oldGen.genID)
+	st.runsInFlight.Store(1)
+
+	go st.run(oldGen)
+	select {
+	case <-oldGen.started:
+	case <-time.After(time.Second):
+		t.Fatal("old generation did not start")
+	}
+
+	newCtx, newCancel := context.WithCancel(context.Background())
+	defer newCancel()
+	newGen := &streamGeneration{
+		ctx:          newCtx,
+		cancel:       newCancel,
+		started:      make(chan struct{}),
+		done:         make(chan struct{}),
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(cfg.Stream.RingBufferBytes),
+		clients:      make(map[string]*clientWriter),
+		startTime:    time.Now(),
+		genID:        2,
+		initBufLimit: int64(cfg.Stream.InitSegmentBytes),
+	}
+	newGen.active.Store(true)
+	st.genMu.Lock()
+	st.gen = newGen
+	st.currentGenID.Store(newGen.genID)
+	st.genMu.Unlock()
+	st.runsInFlight.Store(1)
+
+	if err := os.WriteFile(releasePath, []byte("release"), 0o644); err != nil {
+		t.Fatalf("release fake ffmpeg: %v", err)
+	}
+	select {
+	case <-oldGen.done:
+	case <-time.After(time.Second):
+		t.Fatal("old generation did not exit")
+	}
+
+	if got := st.runsInFlight.Load(); got != 1 {
+		t.Fatalf("old generation cleanup cleared current run tracking: got runsInFlight=%d, want 1", got)
 	}
 }
 

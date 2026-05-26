@@ -65,12 +65,18 @@ type Manager struct {
 }
 
 func NewManager(cfg *config.Config, streamer *stream.Streamer) *Manager {
-	return &Manager{
+	m := &Manager{
 		sessions:     make(map[string]*Session),
 		sessionGenID: make(map[string]uint64),
 		cfg:          cfg,
 		streamer:     streamer,
 	}
+	if streamer != nil {
+		streamer.SetGenStartCallback(func(sessionID string, genID uint64) {
+			m.SetSessionGenID(sessionID, genID)
+		})
+	}
+	return m
 }
 
 func (m *Manager) SetErrorNotifier(n ErrorNotifier) {
@@ -351,18 +357,87 @@ func (m *Manager) SetPlayingAcceptedIfGeneration(sessionID string, genID uint64)
 }
 
 func (m *Manager) SetError(sessionID string, errMsg string) {
+	m.SetErrorIfGeneration(sessionID, 0, errMsg)
+}
+
+// SetErrorIfGeneration sets the session to error state only if genID matches the
+// expected generation (nonzero). genID=0 skips the generation check.
+// It returns true if the error was actually set.
+func (m *Manager) SetErrorIfGeneration(sessionID string, genID uint64, errMsg string) bool {
 	m.mu.Lock()
-	if s, ok := m.sessions[sessionID]; ok {
-		s.State = StateError
-		s.Error = errMsg
-		s.UpdatedAt = time.Now()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
 	}
+	if genID != 0 && m.sessionGenID[sessionID] != genID {
+		m.mu.Unlock()
+		return false
+	}
+	s.State = StateError
+	s.Error = errMsg
+	s.UpdatedAt = time.Now()
 	n := m.errorNotifier
 	m.mu.Unlock()
 
 	if n != nil {
 		n(sessionID, fmt.Errorf("%s", errMsg))
 	}
+	return true
+}
+
+// SetErrorIfNoGeneration sets the session to error state only if the session
+// has no generation recorded (sessionGenID[sessionID] == 0). It returns true
+// if the error was actually set. Used when an operation requires an active
+// stream generation to exist.
+func (m *Manager) SetErrorIfNoGeneration(sessionID string, errMsg string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	if m.sessionGenID[sessionID] != 0 {
+		m.mu.Unlock()
+		return false
+	}
+	s.State = StateError
+	s.Error = errMsg
+	s.UpdatedAt = time.Now()
+	n := m.errorNotifier
+	m.mu.Unlock()
+
+	if n != nil {
+		n(sessionID, fmt.Errorf("%s", errMsg))
+	}
+	return true
+}
+
+// MarkPausedIfGeneration transitions StatePlaying or StateStarting to StatePaused
+// only if genID matches the expected generation (nonzero). genID=0 skips the check.
+// It returns true if the state was actually changed. Does not touch streamer.Pause.
+func (m *Manager) MarkPausedIfGeneration(sessionID string, genID uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		if genID != 0 && m.sessionGenID[sessionID] != genID {
+			return false
+		}
+		if s.State != StatePlaying && s.State != StateStarting {
+			return false
+		}
+		s.State = StatePaused
+		s.UpdatedAt = time.Now()
+		return true
+	}
+	return false
+}
+
+// CurrentGenID returns the expected generation ID for a session.
+func (m *Manager) CurrentGenID(sessionID string) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sessionGenID[sessionID]
 }
 
 func (m *Manager) Get(sessionID string) *Session {

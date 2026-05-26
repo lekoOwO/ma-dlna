@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1265,4 +1266,62 @@ func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {
 		t.Errorf("expected starting state after Play, got %s", active.State)
 	}
 	t.Logf("Correct session played: %s with URI %s", active.ID, active.SourceURI)
+}
+
+func TestSeekWithoutGenerationDoesNotCallPlayMedia(t *testing.T) {
+	var playCalls atomic.Int32
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			playCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"success": false}`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	strm := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, strm)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+
+	s := sm.Create("http://192.168.1.10/song.mp3", "")
+	if err := sm.Play(s.ID); err != nil {
+		t.Fatalf("play session: %v", err)
+	}
+	sm.SetPlaying(s.ID)
+	if gen := sm.CurrentGenID(s.ID); gen != 0 {
+		t.Fatalf("test setup expected no generation, got %d", gen)
+	}
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	seekBody := soapEnvelope("AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:10</Target>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(seekBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if playCalls.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := playCalls.Load(); got != 0 {
+		t.Fatalf("Seek without a stream generation must not call HA PlayMedia; got %d calls", got)
+	}
 }
