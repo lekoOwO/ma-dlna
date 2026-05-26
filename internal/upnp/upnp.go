@@ -57,17 +57,18 @@ type eventSubscriber struct {
 }
 
 type Handler struct {
-	cfg         *config.Config
-	sessionMgr  *session.Manager
-	maAdapter   *maadapter.Adapter
-	mu          sync.RWMutex
-	rcMu        sync.Mutex
-	volume      int
-	prevVolume  int
-	muted       bool
-	ssdpCancel  context.CancelFunc
-	deviceUUID  string
-	subscribers map[string]*eventSubscriber
+	cfg               *config.Config
+	sessionMgr        *session.Manager
+	maAdapter         *maadapter.Adapter
+	mu                sync.RWMutex
+	rcMu              sync.Mutex
+	volume            int
+	prevVolume        int
+	muted             bool
+	ssdpCancel        context.CancelFunc
+	playbackMonCancel context.CancelFunc
+	deviceUUID        string
+	subscribers       map[string]*eventSubscriber
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter *maadapter.Adapter) *Handler {
@@ -94,6 +95,7 @@ func (h *Handler) Stop() {
 	if h.ssdpCancel != nil {
 		h.ssdpCancel()
 	}
+	h.stopPlaybackMonitor()
 	slog.Info("UPnP handler stopped")
 }
 
@@ -115,9 +117,55 @@ func (h *Handler) NotifyError(sessionID string) {
 }
 
 // NotifyPlaying sends AVTransport LastChange when the first /live client connects,
-// meaning HA/MA has actually started consuming the stream.
+// meaning HA/MA has actually started consuming the stream. It also starts the
+// playback monitor to detect when HA/MA reports playback ended.
 func (h *Handler) NotifyPlaying(sessionID string) {
 	h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
+	h.startPlaybackMonitor(sessionID)
+}
+
+// startPlaybackMonitor polls HA/MA media_player state periodically and fires
+// STOPPED when the entity reports playback has ended (state != "playing").
+// This is the long-term replacement for relying on ffmpeg EOF as playback-ended.
+func (h *Handler) startPlaybackMonitor(sessionID string) {
+	h.stopPlaybackMonitor()
+	ctx, cancel := context.WithCancel(context.Background())
+	h.playbackMonCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		wasPlaying := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				state, err := h.maAdapter.GetEntityState(h.cfg.HA.TargetEntityID)
+				if err != nil {
+					slog.Debug("Playback monitor poll failed", "entity", h.cfg.HA.TargetEntityID, "error", err)
+					continue
+				}
+				if state == "playing" {
+					wasPlaying = true
+				} else if wasPlaying && (state == "idle" || state == "off" || state == "paused" || state == "standby") {
+					slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
+					h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
+					// Mark the session stopped if it's still the current one
+					h.sessionMgr.MarkStoppedIfGeneration(sessionID, 0)
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (h *Handler) stopPlaybackMonitor() {
+	if h.playbackMonCancel != nil {
+		h.playbackMonCancel()
+		h.playbackMonCancel = nil
+	}
 }
 
 // NotifyEnded sends AVTransport LastChange on natural stream end (EOF).
@@ -990,6 +1038,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Server.StreamPublicBaseURL != "" {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
+		h.stopPlaybackMonitor()
 		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
 		h.notifyCurrentSession(s.ID, avTransportLastChange("STOPPED"))
 		response = avTransportResponse(action, fmt.Sprintf(`

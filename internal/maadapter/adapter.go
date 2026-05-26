@@ -79,6 +79,32 @@ func (a *Adapter) SetVolume(targetEntity string, volume int) error {
 	})
 }
 
+// GetEntityState queries the HA REST API for the current state of an entity.
+// Returns the state string (e.g. "playing", "paused", "idle", "off").
+func (a *Adapter) GetEntityState(entityID string) (string, error) {
+	url := fmt.Sprintf("%s/api/states/%s", a.cfg.HA.URL, entityID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfg.HA.Token)
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("get entity state: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get entity state returned %d", resp.StatusCode)
+	}
+	var result struct {
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode entity state: %w", err)
+	}
+	return result.State, nil
+}
+
 func bodyRedacted(body []byte) string {
 	s := string(body)
 	// Strip token=... from URLs in JSON
