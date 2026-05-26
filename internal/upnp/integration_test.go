@@ -1386,6 +1386,115 @@ func TestStartupSeekZeroDoesNotRestartStreamOrReplayMedia(t *testing.T) {
 	}
 }
 
+func TestGetPositionInfoWaitsForPlayMediaSuccessBeforeAdvancing(t *testing.T) {
+	playStarted := make(chan struct{})
+	releasePlay := make(chan struct{})
+	var releaseOnce sync.Once
+	var signaled atomic.Bool
+
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "play_media") {
+			if signaled.CompareAndSwap(false, true) {
+				close(playStarted)
+			}
+			<-releasePlay
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+	defer releaseOnce.Do(func() { close(releasePlay) })
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+
+	t.Cleanup(func() {
+		if s := sm.CurrentSession(); s != nil {
+			_ = sm.Stop(s.ID)
+		}
+	})
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	setBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SetAVTransportURI expected 200, got %d", resp.StatusCode)
+	}
+
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	start := time.Now()
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Play should not wait for HA play_media, took %s", elapsed)
+	}
+
+	select {
+	case <-playStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async play_media request")
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	getPosBody := soapEnvelope("AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(getPosBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GetPositionInfo expected 200, got %d", resp.StatusCode)
+	}
+	if relTime := extractXMLField(string(data), "RelTime"); relTime != "00:00:00" {
+		t.Fatalf("RelTime should not advance before play_media succeeds, got %s", relTime)
+	}
+
+	releaseOnce.Do(func() { close(releasePlay) })
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(getPosBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if relTime := extractXMLField(string(data), "RelTime"); relTime != "00:00:00" {
+			return
+		}
+	}
+	t.Fatal("RelTime should advance after play_media succeeds")
+}
+
 // TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
 // sends SetAVTransportURI twice then Play, it plays the LAST URI.
 func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {

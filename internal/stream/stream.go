@@ -97,6 +97,9 @@ type streamGeneration struct {
 	genID           uint64
 	err             error
 	ffmpegTime      atomic.Int64
+	presAccepted    bool
+	presBaseRaw     time.Duration
+	presLast        time.Duration
 	initBuf         []byte
 	initBufSize     int64
 	initBufLimit    int64
@@ -137,6 +140,43 @@ func (gen *streamGeneration) setErr(err error) {
 	gen.mu.Lock()
 	defer gen.mu.Unlock()
 	gen.err = err
+}
+
+func (gen *streamGeneration) acceptPresentation(raw time.Duration) {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	if gen.presAccepted {
+		return
+	}
+	if raw < gen.offset {
+		raw = gen.offset
+	}
+	gen.presAccepted = true
+	gen.presBaseRaw = raw
+	gen.presLast = gen.offset
+}
+
+func (gen *streamGeneration) presentationElapsed(raw time.Duration, running bool) time.Duration {
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	if !running {
+		if gen.presAccepted && gen.presLast > gen.offset {
+			return gen.presLast
+		}
+		return gen.offset
+	}
+	if !gen.presAccepted {
+		return gen.offset
+	}
+	elapsed := gen.offset + raw - gen.presBaseRaw
+	if elapsed < gen.offset {
+		elapsed = gen.offset
+	}
+	if elapsed < gen.presLast {
+		elapsed = gen.presLast
+	}
+	gen.presLast = elapsed
+	return elapsed
 }
 
 func (gen *streamGeneration) setCmd(cmd *exec.Cmd) {
@@ -434,6 +474,25 @@ func (s *Streamer) Resume(sessionID string) {
 	slog.Info("Stream resuming", "session_id", sessionID, "offset", newGen.offset.Round(time.Second))
 }
 
+func streamRawElapsed(st *stream, gen *streamGeneration) time.Duration {
+	// When ffmpeg is not running (paused/stopped), position is frozen at gen.offset.
+	if st.runsInFlight.Load() == 0 {
+		return gen.offset
+	}
+	elapsed := gen.offset
+	if !gen.startTime.IsZero() {
+		elapsed = gen.offset + time.Since(gen.startTime)
+	}
+	ft := gen.ffmpegTime.Load()
+	if ft > 0 {
+		ffmpegElapsed := gen.offset + time.Duration(ft)
+		if ffmpegElapsed > elapsed {
+			elapsed = ffmpegElapsed
+		}
+	}
+	return elapsed
+}
+
 func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	s.mu.Lock()
 	st, ok := s.streams[sessionID]
@@ -445,18 +504,28 @@ func (s *Streamer) Elapsed(sessionID string) time.Duration {
 	if gen == nil {
 		return 0
 	}
-	// When ffmpeg is not running (paused/stopped), position is frozen at gen.offset.
-	if st.runsInFlight.Load() == 0 {
-		return gen.offset
+	raw := streamRawElapsed(st, gen)
+	return gen.presentationElapsed(raw, st.runsInFlight.Load() > 0)
+}
+
+func (s *Streamer) MarkPlaybackAcceptedIfGeneration(sessionID string, genID uint64) bool {
+	s.mu.Lock()
+	st, ok := s.streams[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return false
 	}
-	ft := gen.ffmpegTime.Load()
-	if ft > 0 {
-		return gen.offset + time.Duration(ft)
+	gen := st.currentGen()
+	if gen == nil {
+		return false
 	}
-	if gen.startTime.IsZero() {
-		return 0
+	if genID != 0 && st.currentGenID.Load() != genID {
+		return false
 	}
-	return gen.offset + time.Since(gen.startTime)
+	raw := streamRawElapsed(st, gen)
+	gen.acceptPresentation(raw)
+	slog.Debug("Stream presentation position accepted", "session_id", sessionID, "gen_id", gen.genID, "raw_elapsed", raw.Round(time.Millisecond), "offset", gen.offset.Round(time.Millisecond))
+	return true
 }
 
 func (s *Streamer) IsRunning(sessionID string) bool {

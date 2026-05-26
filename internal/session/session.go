@@ -463,6 +463,23 @@ func (m *Manager) isCurrentGenerationActiveLocked(sessionID string, genID uint64
 	return true
 }
 
+func (m *Manager) MarkPlaybackAcceptedIfGeneration(sessionID string, genID uint64) bool {
+	m.mu.RLock()
+	if !m.isCurrentGenerationActiveLocked(sessionID, genID) {
+		m.mu.RUnlock()
+		return false
+	}
+	m.mu.RUnlock()
+
+	if !m.streamer.MarkPlaybackAcceptedIfGeneration(sessionID, genID) {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.isCurrentGenerationActiveLocked(sessionID, genID)
+}
+
 // StopWithErrorIfGenerationActive stops the matching stream generation and sets
 // ERROR only if the session is still current and actively starting/playing.
 func (m *Manager) StopWithErrorIfGenerationActive(sessionID string, genID uint64, errMsg string) bool {

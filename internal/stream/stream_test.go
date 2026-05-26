@@ -263,6 +263,100 @@ func TestStreamerStopIfGenerationRejectsOldGenerationAfterResume(t *testing.T) {
 	}
 }
 
+func TestStreamerPauseUsesPresentationOffsetBeforePlaybackAccepted(t *testing.T) {
+	cfg := config.DefaultConfig()
+	streamer := NewStreamer(&cfg)
+	const sessionID = "presentation-pause"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	close(done)
+	gen := &streamGeneration{
+		ctx:          ctx,
+		cancel:       cancel,
+		started:      make(chan struct{}),
+		done:         done,
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(cfg.Stream.RingBufferBytes),
+		clients:      make(map[string]*clientWriter),
+		offset:       5 * time.Second,
+		startTime:    time.Now().Add(-15 * time.Second),
+		genID:        1,
+		initBufLimit: int64(cfg.Stream.InitSegmentBytes),
+	}
+	gen.ffmpegTime.Store(int64(15 * time.Second))
+	gen.active.Store(true)
+
+	st := &stream{
+		sessionID:      sessionID,
+		sourceURI:      "http://source.local/song.mp3",
+		ffmpegCfg:      cfg.FFmpeg,
+		startupTimeout: time.Second,
+		gen:            gen,
+	}
+	st.active.Store(true)
+	st.runsInFlight.Store(1)
+	st.currentGenID.Store(1)
+	streamer.streams[sessionID] = st
+
+	pos := streamer.Pause(sessionID)
+	if pos != 5*time.Second {
+		t.Fatalf("pause before playback acceptance should keep presentation offset 5s, got %s", pos)
+	}
+}
+
+func TestStreamerElapsedKeepsAcceptedPresentationPositionWhenRunStops(t *testing.T) {
+	cfg := config.DefaultConfig()
+	streamer := NewStreamer(&cfg)
+	const sessionID = "presentation-stopped-run"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	close(done)
+	gen := &streamGeneration{
+		ctx:          ctx,
+		cancel:       cancel,
+		started:      make(chan struct{}),
+		done:         done,
+		firstClient:  make(chan struct{}),
+		ringBuf:      NewRingBuffer(cfg.Stream.RingBufferBytes),
+		clients:      make(map[string]*clientWriter),
+		offset:       5 * time.Second,
+		startTime:    time.Now().Add(-20 * time.Second),
+		genID:        1,
+		initBufLimit: int64(cfg.Stream.InitSegmentBytes),
+	}
+	gen.active.Store(true)
+
+	st := &stream{
+		sessionID:      sessionID,
+		sourceURI:      "http://source.local/song.mp3",
+		ffmpegCfg:      cfg.FFmpeg,
+		startupTimeout: time.Second,
+		gen:            gen,
+	}
+	st.active.Store(true)
+	st.runsInFlight.Store(1)
+	st.currentGenID.Store(1)
+	streamer.streams[sessionID] = st
+
+	if !streamer.MarkPlaybackAcceptedIfGeneration(sessionID, 1) {
+		t.Fatal("expected presentation acceptance")
+	}
+	time.Sleep(20 * time.Millisecond)
+	acceptedPos := streamer.Elapsed(sessionID)
+	if acceptedPos <= 5*time.Second {
+		t.Fatalf("expected presentation position to advance after acceptance, got %s", acceptedPos)
+	}
+
+	st.runsInFlight.Store(0)
+	if pos := streamer.Elapsed(sessionID); pos != acceptedPos {
+		t.Fatalf("stopped run should keep last accepted presentation position %s, got %s", acceptedPos, pos)
+	}
+}
+
 func TestOldGenerationExitDoesNotClearCurrentRunTracking(t *testing.T) {
 	dir := t.TempDir()
 	releasePath := filepath.Join(dir, "release")

@@ -1270,6 +1270,10 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				if !h.sessionMgr.StopWithErrorIfGenerationActive(sessionID, playGen, err.Error()) {
 					slog.Debug("PlayMedia error ignored after active generation check", "session_id", sessionID, "gen_id", playGen)
 				}
+				return
+			}
+			if !h.sessionMgr.MarkPlaybackAcceptedIfGeneration(sessionID, playGen) {
+				slog.Debug("PlayMedia success ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
 			}
 		}()
 		response = avTransportResponse(action, fmt.Sprintf(`
@@ -1473,6 +1477,10 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 					if !h.sessionMgr.StopWithErrorIfGenerationActive(active.ID, seekGen, err.Error()) {
 						slog.Debug("Seek PlayMedia error ignored after active generation check", "session_id", active.ID, "gen_id", seekGen)
 					}
+					return
+				}
+				if !h.sessionMgr.MarkPlaybackAcceptedIfGeneration(active.ID, seekGen) {
+					slog.Debug("Seek PlayMedia success ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
 				}
 			}()
 		}
