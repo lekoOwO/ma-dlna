@@ -34,6 +34,7 @@ type Metadata struct {
 	Album       string `json:"album"`
 	AlbumArtURI string `json:"album_art_uri"`
 	Duration    string `json:"duration"`
+	ContentType string `json:"content_type"`
 }
 
 type Session struct {
@@ -152,7 +153,7 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	token := generateToken()
 	parsed := parseDIDL(metadataXML)
 	resolveMetadataURIs(parsed, sourceURI)
-	slog.Info("DIDL metadata parsed", "title", parsed.Title, "artist", parsed.Artist, "duration", parsed.Duration)
+	slog.Info("DIDL metadata parsed", "title", parsed.Title, "artist", parsed.Artist, "duration", parsed.Duration, "content_type", parsed.ContentType)
 
 	s := &Session{
 		ID:          id,
@@ -743,8 +744,9 @@ func parseDIDL(xmlStr string) *Metadata {
 	//     <item>   <title/>  <creator/>  <artist/>  <album/>  <albumArtURI/>   </item>
 	//   </DIDL-Lite>
 	type didlRes struct {
-		Duration string `xml:"duration,attr"`
-		URI      string `xml:",chardata"`
+		Duration     string `xml:"duration,attr"`
+		ProtocolInfo string `xml:"protocolInfo,attr"`
+		URI          string `xml:",chardata"`
 	}
 
 	type didlItem struct {
@@ -765,24 +767,25 @@ func parseDIDL(xmlStr string) *Metadata {
 	var doc didlDoc
 	if err := xml.Unmarshal([]byte(xmlStr), &doc); err == nil && len(doc.Items) > 0 {
 		it := doc.Items[0]
-		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration)
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration, contentTypeFromProtocolInfo(it.Res.ProtocolInfo))
 	}
 
 	// Fallback: bare <item>
 	var it didlItem
 	if err := xml.Unmarshal([]byte(xmlStr), &it); err == nil {
-		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration)
+		return buildMetadata(it.Title, it.Creator, it.Artist, it.Album, it.AlbumArtURI, it.Res.Duration, contentTypeFromProtocolInfo(it.Res.ProtocolInfo))
 	}
 
 	return &Metadata{}
 }
 
-func buildMetadata(title, creator, artist, album, albumArtURI, duration string) *Metadata {
+func buildMetadata(title, creator, artist, album, albumArtURI, duration, contentType string) *Metadata {
 	md := &Metadata{
 		Title:       title,
 		Album:       album,
 		AlbumArtURI: albumArtURI,
 		Duration:    duration,
+		ContentType: contentType,
 	}
 	if artist != "" {
 		md.Artist = artist
@@ -790,6 +793,17 @@ func buildMetadata(title, creator, artist, album, albumArtURI, duration string) 
 		md.Artist = creator
 	}
 	return md
+}
+
+func contentTypeFromProtocolInfo(protocolInfo string) string {
+	parts := strings.Split(protocolInfo, ":")
+	if len(parts) < 3 {
+		return ""
+	}
+	if parts[2] == "*" {
+		return ""
+	}
+	return parts[2]
 }
 
 func resolveMetadataURIs(md *Metadata, sourceURI string) {

@@ -40,6 +40,10 @@ func (a *DirectAdapter) Target() string {
 	return a.cfg.MusicAssistant.TargetPlayerID
 }
 
+func (a *DirectAdapter) RequiresBridgeStream() bool {
+	return false
+}
+
 func (a *DirectAdapter) getActiveQueueStatus() (*maQueueStatus, error) {
 	var result *maQueueStatus
 	if err := a.callMAResult("player_queues/get_active_queue", map[string]any{
@@ -67,8 +71,13 @@ func (a *DirectAdapter) PlayMedia(req PlayRequest) error {
 		return err
 	}
 
+	mediaURL := req.SourceURL
+	if mediaURL == "" {
+		mediaURL = req.StreamURL
+	}
+
 	media := map[string]any{
-		"item_id":    req.StreamURL,
+		"item_id":    mediaURL,
 		"provider":   "builtin",
 		"name":       mediaName(req),
 		"media_type": "track",
@@ -110,13 +119,19 @@ func (a *DirectAdapter) PlayMedia(req PlayRequest) error {
 	}
 
 	audioFmt := audioFormatFromMIME(req.ContentType)
-	media["provider_mappings"] = providerMappings(req.StreamURL, audioFmt)
+	media["provider_mappings"] = mediaProviderMappings(mediaURL, audioFmt)
 
 	return a.callMA("player_queues/play_media", map[string]any{
 		"queue_id": qid,
 		"media":    media,
 		"option":   "replace",
 	})
+}
+
+func mediaProviderMappings(itemID, contentType string) []map[string]any {
+	mappings := providerMappings(itemID, contentType)
+	mappings[0]["url"] = itemID
+	return mappings
 }
 
 func providerMappings(itemID, contentType string) []map[string]any {
@@ -129,6 +144,16 @@ func providerMappings(itemID, contentType string) []map[string]any {
 		mapping["audio_format"] = map[string]any{"content_type": contentType}
 	}
 	return []map[string]any{mapping}
+}
+
+func (a *DirectAdapter) Resume() error {
+	qid, err := a.resolveQueueID()
+	if err != nil {
+		return err
+	}
+	return a.callMA("player_queues/play", map[string]any{
+		"queue_id": qid,
+	})
 }
 
 func (a *DirectAdapter) Stop() error {
@@ -148,6 +173,17 @@ func (a *DirectAdapter) Pause() error {
 	}
 	return a.callMA("player_queues/pause", map[string]any{
 		"queue_id": qid,
+	})
+}
+
+func (a *DirectAdapter) Seek(position time.Duration) error {
+	qid, err := a.resolveQueueID()
+	if err != nil {
+		return err
+	}
+	return a.callMA("player_queues/seek", map[string]any{
+		"queue_id": qid,
+		"position": int(position.Seconds()),
 	})
 }
 

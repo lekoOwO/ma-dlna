@@ -36,9 +36,9 @@ Therefore, the bridge should act as a controlled media ingest and re-publishing 
    * `Play`
    * `Stop`
    * `Pause` if practical
-3. Ingest the DLNA-provided source URI using ffmpeg.
-4. Publish a stable local HTTP live stream URL from the bridge.
-5. Call Music Assistant directly, or Home Assistant as a legacy compatibility path, to play the bridge stream URL on a configured MA player or group.
+3. In direct MA mode, pass the DLNA-provided source URI to MA; in HA-service mode, ingest it using ffmpeg.
+4. Publish a stable local HTTP live stream URL from the bridge only for HA-service mode.
+5. Call Music Assistant directly with the controller source URL, or Home Assistant as a legacy compatibility path with the bridge stream URL, on a configured MA player or group.
 6. Support common audio sources with minimal configuration.
 7. Work well in Docker / HA add-on style deployment with host networking.
 
@@ -100,7 +100,8 @@ DLNA-MA Bridge Session Manager
         ↓
 ffmpeg ingest/transcode process
         ↓
-Bridge HTTP live stream endpoint
+Bridge HTTP live stream endpoint for HA-service mode,
+or original source URL for direct MA mode
         ↓
 Music Assistant direct API / Home Assistant play_media call
         ↓
@@ -344,7 +345,7 @@ Behavior:
 
 The preferred control path is Music Assistant's direct HTTP API. The legacy Home Assistant service path remains available for deployments that cannot expose MA's API to the bridge.
 
-Direct MA mode calls `/api` with commands such as `player_queues/play_media`, `player_queues/pause`, `player_queues/stop`, `player_queues/get_active_queue`, and `players/cmd/volume_set`. The bridge sends a metadata-bearing MA track object backed by the bridge stream URL, so MA can display the controller-provided title/artist instead of deriving a name from `/live/<session-id>.<ext>`.
+Direct MA mode calls `/api` with commands such as `player_queues/play_media`, `player_queues/pause`, `player_queues/stop`, `player_queues/get_active_queue`, `player_queues/seek`, and `players/cmd/volume_set`. The bridge sends a metadata-bearing MA track object backed by the original controller source URL, so MA handles fetching, buffering, grouping, and synchronization without a bridge ffmpeg `/live` hop.
 
 Direct MA config:
 
@@ -410,7 +411,7 @@ Best effort parsing:
 * resource protocolInfo
 * source MIME type if present
 
-Metadata is used for logging, UPnP responses, and direct MA API playback payloads. It is not required for HA-service playback success.
+Metadata is used for logging, UPnP responses, source MIME detection, and direct MA API playback payloads. It is not required for HA-service playback success.
 
 ### 8.7 Volume Handling
 

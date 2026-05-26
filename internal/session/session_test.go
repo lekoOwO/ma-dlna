@@ -538,6 +538,13 @@ func TestDIDLDurationParsing(t *testing.T) {
 	}
 }
 
+func TestDIDLProtocolInfoContentTypeParsing(t *testing.T) {
+	md := parseDIDL(`<item><title>Test</title><res protocolInfo="http-get:*:audio/mpeg:*" duration="00:03:45">http://example.com/stream</res></item>`)
+	if md.ContentType != "audio/mpeg" {
+		t.Errorf("expected content type 'audio/mpeg', got %q", md.ContentType)
+	}
+}
+
 func TestSeekPlayingTransitionsToStarting(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(&cfg, stream.NewStreamer(&cfg))

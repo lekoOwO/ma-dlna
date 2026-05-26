@@ -1,6 +1,7 @@
 package upnp
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -578,6 +579,154 @@ func TestPlaybackActions(t *testing.T) {
 	}
 	waitForHACall(t, haCalls, "media_pause")
 	t.Logf("Pause ok: session state=%s", s2.State)
+}
+
+func TestDirectModePlayUsesSourceURLAndDoesNotStartFFmpeg(t *testing.T) {
+	type maRequest struct {
+		Command string
+		Body    string
+	}
+	maCalls := make(chan maRequest, 8)
+	maServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Errorf("decode MA payload: %v", err)
+		}
+		command, _ := payload["command"].(string)
+		maCalls <- maRequest{Command: command, Body: string(body)}
+
+		switch command {
+		case "player_queues/get_active_queue":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"result":{"queue_id":"queue123","state":"idle"}}`))
+		case "player_queues/play_media":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case "player_queues/seek":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		default:
+			t.Errorf("unexpected MA command: %s", command)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer maServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.MAAdapter.Mode = "direct"
+	cfg.MusicAssistant.URL = maServer.URL
+	cfg.MusicAssistant.TargetPlayerID = "player123"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+
+	tmp := t.TempDir()
+	ffmpegMarker := filepath.Join(tmp, "ffmpeg-started")
+	ffmpegPath := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\necho started > "+ffmpegMarker+"\nexec sleep 3600\n"), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	cfg.FFmpeg.Binary = ffmpegPath
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3?token=source"
+	metadata := "<DIDL-Lite><item><title>Direct Song</title><res protocolInfo=\"http-get:*:audio/mpeg:*\" duration=\"00:03:00\">" + sourceURL + "</res></item></DIDL-Lite>"
+	body := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData>"+escapeXMLText(metadata)+"</CurrentURIMetaData>")
+
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SetAVTransportURI expected 200, got %d", resp.StatusCode)
+	}
+
+	sessions := sm.AllSessions()
+	if len(sessions) == 0 {
+		t.Fatal("no session created")
+	}
+	s := sessions[len(sessions)-1]
+
+	body = soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
+	}
+
+	var playBody string
+	deadline := time.After(2 * time.Second)
+	for playBody == "" {
+		select {
+		case call := <-maCalls:
+			if call.Command == "player_queues/play_media" {
+				playBody = call.Body
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for MA play_media")
+		}
+	}
+
+	if !strings.Contains(playBody, sourceURL) {
+		t.Fatalf("direct play_media should contain source URL, got: %s", playBody)
+	}
+	if strings.Contains(playBody, s.StreamURL) {
+		t.Fatalf("direct play_media must not contain bridge stream URL %s; payload: %s", s.StreamURL, playBody)
+	}
+	if streamer.IsRunning(s.ID) {
+		t.Fatal("direct mode must not start ffmpeg bridge stream")
+	}
+	if _, err := os.Stat(ffmpegMarker); err == nil {
+		t.Fatal("direct mode executed ffmpeg")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat ffmpeg marker: %v", err)
+	}
+
+	waitForSessionState(t, sm, s.ID, session.StatePlaying)
+
+	seekBody := soapEnvelope("AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:00</Target>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(seekBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Seek expected 200, got %d", resp.StatusCode)
+	}
+
+	var seekBodyRaw string
+	deadline = time.After(2 * time.Second)
+	for seekBodyRaw == "" {
+		select {
+		case call := <-maCalls:
+			if call.Command == "player_queues/seek" {
+				seekBodyRaw = call.Body
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for MA seek")
+		}
+	}
+	if !strings.Contains(seekBodyRaw, `"position":0`) {
+		t.Fatalf("direct seek should send position 0, got: %s", seekBodyRaw)
+	}
 }
 
 // TestVolumeControl validates RenderingControl volume/mute actions.

@@ -25,9 +25,12 @@ type PlayerStatus struct {
 // PlayerClient is the interface for controlling a media player backend.
 type PlayerClient interface {
 	Target() string
+	RequiresBridgeStream() bool
 	PlayMedia(req PlayRequest) error
+	Resume() error
 	Stop() error
 	Pause() error
+	Seek(position time.Duration) error
 	SetVolume(volume int) error
 	GetState() (string, error)
 	GetStatus() (PlayerStatus, error)
@@ -74,6 +77,10 @@ func (a *HAAdapter) Target() string {
 	return a.cfg.HA.TargetEntityID
 }
 
+func (a *HAAdapter) RequiresBridgeStream() bool {
+	return true
+}
+
 func (a *HAAdapter) PlayMedia(req PlayRequest) error {
 	targetEntity := a.cfg.HA.TargetEntityID
 	contentID := req.StreamURL
@@ -115,6 +122,10 @@ func (a *HAAdapter) PlayMedia(req PlayRequest) error {
 	return fmt.Errorf("no play service configured")
 }
 
+func (a *HAAdapter) Resume() error {
+	return nil
+}
+
 func (a *HAAdapter) Stop() error {
 	return a.callHAService(a.cfg.MAAdapter.StopService, map[string]any{
 		"entity_id": a.cfg.HA.TargetEntityID,
@@ -125,6 +136,10 @@ func (a *HAAdapter) Pause() error {
 	return a.callHAService(a.cfg.MAAdapter.PauseService, map[string]any{
 		"entity_id": a.cfg.HA.TargetEntityID,
 	})
+}
+
+func (a *HAAdapter) Seek(position time.Duration) error {
+	return nil
 }
 
 func (a *HAAdapter) SetVolume(volume int) error {

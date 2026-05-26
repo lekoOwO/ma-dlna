@@ -138,6 +138,60 @@ func TestDirectPlayMediaPayload(t *testing.T) {
 	}
 }
 
+func TestDirectPlayMediaUsesSourceURLWhenPresent(t *testing.T) {
+	cfg := directCfg()
+	sourceURL := "http://source.local/path/song.mp3?token=source"
+	streamURL := "http://bridge:8787/live/test.ogg?token=bridge"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+
+		switch body["command"] {
+		case "player_queues/get_active_queue":
+			w.Write([]byte(`{"result":{"queue_id":"group123","state":"idle"}}`))
+			return
+		case "player_queues/play_media":
+		default:
+			t.Errorf("unexpected command: %v", body["command"])
+		}
+
+		args, _ := body["args"].(map[string]any)
+		media, _ := args["media"].(map[string]any)
+		if media["item_id"] != sourceURL {
+			t.Fatalf("direct mode should send source URL as item_id, got %v", media["item_id"])
+		}
+
+		pms := media["provider_mappings"].([]any)
+		pm := pms[0].(map[string]any)
+		if pm["item_id"] != sourceURL {
+			t.Fatalf("direct mode provider mapping should use source URL, got %v", pm["item_id"])
+		}
+		if pm["url"] != sourceURL {
+			t.Fatalf("direct mode provider mapping url should use source URL, got %v", pm["url"])
+		}
+		if media["item_id"] == streamURL || pm["item_id"] == streamURL {
+			t.Fatal("direct mode must not send bridge stream URL to MA when source URL is available")
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	adapter := directAdapter(&cfg, server.URL)
+
+	err := adapter.PlayMedia(PlayRequest{
+		StreamURL:   streamURL,
+		SourceURL:   sourceURL,
+		ContentType: "audio/mpeg",
+		Title:       "Test Song",
+	})
+	if err != nil {
+		t.Fatalf("PlayMedia failed: %v", err)
+	}
+}
+
 func TestDirectPlayMedia_NoToken(t *testing.T) {
 	cfg := directCfg()
 	cfg.MusicAssistant.Token = ""
@@ -310,6 +364,67 @@ func TestDirectPause(t *testing.T) {
 	adapter := directAdapter(&cfg, server.URL)
 	if err := adapter.Pause(); err != nil {
 		t.Fatalf("Pause failed: %v", err)
+	}
+}
+
+func TestDirectResume(t *testing.T) {
+	cfg := directCfg()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		switch body["command"] {
+		case "player_queues/get_active_queue":
+			w.Write([]byte(`{"result":{"queue_id":"group123","state":"paused"}}`))
+			return
+		case "player_queues/play":
+		default:
+			t.Errorf("unexpected command: %v", body["command"])
+		}
+		args, _ := body["args"].(map[string]any)
+		if args["queue_id"] != "group123" {
+			t.Errorf("unexpected queue_id: %v", args["queue_id"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	adapter := directAdapter(&cfg, server.URL)
+	if err := adapter.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+}
+
+func TestDirectSeek(t *testing.T) {
+	cfg := directCfg()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		switch body["command"] {
+		case "player_queues/get_active_queue":
+			w.Write([]byte(`{"result":{"queue_id":"group123","state":"playing"}}`))
+			return
+		case "player_queues/seek":
+		default:
+			t.Errorf("unexpected command: %v", body["command"])
+		}
+		args, _ := body["args"].(map[string]any)
+		if args["queue_id"] != "group123" {
+			t.Errorf("unexpected queue_id: %v", args["queue_id"])
+		}
+		if args["position"].(float64) != 42 {
+			t.Errorf("unexpected seek position: %v", args["position"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	adapter := directAdapter(&cfg, server.URL)
+	if err := adapter.Seek(42 * time.Second); err != nil {
+		t.Fatalf("Seek failed: %v", err)
 	}
 }
 
