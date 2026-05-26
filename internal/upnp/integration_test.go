@@ -1300,6 +1300,92 @@ func TestLatePlayMediaErrorAfterStopDoesNotSetSessionError(t *testing.T) {
 	}
 }
 
+func TestStartupSeekZeroDoesNotRestartStreamOrReplayMedia(t *testing.T) {
+	var playCalls atomic.Int32
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "play_media") {
+			playCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"success": true}]`))
+	}))
+	defer haServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	cfg.Security.AllowedSourceCIDRs = append(cfg.Security.AllowedSourceCIDRs, "127.0.0.0/8")
+	cfg.HA.URL = haServer.URL
+	cfg.HA.Token = "test-token"
+	cfg.HA.TargetEntityID = "media_player.test"
+	cfg.Server.PublicBaseURL = "http://bridge:8787"
+	cfg.UPnP.AutoBaseURL = false
+	cfg.FFmpeg.Binary = writeSleepFFmpeg(t)
+
+	streamer := stream.NewStreamer(&cfg)
+	sm := session.NewManager(&cfg, streamer)
+	ma := maadapter.New(&cfg)
+	h := NewHandler(&cfg, sm, ma)
+	streamer.SetTokenValidator(sm.ValidateToken)
+
+	mux := http.NewServeMux()
+	h.RegisterUPnPEndpoints(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	setBody := soapEnvelope("AVTransport", "SetAVTransportURI",
+		"<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	resp, err := http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(setBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SetAVTransportURI expected 200, got %d", resp.StatusCode)
+	}
+
+	sessions := sm.AllSessions()
+	if len(sessions) == 0 {
+		t.Fatal("No session created")
+	}
+	sessionID := sessions[0].ID
+
+	playBody := soapEnvelope("AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(playBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Play expected 200, got %d", resp.StatusCode)
+	}
+	genBefore := sm.CurrentGenID(sessionID)
+	if genBefore == 0 {
+		t.Fatal("expected stream generation after Play")
+	}
+
+	seekBody := soapEnvelope("AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:00</Target>")
+	resp, err = http.Post(ts.URL+"/avtransport/control", "text/xml", strings.NewReader(seekBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("startup Seek(0) expected 200, got %d", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && playCalls.Load() < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := playCalls.Load(); got != 1 {
+		t.Fatalf("startup Seek(0) should not issue another play_media call, got %d calls", got)
+	}
+	if genAfter := sm.CurrentGenID(sessionID); genAfter != genBefore {
+		t.Fatalf("startup Seek(0) should not restart stream generation: before=%d after=%d", genBefore, genAfter)
+	}
+}
+
 // TestMultipleSetAVTransportURIPlaysLastURI verifies that when a controller
 // sends SetAVTransportURI twice then Play, it plays the LAST URI.
 func TestMultipleSetAVTransportURIPlaysLastURI(t *testing.T) {

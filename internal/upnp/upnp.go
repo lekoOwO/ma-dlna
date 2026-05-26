@@ -161,6 +161,9 @@ func (d *idleDebounce) update(haState string, now time.Time) (shouldStop bool, e
 		d.wasPlaying = true
 		d.idleSince = time.Time{}
 	case "idle", "off", "standby":
+		if !d.wasPlaying {
+			return false, ""
+		}
 		if d.idleSince.IsZero() {
 			d.idleSince = now
 			return false, ""
@@ -203,7 +206,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
-		debounce := &idleDebounce{wasPlaying: true}
+		debounce := &idleDebounce{}
 
 		for {
 			select {
@@ -1434,6 +1437,13 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
+		}
+		elapsed := h.sessionMgr.Elapsed(active.ID)
+		if active.State == session.StateStarting && offset == 0 && elapsed < 1*time.Second {
+			slog.Debug("Seek ignored: no-op startup seek to 00:00:00", "session_id", active.ID, "elapsed", elapsed)
+			response = avTransportResponse(action, fmt.Sprintf(`
+		<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+			break
 		}
 		slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
 		wasPaused := active.State == session.StatePaused

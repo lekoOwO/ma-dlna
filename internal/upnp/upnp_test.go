@@ -921,6 +921,83 @@ func TestIdleDebounceNonEndedStateResetsIdle(t *testing.T) {
 	}
 }
 
+func TestIdleDebounceBeforePlayingDoesNotStop(t *testing.T) {
+	d := &idleDebounce{}
+	now := time.Now()
+
+	shouldStop, event := d.update("idle", now)
+	if shouldStop {
+		t.Error("idle before playing should not stop")
+	}
+	if event != "" {
+		t.Errorf("idle before playing should not emit event, got %q", event)
+	}
+	if !d.idleSince.IsZero() {
+		t.Error("idleSince should remain zero when wasPlaying is false")
+	}
+
+	shouldStop, event = d.update("idle", now.Add(5*time.Second))
+	if shouldStop {
+		t.Error("idle before playing should not stop at 5s")
+	}
+	if event != "" {
+		t.Errorf("idle before playing should not emit at 5s, got %q", event)
+	}
+
+	shouldStop, event = d.update("idle", now.Add(10*time.Second))
+	if shouldStop {
+		t.Error("idle before playing should not stop even after 10s")
+	}
+	if event != "" {
+		t.Errorf("idle before playing should not emit STOPPED, got %q", event)
+	}
+
+	shouldStop, event = d.update("idle", now.Add(30*time.Second))
+	if shouldStop {
+		t.Error("idle before playing should not stop even after 30s")
+	}
+	if event != "" {
+		t.Errorf("idle before playing should not emit at 30s, got %q", event)
+	}
+}
+
+func TestIdleDebounceAfterPlayingStopsAfterDebounce(t *testing.T) {
+	d := &idleDebounce{}
+	now := time.Now()
+
+	shouldStop, _ := d.update("idle", now)
+	if shouldStop {
+		t.Error("idle before playing should not stop")
+	}
+
+	shouldStop, _ = d.update("playing", now.Add(1*time.Second))
+	if shouldStop {
+		t.Error("playing should not stop")
+	}
+	if !d.wasPlaying {
+		t.Error("playing should set wasPlaying=true")
+	}
+
+	shouldStop, event := d.update("idle", now.Add(2*time.Second))
+	if shouldStop {
+		t.Error("first idle after playing should not stop")
+	}
+	if event != "" {
+		t.Errorf("first idle after playing should not emit, got %q", event)
+	}
+	if d.idleSince.IsZero() {
+		t.Error("first idle after playing should set idleSince")
+	}
+
+	shouldStop, event = d.update("idle", now.Add(12*time.Second))
+	if !shouldStop {
+		t.Error("idle after playing past debounce should stop")
+	}
+	if event != "STOPPED" {
+		t.Errorf("expected STOPPED, got %q", event)
+	}
+}
+
 func TestUUIDUSNNormalization(t *testing.T) {
 	tests := []struct {
 		input    string
