@@ -4,7 +4,9 @@ import (
 	"encoding/xml"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -935,5 +937,167 @@ func TestUUIDUSNNormalization(t *testing.T) {
 		if got != tc.expected {
 			t.Errorf("uuidUSN(%q) = %q, want %q", tc.input, got, tc.expected)
 		}
+	}
+}
+
+func TestNotifySubscribersSerializesPerSubscriberDelivery(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	done := make(chan struct{}, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seq := r.Header.Get("SEQ")
+		if seq == "1" {
+			time.Sleep(100 * time.Millisecond)
+		}
+		mu.Lock()
+		order = append(order, seq)
+		n := len(order)
+		mu.Unlock()
+		if n >= 2 {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	}))
+	defer srv.Close()
+
+	h := &Handler{
+		deviceUUID: "uuid:test-order",
+		subscribers: map[string]*eventSubscriber{
+			"uuid:ordered": {
+				sid:       "uuid:ordered",
+				callback:  "<" + srv.URL + ">",
+				service:   "AVTransport",
+				seq:       0,
+				expiresAt: time.Now().Add(time.Hour),
+			},
+		},
+	}
+
+	h.notifySubscribers("AVTransport", avTransportLastChange("STOPPED"))
+	h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for two callback requests")
+	}
+
+	mu.Lock()
+	got := order
+	mu.Unlock()
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 deliveries, got %d: %v", len(got), got)
+	}
+	for i, want := range []string{"1", "2"} {
+		if got[i] != want {
+			t.Errorf("position %d: expected SEQ %q, got %q. Order: %v", i, want, got[i], got)
+		}
+	}
+}
+
+func TestEventSubscriberExpiryRemovesSubscriber(t *testing.T) {
+	h := &Handler{
+		subscribers: make(map[string]*eventSubscriber),
+	}
+	sub := &eventSubscriber{
+		sid:       "uuid:expire",
+		callback:  "<http://127.0.0.1:1/callback>",
+		service:   "AVTransport",
+		expiresAt: time.Now().Add(20 * time.Millisecond),
+	}
+
+	h.mu.Lock()
+	h.subscribers[sub.sid] = sub
+	h.enqueueSubscriberDeliveryLocked(sub, eventDelivery{
+		callback: sub.callback,
+		sid:      sub.sid,
+		service:  sub.service,
+		seq:      1,
+		body:     "<event/>",
+	})
+	h.scheduleExpiryLocked(sub, sub.sid)
+	h.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.RLock()
+		_, exists := h.subscribers[sub.sid]
+		h.mu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	h.mu.RLock()
+	_, exists := h.subscribers[sub.sid]
+	h.mu.RUnlock()
+	if exists {
+		t.Fatal("expired subscriber was not removed")
+	}
+	sub.queueMu.Lock()
+	closed := sub.closed
+	sub.queueMu.Unlock()
+	if !closed {
+		t.Fatal("expired subscriber queue was not closed")
+	}
+}
+
+func TestSubscribeInitialEventPrecedesStateChange(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	done := make(chan struct{}, 1)
+
+	cbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		order = append(order, r.Header.Get("SEQ"))
+		n := len(order)
+		mu.Unlock()
+		if n >= 2 {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cbServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Security.AllowLoopbackSources = true
+	h := NewHandler(&cfg, nil, nil)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("SUBSCRIBE", "/avtransport/event", nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+	r.Header.Set("CALLBACK", "<"+cbServer.URL+">")
+	r.Header.Set("NT", "upnp:event")
+	r.Header.Set("TIMEOUT", "Second-1800")
+
+	h.serveEvent(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("SUBSCRIBE returned %d", w.Code)
+	}
+
+	h.notifySubscribers("AVTransport", avTransportLastChange("PLAYING"))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial and state-change events")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 deliveries, got %d: %v", len(got), got)
+	}
+	if got[0] != "0" || got[1] != "1" {
+		t.Fatalf("expected SEQ order [0 1], got %v", got)
 	}
 }

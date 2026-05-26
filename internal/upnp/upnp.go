@@ -47,6 +47,16 @@ func uuidUSN(id string) string {
 	return "uuid:" + id
 }
 
+type eventDelivery struct {
+	callback   string
+	callbackIP string
+	sid        string
+	service    string
+	seq        int
+	body       string
+	release    <-chan struct{}
+}
+
 type eventSubscriber struct {
 	sid        string
 	callback   string
@@ -54,6 +64,14 @@ type eventSubscriber struct {
 	service    string
 	seq        int
 	expiresAt  time.Time
+
+	queueMu       sync.Mutex
+	queueCond     *sync.Cond
+	queue         []eventDelivery
+	closed        bool
+	workerStarted bool
+
+	expiryTimer *time.Timer
 }
 
 type Handler struct {
@@ -97,6 +115,7 @@ func (h *Handler) Stop() {
 		h.ssdpCancel()
 	}
 	h.stopPlaybackMonitor()
+	h.closeAllSubscribers()
 	slog.Info("UPnP handler stopped")
 }
 
@@ -741,6 +760,7 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 			sub, ok := h.subscribers[sid]
 			if ok {
 				sub.expiresAt = time.Now().Add(1800 * time.Second)
+				h.scheduleExpiryLocked(sub, sid)
 			}
 			h.mu.Unlock()
 			if !ok {
@@ -764,22 +784,35 @@ func (h *Handler) serveEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid CALLBACK", http.StatusPreconditionFailed)
 			return
 		}
+		release := make(chan struct{})
+		if h.subscribers != nil {
+			h.mu.Lock()
+			body := h.initialEventBodyLocked(svc)
+			sub := &eventSubscriber{sid: sid, callback: cb, callbackIP: pinIP, service: svc, expiresAt: time.Now().Add(1800 * time.Second)}
+			h.subscribers[sid] = sub
+			h.enqueueSubscriberDeliveryLocked(sub, eventDelivery{
+				callback: cb, callbackIP: pinIP, sid: sid,
+				service: svc, seq: 0, body: body, release: release,
+			})
+			h.scheduleExpiryLocked(sub, sid)
+			h.mu.Unlock()
+		}
 		w.Header().Set("SID", sid)
 		w.Header().Set("TIMEOUT", "Second-1800")
 		w.Header().Set("SERVER", serverString())
 		w.WriteHeader(http.StatusOK)
-
-		if h.subscribers != nil {
-			h.mu.Lock()
-			h.subscribers[sid] = &eventSubscriber{sid: sid, callback: cb, callbackIP: pinIP, service: svc, expiresAt: time.Now().Add(1800 * time.Second)}
-			h.mu.Unlock()
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
 		}
-		go h.sendInitialEvent(cb, pinIP, sid, svc)
+		close(release)
 
 	case "UNSUBSCRIBE":
 		sid := r.Header.Get("SID")
 		if h.subscribers != nil {
 			h.mu.Lock()
+			if sub, ok := h.subscribers[sid]; ok {
+				h.closeSubscriberLocked(sub)
+			}
 			delete(h.subscribers, sid)
 			h.mu.Unlock()
 		}
@@ -852,16 +885,13 @@ func (h *Handler) validateCallback(callback string, remoteAddr string) (string, 
 	return pinIP, nil
 }
 
-func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
-	urls := extractCallbackURLs(callback)
+func (h *Handler) sendEventDelivery(ed eventDelivery) {
+	urls := extractCallbackURLs(ed.callback)
 	if len(urls) == 0 {
 		return
 	}
-
-	body := h.initialEventBody(service)
-
 	for _, u := range urls {
-		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
+		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(ed.body))
 		if err != nil {
 			slog.Debug("Event NOTIFY create failed", "url", safeURL(u), "error", err)
 			continue
@@ -873,16 +903,16 @@ func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
 		req.Header.Set("Content-Type", "text/xml; charset=utf-8")
 		req.Header.Set("NT", "upnp:event")
 		req.Header.Set("NTS", "upnp:propchange")
-		req.Header.Set("SID", sid)
-		req.Header.Set("SEQ", "0")
+		req.Header.Set("SID", ed.sid)
+		req.Header.Set("SEQ", fmt.Sprintf("%d", ed.seq))
 		req.Header.Set("SERVER", serverString())
 
 		transport := &http.Transport{
 			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if pinIP != "" {
+				if ed.callbackIP != "" {
 					_, port, _ := net.SplitHostPort(addr)
-					addr = net.JoinHostPort(pinIP, port)
+					addr = net.JoinHostPort(ed.callbackIP, port)
 				}
 				d := &net.Dialer{Timeout: 5 * time.Second}
 				return d.DialContext(ctx, network, addr)
@@ -901,35 +931,157 @@ func (h *Handler) sendInitialEvent(callback, pinIP, sid, service string) {
 			continue
 		}
 		resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			slog.Debug("Initial event sent", "url", safeURL(u), "sid", sid, "status", resp.StatusCode)
+		if ed.seq == 0 {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				slog.Debug("Initial event sent", "url", safeURL(u), "sid", ed.sid, "status", resp.StatusCode)
+			} else {
+				slog.Warn("Event NOTIFY rejected", "url", safeURL(u), "sid", ed.sid, "status", resp.StatusCode)
+			}
 		} else {
-			slog.Warn("Event NOTIFY rejected", "url", safeURL(u), "sid", sid, "status", resp.StatusCode)
+			slog.Debug("State change NOTIFY sent", "service", ed.service, "url", safeURL(u), "seq", ed.seq)
 		}
 	}
 }
 
+func (h *Handler) ensureWorkerLocked(sub *eventSubscriber, sid string) {
+	if sub.workerStarted {
+		return
+	}
+	if sub.queueCond == nil {
+		sub.queueCond = sync.NewCond(&sub.queueMu)
+	}
+	sub.workerStarted = true
+	go h.runSubscriberWorker(sub, sid)
+}
+
+func (h *Handler) enqueueSubscriberDeliveryLocked(sub *eventSubscriber, ed eventDelivery) {
+	h.ensureWorkerLocked(sub, sub.sid)
+	sub.queueMu.Lock()
+	if !sub.closed {
+		sub.queue = append(sub.queue, ed)
+		sub.queueCond.Signal()
+	}
+	sub.queueMu.Unlock()
+}
+
+func (h *Handler) runSubscriberWorker(sub *eventSubscriber, sid string) {
+	for {
+		sub.queueMu.Lock()
+		for len(sub.queue) == 0 && !sub.closed {
+			sub.queueCond.Wait()
+		}
+		if sub.closed {
+			sub.queueMu.Unlock()
+			return
+		}
+		ed := sub.queue[0]
+		sub.queue[0] = eventDelivery{}
+		sub.queue = sub.queue[1:]
+		if len(sub.queue) == 0 {
+			sub.queue = nil
+		}
+		sub.queueMu.Unlock()
+
+		if ed.release != nil {
+			<-ed.release
+		}
+		sub.queueMu.Lock()
+		closed := sub.closed
+		sub.queueMu.Unlock()
+		if closed {
+			return
+		}
+		h.sendEventDelivery(ed)
+	}
+}
+
+func (h *Handler) closeSubscriberLocked(sub *eventSubscriber) {
+	sub.queueMu.Lock()
+	if sub.closed {
+		sub.queueMu.Unlock()
+		return
+	}
+	sub.closed = true
+	sub.queue = nil
+	if sub.expiryTimer != nil {
+		sub.expiryTimer.Stop()
+		sub.expiryTimer = nil
+	}
+	if sub.queueCond != nil {
+		sub.queueCond.Broadcast()
+	}
+	sub.queueMu.Unlock()
+}
+
+func (h *Handler) scheduleExpiryLocked(sub *eventSubscriber, sid string) {
+	if sub.expiryTimer != nil {
+		sub.expiryTimer.Stop()
+	}
+	d := time.Until(sub.expiresAt)
+	if d <= 0 {
+		d = time.Nanosecond
+	}
+	sub.expiryTimer = time.AfterFunc(d, func() {
+		h.expireSubscriber(sid)
+	})
+}
+
+func (h *Handler) expireSubscriber(sid string) {
+	h.mu.Lock()
+	sub, ok := h.subscribers[sid]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	if time.Now().Before(sub.expiresAt) {
+		h.scheduleExpiryLocked(sub, sid)
+		h.mu.Unlock()
+		return
+	}
+	h.closeSubscriberLocked(sub)
+	delete(h.subscribers, sid)
+	h.mu.Unlock()
+}
+
+func (h *Handler) closeAllSubscribers() {
+	if h.subscribers == nil {
+		return
+	}
+	h.mu.Lock()
+	for sid, sub := range h.subscribers {
+		h.closeSubscriberLocked(sub)
+		delete(h.subscribers, sid)
+	}
+	h.mu.Unlock()
+}
+
 func (h *Handler) initialEventBody(service string) string {
+	if service == "RenderingControl" {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+	}
+	return h.initialEventBodyLocked(service)
+}
+
+func (h *Handler) initialEventBodyLocked(service string) string {
 	switch service {
 	case "RenderingControl":
-		h.mu.RLock()
 		vol := h.volume
 		muted := h.muted
-		h.mu.RUnlock()
 		l := renderingControlLastChange(vol, muted)
 		return fmt.Sprintf(`<?xml version="1.0"?>
 	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-	  <e:property>
-	    <LastChange>%s</LastChange>
-	  </e:property>
-	</e:propertyset>`, escapeXML(l))
+  <e:property>
+    <LastChange>%s</LastChange>
+  </e:property>
+</e:propertyset>`, escapeXML(l))
 	case "ConnectionManager":
 		return `<?xml version="1.0"?>
-	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-	  <e:property>
-	    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/CM/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;SinkProtocolInfo val=&quot;http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/aac:*&quot;/&gt;&lt;SourceProtocolInfo val=&quot;&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
-	  </e:property>
-	</e:propertyset>`
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/CM/&quot;&gt;&lt;InstanceID val=&quot;0&quot;&gt;&lt;SinkProtocolInfo val=&quot;http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/wav:*,http-get:*:audio/flac:*,http-get:*:audio/aac:*&quot;/&gt;&lt;SourceProtocolInfo val=&quot;&quot;/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange>
+  </e:property>
+</e:propertyset>`
 	default:
 		var s *session.Session
 		if h.sessionMgr != nil {
@@ -954,11 +1106,11 @@ func (h *Handler) initialEventBody(service string) string {
 		}
 		l := avTransportLastChangeStatus(state, status)
 		return fmt.Sprintf(`<?xml version="1.0"?>
-	<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
-	  <e:property>
-	    <LastChange>%s</LastChange>
-	  </e:property>
-	</e:propertyset>`, escapeXML(l))
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>%s</LastChange>
+  </e:property>
+</e:propertyset>`, escapeXML(l))
 	}
 }
 
@@ -967,90 +1119,32 @@ func (h *Handler) notifySubscribers(service, lastChangeXML string) {
 		return
 	}
 	h.mu.Lock()
-	subs := make([]subSnapshot, 0)
 	now := time.Now()
-	for _, sub := range h.subscribers {
-		if now.After(sub.expiresAt) {
-			delete(h.subscribers, sub.sid)
-			continue
-		}
-		if sub.service == service {
-			sub.seq++
-			subs = append(subs, subSnapshot{
-				sid:        sub.sid,
-				callback:   sub.callback,
-				callbackIP: sub.callbackIP,
-				service:    sub.service,
-				seq:        sub.seq,
-			})
-		}
-	}
-	h.mu.Unlock()
-
-	for _, s := range subs {
-		go h.sendStateChange(s, lastChangeXML)
-	}
-}
-
-type subSnapshot struct {
-	sid        string
-	callback   string
-	callbackIP string
-	service    string
-	seq        int
-}
-
-func (h *Handler) sendStateChange(snap subSnapshot, lastChangeXML string) {
 	body := fmt.Sprintf(`<?xml version="1.0"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>
     <LastChange>%s</LastChange>
   </e:property>
 </e:propertyset>`, escapeXML(lastChangeXML))
-
-	for _, u := range extractCallbackURLs(snap.callback) {
-		req, err := http.NewRequest("NOTIFY", u, strings.NewReader(body))
-		if err != nil {
-			slog.Debug("Event NOTIFY create failed", "url", safeURL(u), "error", err)
+	for _, sub := range h.subscribers {
+		if now.After(sub.expiresAt) {
+			h.closeSubscriberLocked(sub)
+			delete(h.subscribers, sub.sid)
 			continue
 		}
-		parsed, _ := neturl.Parse(u)
-		if parsed != nil {
-			req.Host = parsed.Host
+		if sub.service == service {
+			sub.seq++
+			h.enqueueSubscriberDeliveryLocked(sub, eventDelivery{
+				callback:   sub.callback,
+				callbackIP: sub.callbackIP,
+				sid:        sub.sid,
+				service:    sub.service,
+				seq:        sub.seq,
+				body:       body,
+			})
 		}
-		req.Header.Set("Content-Type", "text/xml; charset=utf-8")
-		req.Header.Set("NT", "upnp:event")
-		req.Header.Set("NTS", "upnp:propchange")
-		req.Header.Set("SID", snap.sid)
-		req.Header.Set("SEQ", fmt.Sprintf("%d", snap.seq))
-		req.Header.Set("SERVER", serverString())
-
-		transport := &http.Transport{
-			DisableKeepAlives: true,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if snap.callbackIP != "" {
-					_, port, _ := net.SplitHostPort(addr)
-					addr = net.JoinHostPort(snap.callbackIP, port)
-				}
-				d := &net.Dialer{Timeout: 5 * time.Second}
-				return d.DialContext(ctx, network, addr)
-			},
-		}
-		client := &http.Client{
-			Transport: transport,
-			Timeout:   5 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			slog.Warn("State change NOTIFY error", "url", safeURL(u), "error", err)
-			continue
-		}
-		resp.Body.Close()
-		slog.Debug("State change NOTIFY sent", "service", snap.service, "url", safeURL(u), "seq", snap.seq)
 	}
+	h.mu.Unlock()
 }
 
 func avTransportLastChange(state string) string {
