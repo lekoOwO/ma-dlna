@@ -137,7 +137,7 @@ func TestPauseResumePosition(t *testing.T) {
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	strm.SetTokenValidator(sm.ValidateToken)
-	strm.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+	strm.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)
@@ -239,7 +239,7 @@ func TestSeekRepositions(t *testing.T) {
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	strm.SetTokenValidator(sm.ValidateToken)
-	strm.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+	strm.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)
@@ -311,7 +311,7 @@ func TestDLNAClientFullSession(t *testing.T) {
 	ma := maadapter.New(&cfg)
 	h := NewHandler(&cfg, sm, ma)
 	strm.SetTokenValidator(sm.ValidateToken)
-	strm.SetFirstClientCallback(func(id string) { sm.SetPlaying(id) })
+	strm.SetFirstClientCallback(func(id string, _ uint64) { sm.SetPlaying(id) })
 
 	mux := http.NewServeMux()
 	h.RegisterUPnPEndpoints(mux)

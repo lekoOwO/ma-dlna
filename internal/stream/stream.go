@@ -21,7 +21,7 @@ import (
 
 type TokenValidator func(sessionID, token string) bool
 
-type FirstClientCallback func(sessionID string)
+type FirstClientCallback func(sessionID string, genID uint64)
 
 // ErrorCallback receives the generation ID so the receiver can verify the error
 // is from the current generation before acting on it.
@@ -592,7 +592,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gen.firstClientOnce.Do(func() {
 		close(gen.firstClient)
 		if s.firstClientCB != nil {
-			s.firstClientCB(sessionID)
+			s.firstClientCB(sessionID, gen.genID)
 		}
 	})
 

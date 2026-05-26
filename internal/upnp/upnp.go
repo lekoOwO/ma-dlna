@@ -62,11 +62,12 @@ type Handler struct {
 	maAdapter         *maadapter.Adapter
 	mu                sync.RWMutex
 	rcMu              sync.Mutex
+	playbackMonMu     sync.Mutex
+	playbackMonCancel context.CancelFunc
 	volume            int
 	prevVolume        int
 	muted             bool
 	ssdpCancel        context.CancelFunc
-	playbackMonCancel context.CancelFunc
 	deviceUUID        string
 	subscribers       map[string]*eventSubscriber
 }
@@ -119,16 +120,23 @@ func (h *Handler) NotifyError(sessionID string) {
 // NotifyPlaying sends AVTransport LastChange when the first /live client connects,
 // meaning HA/MA has actually started consuming the stream. It also starts the
 // playback monitor to detect when HA/MA reports playback ended.
-func (h *Handler) NotifyPlaying(sessionID string) {
+func (h *Handler) NotifyPlaying(sessionID string, genID uint64) {
 	h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
-	h.startPlaybackMonitor(sessionID)
+	h.startPlaybackMonitor(sessionID, genID)
 }
 
 // startPlaybackMonitor polls HA/MA media_player state periodically and fires
 // STOPPED when the entity reports playback has ended (state != "playing").
 // This is the long-term replacement for relying on ffmpeg EOF as playback-ended.
-func (h *Handler) startPlaybackMonitor(sessionID string) {
-	h.stopPlaybackMonitor()
+func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
+	h.playbackMonMu.Lock()
+	defer h.playbackMonMu.Unlock()
+
+	if h.playbackMonCancel != nil {
+		h.playbackMonCancel()
+		h.playbackMonCancel = nil
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	h.playbackMonCancel = cancel
 
@@ -147,14 +155,20 @@ func (h *Handler) startPlaybackMonitor(sessionID string) {
 					slog.Debug("Playback monitor poll failed", "entity", h.cfg.HA.TargetEntityID, "error", err)
 					continue
 				}
-				if state == "playing" {
+				switch state {
+				case "playing":
 					wasPlaying = true
-				} else if wasPlaying && (state == "idle" || state == "off" || state == "paused" || state == "standby") {
-					slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
-					h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
-					// Mark the session stopped if it's still the current one
-					h.sessionMgr.MarkStoppedIfGeneration(sessionID, 0)
-					return
+				case "idle", "off", "standby":
+					if wasPlaying {
+						slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
+						h.sessionMgr.MarkStoppedIfGeneration(sessionID, genID)
+						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
+						return
+					}
+				case "paused":
+					if wasPlaying {
+						h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
+					}
 				}
 			}
 		}
@@ -162,16 +176,19 @@ func (h *Handler) startPlaybackMonitor(sessionID string) {
 }
 
 func (h *Handler) stopPlaybackMonitor() {
+	h.playbackMonMu.Lock()
+	defer h.playbackMonMu.Unlock()
 	if h.playbackMonCancel != nil {
 		h.playbackMonCancel()
 		h.playbackMonCancel = nil
 	}
 }
 
-// NotifyEnded sends AVTransport LastChange on natural stream end (EOF).
-func (h *Handler) NotifyEnded(sessionID string) {
-	h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
-}
+// NotifyDeliveryEnded is a no-op hook for ffmpeg EOF.
+// Playback-ended (STOPPED) is driven by the HA/MA playback monitor, not by
+// stream EOF, because HA/MA may still be playing buffered audio after
+// ffmpeg finishes delivering the stream.
+func (h *Handler) NotifyDeliveryEnded(sessionID string) {}
 
 func (h *Handler) activeSession() *session.Session {
 	return h.sessionMgr.CurrentSession()
@@ -1161,6 +1178,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 
 	case "GetPositionInfo":
 		relTime := "00:00:00"
+		dur := "00:00:00"
 		uri := ""
 		metadata := ""
 		if h.sessionMgr != nil {
@@ -1169,30 +1187,37 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				relTime = formatDurationUPnP(elapsed)
 				uri = escapeXML(active.SourceURI)
 				metadata = escapeXML(active.MetadataRaw)
+				if active.Metadata != nil && active.Metadata.Duration != "" {
+					dur = active.Metadata.Duration
+				}
 			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 	<u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
 	  <Track>1</Track>
-	  <TrackDuration>00:00:00</TrackDuration>
+	  <TrackDuration>%s</TrackDuration>
 	  <TrackMetaData>%s</TrackMetaData>
 	  <TrackURI>%s</TrackURI>
 	  <RelTime>%s</RelTime>
 	  <AbsTime>00:00:00</AbsTime>
 	  <RelCount>2147483647</RelCount>
 	  <AbsCount>2147483647</AbsCount>
-	</u:GetPositionInfoResponse>`, metadata, uri, relTime))
+	</u:GetPositionInfoResponse>`, dur, metadata, uri, relTime))
 	case "GetMediaInfo":
+		dur := "00:00:00"
 		uri := ""
 		metadata := ""
 		if s := h.activeSession(); s != nil {
 			uri = escapeXML(s.SourceURI)
 			metadata = escapeXML(s.MetadataRaw)
+			if s.Metadata != nil && s.Metadata.Duration != "" {
+				dur = s.Metadata.Duration
+			}
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 	<u:GetMediaInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
 	  <NrTracks>1</NrTracks>
-	  <MediaDuration>00:00:00</MediaDuration>
+	  <MediaDuration>%s</MediaDuration>
 	  <CurrentURI>%s</CurrentURI>
 	  <CurrentURIMetaData>%s</CurrentURIMetaData>
 	  <NextURI></NextURI>
@@ -1200,7 +1225,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 	  <PlayMedium>NETWORK</PlayMedium>
 	  <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
 	  <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
-	</u:GetMediaInfoResponse>`, uri, metadata))
+	</u:GetMediaInfoResponse>`, dur, uri, metadata))
 
 	case "Seek":
 		instanceID := extractSOAPField(body, "InstanceID")
