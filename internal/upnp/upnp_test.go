@@ -759,6 +759,166 @@ func TestByeByeMessageFields(t *testing.T) {
 	}
 }
 
+func TestIdleDebounceFirstIdleStartsTimer(t *testing.T) {
+	now := time.Now()
+	d := &idleDebounce{wasPlaying: true}
+
+	shouldStop, event := d.update("idle", now)
+	if shouldStop {
+		t.Error("first idle should not stop")
+	}
+	if event != "" {
+		t.Errorf("first idle should not emit event, got %q", event)
+	}
+	if d.idleSince.IsZero() {
+		t.Error("first idle should set idleSince")
+	}
+}
+
+func TestIdleDebounceBeforeDeadlineDoesNotStop(t *testing.T) {
+	d := &idleDebounce{wasPlaying: true}
+	now := time.Now()
+
+	// First idle starts timer
+	d.update("idle", now)
+
+	// 5 seconds later (before 10s debounce), still idle → should not stop
+	shouldStop, _ := d.update("idle", now.Add(5*time.Second))
+	if shouldStop {
+		t.Error("idle before debounce duration should not stop even after long monitor runtime")
+	}
+}
+
+func TestIdleDebounceAfterDeadlineStops(t *testing.T) {
+	d := &idleDebounce{wasPlaying: true}
+	now := time.Now()
+
+	// First idle starts timer
+	d.update("idle", now)
+
+	// 10 seconds later (at debounce duration), still idle → should stop
+	shouldStop, event := d.update("idle", now.Add(10*time.Second))
+	if !shouldStop {
+		t.Error("idle at debounce duration should stop")
+	}
+	if event != "STOPPED" {
+		t.Errorf("expected STOPPED event, got %q", event)
+	}
+}
+
+func TestIdleDebouncePlayingResetsIdle(t *testing.T) {
+	d := &idleDebounce{wasPlaying: true}
+	now := time.Now()
+
+	// First idle starts timer
+	d.update("idle", now)
+
+	// Then playing → resets idle tracking
+	shouldStop, _ := d.update("playing", now.Add(3*time.Second))
+	if shouldStop {
+		t.Error("playing should not stop")
+	}
+	if !d.idleSince.IsZero() {
+		t.Error("playing should reset idleSince")
+	}
+	if !d.wasPlaying {
+		t.Error("playing should set wasPlaying to true")
+	}
+
+	// Now idle again at much later time → starts fresh timer, does NOT stop immediately
+	later := now.Add(50 * time.Second)
+	shouldStop, _ = d.update("idle", later)
+	if shouldStop {
+		t.Error("first idle after playing should not stop immediately even after long monitor runtime")
+	}
+	if !d.idleSince.Equal(later) {
+		t.Errorf("idleSince should be %v, got %v", later, d.idleSince)
+	}
+}
+
+func TestIdleDebouncePausedResetsIdleAndEmitsOnce(t *testing.T) {
+	d := &idleDebounce{wasPlaying: true}
+	now := time.Now()
+
+	// First idle starts timer
+	d.update("idle", now)
+
+	// Paused resets idle tracking and emits PAUSED_PLAYBACK
+	shouldStop, event := d.update("paused", now.Add(3*time.Second))
+	if shouldStop {
+		t.Error("paused should not stop")
+	}
+	if event != "PAUSED_PLAYBACK" {
+		t.Errorf("expected PAUSED_PLAYBACK, got %q", event)
+	}
+	if !d.idleSince.IsZero() {
+		t.Error("paused should reset idleSince")
+	}
+
+	// Second paused should not re-emit
+	_, event = d.update("paused", now.Add(4*time.Second))
+	if event != "" {
+		t.Errorf("second paused should not emit, got %q", event)
+	}
+}
+
+func TestIdleDebounceOffAndStandbyBehaveLikeIdle(t *testing.T) {
+	now := time.Now()
+
+	for _, state := range []string{"off", "standby"} {
+		d2 := &idleDebounce{wasPlaying: true}
+		d2.update(state, now)
+		// Should start idle tracking
+		if d2.idleSince.IsZero() {
+			t.Errorf("%s should set idleSince", state)
+		}
+		// After debounce should stop
+		shouldStop, event := d2.update(state, now.Add(10*time.Second))
+		if !shouldStop {
+			t.Errorf("%s at debounce duration should stop", state)
+		}
+		if event != "STOPPED" {
+			t.Errorf("%s should emit STOPPED, got %q", state, event)
+		}
+	}
+}
+
+func TestIdleDebounceNonEndedStateResetsIdle(t *testing.T) {
+	now := time.Now()
+	d := &idleDebounce{wasPlaying: true}
+
+	// idle at t0 sets idleSince
+	d.update("idle", now)
+	if d.idleSince.IsZero() {
+		t.Fatal("first idle should set idleSince")
+	}
+
+	// buffering at t0+5 should reset idle tracking without emitting
+	shouldStop, event := d.update("buffering", now.Add(5*time.Second))
+	if shouldStop {
+		t.Error("buffering should not stop")
+	}
+	if event != "" {
+		t.Errorf("buffering should not emit event, got %q", event)
+	}
+	if !d.idleSince.IsZero() {
+		t.Error("buffering should reset idleSince")
+	}
+
+	// idle at t0+20 starts a fresh timer, must not stop immediately
+	shouldStop, event = d.update("idle", now.Add(20*time.Second))
+	if shouldStop {
+		t.Error("first idle after buffering should not stop (fresh timer)")
+	}
+	if event != "" {
+		t.Errorf("first idle after buffering should not emit, got %q", event)
+	}
+	// idleSince should be the new "now" (t0+20), not the original t0
+	if !d.idleSince.Equal(now.Add(20 * time.Second)) {
+		t.Errorf("idleSince should be t0+20, got %v", d.idleSince)
+	}
+}
+
 func TestUUIDUSNNormalization(t *testing.T) {
 	tests := []struct {
 		input    string

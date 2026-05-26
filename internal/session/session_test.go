@@ -503,6 +503,26 @@ func TestStopIfGenerationZeroGenSkipsGenerationCheck(t *testing.T) {
 	waitForStreamStopped(t, streamer, s.ID)
 }
 
+func TestDIDLDurationParsing(t *testing.T) {
+	// Bare item with res duration attribute
+	md := parseDIDL(`<item><title>Test</title><artist>Artist</artist><res duration="00:03:45.000">http://example.com/stream</res></item>`)
+	if md.Duration != "00:03:45.000" {
+		t.Errorf("expected duration '00:03:45.000', got '%s'", md.Duration)
+	}
+
+	// DIDL-Lite wrapper with res duration
+	md = parseDIDL(`<DIDL-Lite><item><title>Wrapped</title><artist>Wrapper</artist><res duration="01:30:00.000">http://example.com/long</res></item></DIDL-Lite>`)
+	if md.Duration != "01:30:00.000" {
+		t.Errorf("expected duration '01:30:00.000', got '%s'", md.Duration)
+	}
+
+	// No duration attribute
+	md = parseDIDL(`<DIDL-Lite><item><title>No Duration</title></item></DIDL-Lite>`)
+	if md.Duration != "" {
+		t.Errorf("expected empty duration, got '%s'", md.Duration)
+	}
+}
+
 func TestSafeURLRedactsToken(t *testing.T) {
 	tests := []struct {
 		input    string

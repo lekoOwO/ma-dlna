@@ -144,6 +144,7 @@ func (m *Manager) CreateWithBase(sourceURI, metadataXML, baseURL string) *Sessio
 	id := generateID()
 	token := generateToken()
 	parsed := parseDIDL(metadataXML)
+	slog.Info("DIDL metadata parsed", "title", parsed.Title, "artist", parsed.Artist, "duration", parsed.Duration)
 
 	s := &Session{
 		ID:          id,

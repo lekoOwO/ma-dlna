@@ -125,6 +125,46 @@ func (h *Handler) NotifyPlaying(sessionID string, genID uint64) {
 	h.startPlaybackMonitor(sessionID, genID)
 }
 
+// idleDebounce tracks HA state debounce logic for the playback monitor.
+// It encapsulates idle/off/standby timing so tests can inject time.
+type idleDebounce struct {
+	wasPlaying  bool
+	idleSince   time.Time
+	lastEmitted string
+}
+
+// update processes one HA state poll. now is injected for testability.
+// Returns (shouldStop, event). event is non-empty when a state-change
+// notification should be sent. shouldStop means the monitor exits.
+func (d *idleDebounce) update(haState string, now time.Time) (shouldStop bool, event string) {
+	switch haState {
+	case "playing":
+		d.wasPlaying = true
+		d.idleSince = time.Time{}
+	case "idle", "off", "standby":
+		if d.idleSince.IsZero() {
+			d.idleSince = now
+			return false, ""
+		}
+		if now.Sub(d.idleSince) < 10*time.Second {
+			return false, ""
+		}
+		if d.lastEmitted != "STOPPED" {
+			d.lastEmitted = "STOPPED"
+			return true, "STOPPED"
+		}
+	case "paused":
+		d.idleSince = time.Time{}
+		if d.wasPlaying && d.lastEmitted != "PAUSED_PLAYBACK" {
+			d.lastEmitted = "PAUSED_PLAYBACK"
+			return false, "PAUSED_PLAYBACK"
+		}
+	default:
+		d.idleSince = time.Time{}
+	}
+	return false, ""
+}
+
 // startPlaybackMonitor polls HA/MA media_player state periodically and fires
 // STOPPED when the entity reports playback has ended (state != "playing").
 // This is the long-term replacement for relying on ffmpeg EOF as playback-ended.
@@ -144,12 +184,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
-		// The monitor starts after first /live client, so HA/MA is expected to be
-		// playing. If HA state briefly flickers idle (buffer handoff), debounce it.
-		startedAt := time.Now()
-		wasPlaying := true
-		lastEmitted := ""
-		var idleSince time.Time
+		debounce := &idleDebounce{wasPlaying: true}
 
 		for {
 			select {
@@ -174,37 +209,34 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					continue
 				}
 
-				slog.Debug("Playback monitor poll", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID, "gen_id", genID)
+				now := time.Now()
+				_, event := debounce.update(state, now)
 
-				switch state {
-				case "playing":
-					wasPlaying = true
-					idleSince = time.Time{}
-				case "idle", "off", "standby":
-					// Debounce: require 10s consecutive idle before treating as ended.
-					// Also allow immediate idle if started more than 30s ago (safety).
-					if idleSince.IsZero() {
-						idleSince = time.Now()
-						continue
+				idleActive := !debounce.idleSince.IsZero()
+				var idleDur time.Duration
+				if idleActive {
+					idleDur = now.Sub(debounce.idleSince).Round(time.Second)
+				}
+				slog.Debug("Playback monitor poll",
+					"entity", h.cfg.HA.TargetEntityID,
+					"session_id", sessionID,
+					"gen_id", genID,
+					"ha_state", state,
+					"was_playing", debounce.wasPlaying,
+					"last_emitted", debounce.lastEmitted,
+					"idle_active", idleActive,
+					"idle_duration", idleDur,
+				)
+
+				switch event {
+				case "STOPPED":
+					slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
+					if h.sessionMgr.StopIfGeneration(sessionID, genID) {
+						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
 					}
-					sinceStart := time.Since(startedAt)
-					if time.Since(idleSince) < 10*time.Second && sinceStart < 30*time.Second {
-						continue
-					}
-					if lastEmitted != "STOPPED" {
-						slog.Info("Playback monitor detected playback ended", "entity", h.cfg.HA.TargetEntityID, "ha_state", state, "session_id", sessionID)
-						if h.sessionMgr.StopIfGeneration(sessionID, genID) {
-							h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
-						}
-						lastEmitted = "STOPPED"
-						return
-					}
-				case "paused":
-					idleSince = time.Time{}
-					if wasPlaying && lastEmitted != "PAUSED_PLAYBACK" {
-						h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
-						lastEmitted = "PAUSED_PLAYBACK"
-					}
+					return
+				case "PAUSED_PLAYBACK":
+					h.notifyCurrentSession(sessionID, avTransportLastChange("PAUSED_PLAYBACK"))
 				}
 			}
 		}
