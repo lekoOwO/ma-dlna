@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,6 +26,9 @@ import (
 )
 
 const maxWebSocketPayloadBytes = 16 * 1024 * 1024
+const maCommandTimeout = 15 * time.Second
+
+var errMACommandTimeout = errors.New("Music Assistant command timed out")
 
 type DirectAdapter struct {
 	cfg      *config.Config
@@ -35,10 +39,26 @@ type DirectAdapter struct {
 }
 
 type maQueueStatus struct {
-	State                  *string  `json:"state"`
-	QueueID                *string  `json:"queue_id"`
-	ElapsedTime            *float64 `json:"elapsed_time"`
-	ElapsedTimeLastUpdated *float64 `json:"elapsed_time_last_updated"`
+	State                  *string      `json:"state"`
+	QueueID                *string      `json:"queue_id"`
+	ElapsedTime            *float64     `json:"elapsed_time"`
+	ElapsedTimeLastUpdated *float64     `json:"elapsed_time_last_updated"`
+	CurrentItem            *maQueueItem `json:"current_item"`
+}
+
+type maQueueItem struct {
+	MediaItem *maMediaItem `json:"media_item"`
+}
+
+type maMediaItem struct {
+	ItemID           string              `json:"item_id"`
+	URI              string              `json:"uri"`
+	ProviderMappings []maProviderMapping `json:"provider_mappings"`
+}
+
+type maProviderMapping struct {
+	ItemID string `json:"item_id"`
+	URL    string `json:"url"`
 }
 
 func newDirectAdapter(cfg *config.Config) *DirectAdapter {
@@ -52,10 +72,14 @@ func (a *DirectAdapter) Target() string {
 }
 
 func (a *DirectAdapter) getActiveQueueStatus() (*maQueueStatus, error) {
+	return a.getActiveQueueStatusWithin(maCommandTimeout)
+}
+
+func (a *DirectAdapter) getActiveQueueStatusWithin(timeout time.Duration) (*maQueueStatus, error) {
 	var result *maQueueStatus
-	if err := a.callMAResult("player_queues/get_active_queue", map[string]any{
+	if err := a.callMAResultWithin("player_queues/get_active_queue", map[string]any{
 		"player_id": a.cfg.MusicAssistant.TargetPlayerID,
-	}, &result); err != nil {
+	}, &result, timeout); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -210,13 +234,47 @@ func (a *DirectAdapter) GetState() (string, error) {
 }
 
 func (a *DirectAdapter) GetStatus() (PlayerStatus, error) {
-	result, err := a.getActiveQueueStatus()
+	return a.getStatusWithin(maCommandTimeout)
+}
+
+func (a *DirectAdapter) GetStatusWithin(timeout time.Duration) (PlayerStatus, error, bool) {
+	status, err := a.getStatusWithin(timeout)
+	if errors.Is(err, errMACommandTimeout) {
+		return PlayerStatus{}, nil, false
+	}
+	return status, err, true
+}
+
+func (a *DirectAdapter) getStatusWithin(timeout time.Duration) (PlayerStatus, error) {
+	if timeout <= 0 {
+		return PlayerStatus{}, errMACommandTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	result, err := a.getActiveQueueStatusWithin(timeout)
 	if err != nil {
 		return PlayerStatus{}, err
 	}
 
 	if result != nil && result.State != nil {
-		return playerStatusFromMA(*result), nil
+		ps := playerStatusFromMA(*result)
+		if ps.QueueID == "" {
+			ps.QueueID = a.cfg.MusicAssistant.TargetPlayerID
+		}
+		if len(ps.CurrentURIs) == 0 && ps.State == "playing" {
+			if full, err := a.getQueueStatusWithin(ps.QueueID, time.Until(deadline)); err == nil && full != nil {
+				fullStatus := playerStatusFromMA(*full)
+				if len(fullStatus.CurrentURIs) > 0 {
+					ps.CurrentURI = fullStatus.CurrentURI
+					ps.CurrentURIs = fullStatus.CurrentURIs
+				}
+				if !ps.HasElapsed && fullStatus.HasElapsed {
+					ps.Elapsed = fullStatus.Elapsed
+					ps.ElapsedUpdatedAt = fullStatus.ElapsedUpdatedAt
+					ps.HasElapsed = true
+				}
+			}
+		}
+		return ps, nil
 	}
 
 	qid := a.cfg.MusicAssistant.TargetPlayerID
@@ -224,10 +282,8 @@ func (a *DirectAdapter) GetStatus() (PlayerStatus, error) {
 		qid = *result.QueueID
 	}
 
-	var result2 *maQueueStatus
-	if err := a.callMAResult("player_queues/get", map[string]any{
-		"queue_id": qid,
-	}, &result2); err != nil {
+	result2, err := a.getQueueStatusWithin(qid, time.Until(deadline))
+	if err != nil {
 		return PlayerStatus{}, err
 	}
 	if result2 != nil {
@@ -238,6 +294,16 @@ func (a *DirectAdapter) GetStatus() (PlayerStatus, error) {
 		return ps, nil
 	}
 	return PlayerStatus{State: normalizeMAState("unknown")}, nil
+}
+
+func (a *DirectAdapter) getQueueStatusWithin(queueID string, timeout time.Duration) (*maQueueStatus, error) {
+	var result *maQueueStatus
+	if err := a.callMAResultWithin("player_queues/get", map[string]any{
+		"queue_id": queueID,
+	}, &result, timeout); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (a *DirectAdapter) PlaybackPosition() (time.Duration, bool, error) {
@@ -272,7 +338,57 @@ func playerStatusFromMA(status maQueueStatus) PlayerStatus {
 	if status.ElapsedTimeLastUpdated != nil {
 		ps.ElapsedUpdatedAt = maTimestampToTime(*status.ElapsedTimeLastUpdated)
 	}
+	if status.CurrentItem != nil && status.CurrentItem.MediaItem != nil {
+		ps.CurrentURIs = currentURIsFromMediaItem(*status.CurrentItem.MediaItem)
+		if len(ps.CurrentURIs) > 0 {
+			ps.CurrentURI = ps.CurrentURIs[0]
+		}
+	}
 	return ps
+}
+
+func currentURIFromMediaItem(item maMediaItem) string {
+	uris := currentURIsFromMediaItem(item)
+	if len(uris) == 0 {
+		return ""
+	}
+	return uris[0]
+}
+
+func currentURIsFromMediaItem(item maMediaItem) []string {
+	var uris []string
+	add := func(uri string) {
+		uri = strings.TrimSpace(uri)
+		if uri == "" {
+			return
+		}
+		for _, existing := range uris {
+			if existing == uri {
+				return
+			}
+		}
+		uris = append(uris, uri)
+	}
+
+	for _, mapping := range item.ProviderMappings {
+		if mapping.URL != "" {
+			add(mapping.URL)
+		}
+	}
+	if item.URI != "" && (strings.HasPrefix(item.URI, "http://") || strings.HasPrefix(item.URI, "https://")) {
+		add(item.URI)
+	}
+	if item.ItemID != "" && (strings.HasPrefix(item.ItemID, "http://") || strings.HasPrefix(item.ItemID, "https://")) {
+		add(item.ItemID)
+	}
+	for _, mapping := range item.ProviderMappings {
+		if mapping.ItemID != "" && (strings.HasPrefix(mapping.ItemID, "http://") || strings.HasPrefix(mapping.ItemID, "https://")) {
+			add(mapping.ItemID)
+		}
+	}
+	add(item.URI)
+	add(item.ItemID)
+	return uris
 }
 
 func maTimestampToTime(ts float64) time.Time {
@@ -295,13 +411,23 @@ func (a *DirectAdapter) callMA(command string, args map[string]any) error {
 }
 
 func (a *DirectAdapter) callMAResult(command string, args map[string]any, result any) error {
-	a.wsMu.Lock()
+	return a.callMAResultWithin(command, args, result, maCommandTimeout)
+}
+
+func (a *DirectAdapter) callMAResultWithin(command string, args map[string]any, result any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return errMACommandTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	if !a.lockWSWithin(timeout) {
+		return errMACommandTimeout
+	}
 	defer a.wsMu.Unlock()
 
-	if err := a.connectWSLocked(); err != nil {
+	if err := a.connectWSLocked(time.Until(deadline)); err != nil {
 		return err
 	}
-	if err := a.sendWSCommandLocked(command, args, result); err != nil {
+	if err := a.sendWSCommandLocked(command, args, result, time.Until(deadline)); err != nil {
 		a.closeWSLocked()
 		slog.Error("MA WebSocket call failed", "command", command, "error", err)
 		return fmt.Errorf("call MA %s: %w", command, err)
@@ -310,17 +436,45 @@ func (a *DirectAdapter) callMAResult(command string, args map[string]any, result
 	return nil
 }
 
-func (a *DirectAdapter) connectWSLocked() error {
+func (a *DirectAdapter) lockWSWithin(timeout time.Duration) bool {
+	if a.wsMu.TryLock() {
+		return true
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		if time.Until(deadline) <= 0 {
+			return false
+		}
+		select {
+		case <-ticker.C:
+			if a.wsMu.TryLock() {
+				return true
+			}
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
+func (a *DirectAdapter) connectWSLocked(timeout time.Duration) error {
 	if a.wsConn != nil {
 		return nil
 	}
+	if timeout <= 0 {
+		return errMACommandTimeout
+	}
+	deadline := time.Now().Add(timeout)
 
 	wsURL, err := musicAssistantWSURL(a.cfg.MusicAssistant.URL)
 	if err != nil {
 		return err
 	}
 
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	dialer := &net.Dialer{Timeout: timeout}
 	var conn net.Conn
 	switch wsURL.Scheme {
 	case "ws":
@@ -332,6 +486,10 @@ func (a *DirectAdapter) connectWSLocked() error {
 	}
 	if err != nil {
 		return fmt.Errorf("connect Music Assistant websocket: %w", err)
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return err
 	}
 
 	key, err := websocketKey()
@@ -388,7 +546,7 @@ func (a *DirectAdapter) connectWSLocked() error {
 		var auth struct {
 			Authenticated bool `json:"authenticated"`
 		}
-		if err := a.sendWSCommandLocked("auth", map[string]any{"token": a.cfg.MusicAssistant.Token}, &auth); err != nil {
+		if err := a.sendWSCommandLocked("auth", map[string]any{"token": a.cfg.MusicAssistant.Token}, &auth, time.Until(deadline)); err != nil {
 			a.closeWSLocked()
 			return fmt.Errorf("authenticate Music Assistant websocket: %w", err)
 		}
@@ -445,9 +603,12 @@ func websocketAcceptKey(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func (a *DirectAdapter) sendWSCommandLocked(command string, args map[string]any, result any) error {
+func (a *DirectAdapter) sendWSCommandLocked(command string, args map[string]any, result any, timeout time.Duration) error {
 	if a.wsConn == nil || a.wsReader == nil {
 		return fmt.Errorf("Music Assistant websocket is not connected")
+	}
+	if timeout <= 0 {
+		return errMACommandTimeout
 	}
 
 	msgID := fmt.Sprintf("ma-dlna-%d", a.msgID.Add(1))
@@ -464,7 +625,7 @@ func (a *DirectAdapter) sendWSCommandLocked(command string, args map[string]any,
 	}
 
 	slog.Debug("MA WebSocket call", "command", command, "payload", redactMA(string(payload)))
-	if err := a.wsConn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+	if err := a.wsConn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
 	if err := writeClientTextFrame(a.wsConn, payload); err != nil {

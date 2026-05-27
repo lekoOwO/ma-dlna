@@ -305,6 +305,11 @@ func TestDirectGetStatusAndPlaybackPosition(t *testing.T) {
 			return maWSReply{Result: `{"authenticated":true}`}
 		case "player_queues/get_active_queue":
 			return maWSReply{Result: fmt.Sprintf(`{"queue_id":"group123","state":"playing","elapsed_time":12.3,"elapsed_time_last_updated":%.6f}`, float64(updatedAt.UnixNano())/float64(time.Second))}
+		case "player_queues/get":
+			if req.Args["queue_id"] != "group123" {
+				t.Fatalf("unexpected queue_id: %v", req.Args["queue_id"])
+			}
+			return maWSReply{Result: fmt.Sprintf(`{"queue_id":"group123","state":"playing","elapsed_time":12.3,"elapsed_time_last_updated":%.6f}`, float64(updatedAt.UnixNano())/float64(time.Second))}
 		default:
 			t.Fatalf("unexpected command: %s", req.Command)
 			return maWSReply{}
@@ -329,6 +334,68 @@ func TestDirectGetStatusAndPlaybackPosition(t *testing.T) {
 	}
 	if !ok || pos < 14*time.Second || pos > 17*time.Second {
 		t.Fatalf("expected corrected playing position around 14s, got %s ok=%v", pos, ok)
+	}
+}
+
+func TestDirectGetStatusExtractsCurrentURI(t *testing.T) {
+	cfg := directCfg()
+	sourceURL := "http://source.local/path/song.flac?token=source"
+	server := newMAWSServer(t, func(req maWSCommand) maWSReply {
+		switch req.Command {
+		case "auth":
+			expectAuth(t, req)
+			return maWSReply{Result: `{"authenticated":true}`}
+		case "player_queues/get_active_queue":
+			return maWSReply{Result: `{"queue_id":"group123","state":"playing","elapsed_time":0,"current_item":{"media_item":{"item_id":"builtin-id","uri":"builtin://track/canonical","provider_mappings":[{"item_id":"builtin-id","url":"` + sourceURL + `"}]}}}`}
+		default:
+			t.Fatalf("unexpected command: %s", req.Command)
+			return maWSReply{}
+		}
+	})
+	defer server.Close()
+
+	adapter := directAdapter(&cfg, server.URL)
+	status, err := adapter.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.CurrentURI != sourceURL {
+		t.Fatalf("expected current URI %q, got %q", sourceURL, status.CurrentURI)
+	}
+	if len(status.CurrentURIs) != 3 || status.CurrentURIs[0] != sourceURL || status.CurrentURIs[1] != "builtin://track/canonical" || status.CurrentURIs[2] != "builtin-id" {
+		t.Fatalf("unexpected current URI candidates: %#v", status.CurrentURIs)
+	}
+}
+
+func TestDirectGetStatusFallbacksToQueueGetForCurrentURI(t *testing.T) {
+	cfg := directCfg()
+	sourceURL := "http://source.local/path/song.flac?token=source"
+	server := newMAWSServer(t, func(req maWSCommand) maWSReply {
+		switch req.Command {
+		case "auth":
+			expectAuth(t, req)
+			return maWSReply{Result: `{"authenticated":true}`}
+		case "player_queues/get_active_queue":
+			return maWSReply{Result: `{"queue_id":"group123","state":"playing","elapsed_time":0}`}
+		case "player_queues/get":
+			if req.Args["queue_id"] != "group123" {
+				t.Fatalf("unexpected queue_id: %v", req.Args["queue_id"])
+			}
+			return maWSReply{Result: `{"queue_id":"group123","state":"playing","elapsed_time":0,"current_item":{"media_item":{"item_id":"builtin-id","provider_mappings":[{"item_id":"builtin-id","url":"` + sourceURL + `"}]}}}`}
+		default:
+			t.Fatalf("unexpected command: %s", req.Command)
+			return maWSReply{}
+		}
+	})
+	defer server.Close()
+
+	adapter := directAdapter(&cfg, server.URL)
+	status, err := adapter.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.CurrentURI != sourceURL {
+		t.Fatalf("expected fallback current URI %q, got %q", sourceURL, status.CurrentURI)
 	}
 }
 

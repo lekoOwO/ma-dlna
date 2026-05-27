@@ -67,6 +67,57 @@ type posCache struct {
 	valid     bool
 }
 
+type stateGuard struct {
+	mu             sync.Mutex
+	pauseSessionID string
+}
+
+const (
+	backendPollInterval = 100 * time.Millisecond
+	playConfirmTimeout  = 8 * time.Second
+	pauseConfirmTimeout = 2 * time.Second
+)
+
+type backendWaitResult string
+
+const (
+	backendWaitConfirmed   backendWaitResult = "confirmed"
+	backendWaitInterrupted backendWaitResult = "interrupted"
+	backendWaitTimeout     backendWaitResult = "timeout"
+)
+
+type backendStatusResult struct {
+	status maadapter.PlayerStatus
+	err    error
+}
+
+type backendStatusWithinClient interface {
+	GetStatusWithin(time.Duration) (maadapter.PlayerStatus, error, bool)
+}
+
+func (g *stateGuard) ignorePlaying(sessionID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pauseSessionID = sessionID
+}
+
+func (g *stateGuard) clearPause(sessionID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.pauseSessionID == sessionID {
+		g.pauseSessionID = ""
+	}
+}
+
+func (g *stateGuard) shouldIgnorePlaying(sessionID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.pauseSessionID != sessionID {
+		return false
+	}
+	return true
+}
+
 func (c *posCache) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -163,6 +214,35 @@ func correctedPlaybackPosition(status maadapter.PlayerStatus) (time.Duration, bo
 	return elapsed, true
 }
 
+func cacheBackendPosition(cache *posCache, sessionID string, status maadapter.PlayerStatus, running bool) time.Duration {
+	if pos, ok := correctedPlaybackPosition(status); ok {
+		if cached, ok := cache.guardedZero(sessionID, pos, running); ok {
+			return cached
+		}
+		return cache.set(sessionID, pos, running)
+	}
+	if pos, ok := cache.estimate(sessionID, running); ok {
+		return pos
+	}
+	return 0
+}
+
+func backendStatusMatchesSource(status maadapter.PlayerStatus, sourceURI string) bool {
+	sourceURI = strings.TrimSpace(sourceURI)
+	if sourceURI == "" {
+		return false
+	}
+	if strings.TrimSpace(status.CurrentURI) == sourceURI {
+		return true
+	}
+	for _, uri := range status.CurrentURIs {
+		if strings.TrimSpace(uri) == sourceURI {
+			return true
+		}
+	}
+	return false
+}
+
 type eventSubscriber struct {
 	sid        string
 	callback   string
@@ -195,6 +275,7 @@ type Handler struct {
 	deviceUUID        string
 	subscribers       map[string]*eventSubscriber
 	posCache          posCache
+	stateGuard        stateGuard
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter maadapter.PlayerClient) *Handler {
@@ -354,6 +435,9 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 
 				if cur.State == session.StatePaused {
 					if state == "playing" {
+						if h.stateGuard.shouldIgnorePlaying(sessionID) {
+							continue
+						}
 						if h.sessionMgr.MarkPlayingIfGeneration(sessionID, genID) {
 							h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
 						}
@@ -434,6 +518,9 @@ func (h *Handler) syncCurrentSessionFromBackend() {
 	}
 	switch status.State {
 	case "playing":
+		if active.State == session.StatePaused && h.stateGuard.shouldIgnorePlaying(active.ID) {
+			return
+		}
 		if h.sessionMgr.MarkPlayingIfGeneration(active.ID, 0) {
 			h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
 		}
@@ -441,7 +528,7 @@ func (h *Handler) syncCurrentSessionFromBackend() {
 		if h.sessionMgr.MarkPausedIfGeneration(active.ID, 0) {
 			h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
 		}
-	case "idle":
+	case "idle", "off", "standby":
 		if active.State == session.StatePaused {
 			return
 		}
@@ -486,6 +573,90 @@ func (h *Handler) playbackPositionForSession(active *session.Session) time.Durat
 		return pos
 	}
 	return elapsed
+}
+
+func (h *Handler) getBackendStatusWithin(timeout time.Duration) (maadapter.PlayerStatus, error, bool) {
+	if timeout <= 0 {
+		return maadapter.PlayerStatus{}, nil, false
+	}
+	if client, ok := h.maAdapter.(backendStatusWithinClient); ok {
+		return client.GetStatusWithin(timeout)
+	}
+	ch := make(chan backendStatusResult, 1)
+	go func() {
+		status, err := h.maAdapter.GetStatus()
+		ch <- backendStatusResult{status: status, err: err}
+	}()
+	select {
+	case result := <-ch:
+		return result.status, result.err, true
+	case <-time.After(timeout):
+		return maadapter.PlayerStatus{}, nil, false
+	}
+}
+
+func (h *Handler) waitForBackendPlaying(sessionID, sourceURI string, requireFresh bool, timeout time.Duration) (maadapter.PlayerStatus, backendWaitResult) {
+	deadline := time.Now().Add(timeout)
+	var last maadapter.PlayerStatus
+	for {
+		cur := h.activeSession()
+		if cur == nil || cur.ID != sessionID {
+			return last, backendWaitInterrupted
+		}
+		switch cur.State {
+		case session.StatePaused, session.StateStopped, session.StateError:
+			return last, backendWaitInterrupted
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return last, backendWaitTimeout
+		}
+		status, err, ok := h.getBackendStatusWithin(remaining)
+		if !ok {
+			return last, backendWaitTimeout
+		}
+		if err != nil {
+			slog.Debug("Backend playing confirmation poll failed", "target", h.maAdapter.Target(), "session_id", sessionID, "error", err)
+		} else {
+			last = status
+			if status.State == "playing" && (!requireFresh || backendStatusMatchesSource(status, sourceURI)) {
+				return status, backendWaitConfirmed
+			}
+		}
+		time.Sleep(backendPollInterval)
+	}
+}
+
+func (h *Handler) waitForBackendNotPlaying(sessionID string, timeout time.Duration) (maadapter.PlayerStatus, backendWaitResult) {
+	deadline := time.Now().Add(timeout)
+	var last maadapter.PlayerStatus
+	for {
+		cur := h.activeSession()
+		if cur == nil || cur.ID != sessionID {
+			return last, backendWaitInterrupted
+		}
+		if cur.State != session.StatePaused {
+			return last, backendWaitInterrupted
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return last, backendWaitTimeout
+		}
+		status, err, ok := h.getBackendStatusWithin(remaining)
+		if !ok {
+			return last, backendWaitTimeout
+		}
+		if err != nil {
+			slog.Debug("Backend pause confirmation poll failed", "target", h.maAdapter.Target(), "session_id", sessionID, "error", err)
+		} else {
+			last = status
+			switch status.State {
+			case "paused", "idle", "off", "standby":
+				return status, backendWaitConfirmed
+			}
+		}
+		time.Sleep(backendPollInterval)
+	}
 }
 
 func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
@@ -1425,6 +1596,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			streamBase = h.cfg.Server.StreamPublicBaseURL
 		}
 		h.stopPlaybackMonitor()
+		if old := h.activeSession(); old != nil {
+			h.stateGuard.clearPause(old.ID)
+		}
 		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
 		h.posCache.set(s.ID, 0, false)
 		h.notifyCurrentSession(s.ID, avTransportLastChange("STOPPED"))
@@ -1450,6 +1624,22 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if active.State == session.StateStarting {
+			status, waitResult := h.waitForBackendPlaying(active.ID, active.SourceURI, true, playConfirmTimeout)
+			switch waitResult {
+			case backendWaitConfirmed:
+				cacheBackendPosition(&h.posCache, active.ID, status, true)
+				if h.sessionMgr.SetPlayingAcceptedIfGeneration(active.ID, 0) {
+					h.NotifyPlaying(active.ID, 0)
+				}
+			case backendWaitTimeout:
+				slog.Warn("Timed out waiting for Music Assistant to report playing", "target", h.maAdapter.Target(), "session_id", active.ID)
+				h.posCache.reset()
+				h.sessionMgr.StopWithErrorIfGenerationActive(active.ID, 0, "timed out waiting for Music Assistant to report playing")
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+				return
+			}
 			response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 			break
@@ -1457,51 +1647,97 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		wasPaused := active.State == session.StatePaused
 		if wasPaused {
 			h.posCache.guardZero(active.ID, 10*time.Second)
+			h.stateGuard.clearPause(active.ID)
 		}
 		h.sessionMgr.Play(active.ID)
-		var playGen uint64
+		playGen := uint64(0)
 		sessionID := active.ID
 		streamURL := active.StreamURL
 		sourceURI := active.SourceURI
 		meta := active.Metadata
-		go func() {
-			req := maadapter.PlayRequest{
-				StreamURL:   streamURL,
-				SourceURL:   sourceURI,
-				ContentType: h.playRequestContentType(meta),
+		req := maadapter.PlayRequest{
+			StreamURL:   streamURL,
+			SourceURL:   sourceURI,
+			ContentType: h.playRequestContentType(meta),
+		}
+		if meta != nil {
+			req.Title = meta.Title
+			req.Artist = meta.Artist
+			req.Album = meta.Album
+			req.AlbumArtURI = meta.AlbumArtURI
+			req.Duration = meta.Duration
+		}
+		var err error
+		if wasPaused {
+			err = h.maAdapter.Resume()
+		} else {
+			err = h.maAdapter.PlayMedia(req)
+		}
+		if err != nil {
+			slog.Error("PlayMedia failed", "session_id", sessionID, "gen_id", playGen, "error", err)
+			if !h.sessionMgr.IsCurrentGenerationActive(sessionID, playGen) {
+				slog.Debug("PlayMedia late error ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
+				h.stateGuard.clearPause(sessionID)
+				response = avTransportResponse(action, fmt.Sprintf(`
+<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+				break
 			}
-			if meta != nil {
-				req.Title = meta.Title
-				req.Artist = meta.Artist
-				req.Album = meta.Album
-				req.AlbumArtURI = meta.AlbumArtURI
-				req.Duration = meta.Duration
+			if !h.sessionMgr.StopWithErrorIfGenerationActive(sessionID, playGen, err.Error()) {
+				slog.Debug("PlayMedia error ignored after active generation check", "session_id", sessionID, "gen_id", playGen)
 			}
-			var err error
-			if wasPaused {
-				err = h.maAdapter.Resume()
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
+		}
+		if cur := h.activeSession(); cur != nil && cur.ID == sessionID && cur.State == session.StatePaused {
+			h.stateGuard.ignorePlaying(sessionID)
+			if err := h.maAdapter.Pause(); err != nil {
+				h.stateGuard.clearPause(sessionID)
+				slog.Debug("Pause after late PlayMedia completion failed", "target", h.maAdapter.Target(), "session_id", sessionID, "error", err)
 			} else {
-				err = h.maAdapter.PlayMedia(req)
-			}
-			if err != nil {
-				slog.Error("PlayMedia failed", "session_id", sessionID, "gen_id", playGen, "error", err)
-				if !h.sessionMgr.IsCurrentGenerationActive(sessionID, playGen) {
-					slog.Debug("PlayMedia late error ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
-					return
+				if _, waitResult := h.waitForBackendNotPlaying(sessionID, pauseConfirmTimeout); waitResult == backendWaitConfirmed {
+					h.stateGuard.clearPause(sessionID)
+				} else if waitResult == backendWaitTimeout {
+					h.stateGuard.clearPause(sessionID)
 				}
-				if !h.sessionMgr.StopWithErrorIfGenerationActive(sessionID, playGen, err.Error()) {
-					slog.Debug("PlayMedia error ignored after active generation check", "session_id", sessionID, "gen_id", playGen)
-				}
-				return
 			}
-			accepted := false
-			accepted = h.sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, 0)
-			if accepted {
+			response = avTransportResponse(action, fmt.Sprintf(`
+<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
+			break
+		}
+		status, waitResult := h.waitForBackendPlaying(sessionID, sourceURI, !wasPaused, playConfirmTimeout)
+		switch waitResult {
+		case backendWaitConfirmed:
+			cacheBackendPosition(&h.posCache, sessionID, status, true)
+			if h.sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, 0) {
 				h.NotifyPlaying(sessionID, playGen)
 			} else {
 				slog.Debug("PlayMedia success ignored, session not current/active", "session_id", sessionID, "gen_id", playGen)
 			}
-		}()
+		case backendWaitInterrupted:
+			if cur := h.activeSession(); cur != nil && cur.ID == sessionID && cur.State == session.StatePaused {
+				h.stateGuard.ignorePlaying(sessionID)
+				if err := h.maAdapter.Pause(); err != nil {
+					h.stateGuard.clearPause(sessionID)
+					slog.Debug("Pause after interrupted play confirmation failed", "target", h.maAdapter.Target(), "session_id", sessionID, "error", err)
+				} else {
+					if _, waitResult := h.waitForBackendNotPlaying(sessionID, pauseConfirmTimeout); waitResult == backendWaitConfirmed {
+						h.stateGuard.clearPause(sessionID)
+					} else if waitResult == backendWaitTimeout {
+						h.stateGuard.clearPause(sessionID)
+					}
+				}
+			}
+		case backendWaitTimeout:
+			slog.Warn("Timed out waiting for Music Assistant to report playing", "target", h.maAdapter.Target(), "session_id", sessionID)
+			h.posCache.reset()
+			h.sessionMgr.StopWithErrorIfGenerationActive(sessionID, playGen, "timed out waiting for Music Assistant to report playing")
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
+		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 
@@ -1512,6 +1748,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if active != nil {
 			h.stopPlaybackMonitor()
 			h.sessionMgr.Stop(active.ID)
+			h.stateGuard.clearPause(active.ID)
 			h.posCache.reset()
 			if err := h.maAdapter.Stop(); err != nil {
 				slog.Error("Stop failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
@@ -1542,10 +1779,13 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
+		h.stateGuard.ignorePlaying(active.ID)
+		pausedFromStarting := active.State == session.StateStarting
 		h.playbackPositionForSession(active)
 		h.sessionMgr.Pause(active.ID)
 		h.posCache.estimate(active.ID, false)
 		if err := h.maAdapter.Pause(); err != nil {
+			h.stateGuard.clearPause(active.ID)
 			slog.Error("Pause failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
 			h.sessionMgr.Stop(active.ID)
 			h.sessionMgr.SetError(active.ID, err.Error())
@@ -1554,7 +1794,25 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
-		h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
+		status, waitResult := h.waitForBackendNotPlaying(active.ID, pauseConfirmTimeout)
+		if waitResult == backendWaitConfirmed && !pausedFromStarting {
+			h.stateGuard.clearPause(active.ID)
+		}
+		if waitResult == backendWaitTimeout {
+			h.stateGuard.clearPause(active.ID)
+			if status.State == "playing" {
+				if h.sessionMgr.MarkPlayingIfGeneration(active.ID, 0) {
+					h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
+				}
+			}
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
+		}
+		if cur := h.activeSession(); cur != nil && cur.ID == active.ID && cur.State == session.StatePaused {
+			h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
+		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:PauseResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 		_ = instanceID

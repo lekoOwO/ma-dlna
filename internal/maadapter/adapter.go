@@ -10,6 +10,8 @@ import (
 type PlayerStatus struct {
 	State            string
 	QueueID          string
+	CurrentURI       string
+	CurrentURIs      []string
 	Elapsed          time.Duration
 	ElapsedUpdatedAt time.Time
 	HasElapsed       bool
