@@ -226,7 +226,7 @@ func TestDirectQueueCommandsUseResolvedQueue(t *testing.T) {
 	}{
 		{"stop", (*DirectAdapter).Stop, "player_queues/stop", nil},
 		{"pause", (*DirectAdapter).Pause, "player_queues/pause", nil},
-		{"resume", (*DirectAdapter).Resume, "player_queues/play", nil},
+		{"resume", (*DirectAdapter).Resume, "player_queues/resume", nil},
 		{"seek", func(a *DirectAdapter) error { return a.Seek(42 * time.Second) }, "player_queues/seek", func(t *testing.T, args map[string]any) {
 			if args["position"].(float64) != 42 {
 				t.Fatalf("unexpected seek position: %v", args["position"])

@@ -57,6 +57,112 @@ type eventDelivery struct {
 	release    <-chan struct{}
 }
 
+type posCache struct {
+	mu        sync.Mutex
+	sessionID string
+	position  time.Duration
+	updatedAt time.Time
+	running   bool
+	zeroGuard time.Time
+	valid     bool
+}
+
+func (c *posCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionID = ""
+	c.position = 0
+	c.updatedAt = time.Time{}
+	c.running = false
+	c.zeroGuard = time.Time{}
+	c.valid = false
+}
+
+func (c *posCache) set(sessionID string, pos time.Duration, running bool) time.Duration {
+	if pos < 0 {
+		pos = 0
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionID = sessionID
+	c.position = pos
+	c.updatedAt = now
+	c.running = running
+	if pos > 2*time.Second {
+		c.zeroGuard = time.Time{}
+	}
+	c.valid = true
+	return pos
+}
+
+func (c *posCache) guardZero(sessionID string, duration time.Duration) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sessionID != sessionID {
+		return
+	}
+	c.zeroGuard = now.Add(duration)
+}
+
+func (c *posCache) estimate(sessionID string, running bool) (time.Duration, bool) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sessionID != sessionID || !c.valid {
+		return 0, false
+	}
+	pos := c.estimateLocked(now)
+	c.position = pos
+	c.updatedAt = now
+	c.running = running
+	return pos, true
+}
+
+func (c *posCache) guardedZero(sessionID string, pos time.Duration, running bool) (time.Duration, bool) {
+	if pos > 2*time.Second {
+		return 0, false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sessionID != sessionID || !c.valid || now.After(c.zeroGuard) {
+		return 0, false
+	}
+	estimate := c.estimateLocked(now)
+	if estimate <= 2*time.Second {
+		return 0, false
+	}
+	c.position = estimate
+	c.updatedAt = now
+	c.running = running
+	return estimate, true
+}
+
+func (c *posCache) estimateLocked(now time.Time) time.Duration {
+	pos := c.position
+	if c.running && !c.updatedAt.IsZero() {
+		if delta := now.Sub(c.updatedAt); delta >= 0 && delta < 10*time.Minute {
+			pos += delta
+		}
+	}
+	return pos
+}
+
+func correctedPlaybackPosition(status maadapter.PlayerStatus) (time.Duration, bool) {
+	if !status.HasElapsed {
+		return 0, false
+	}
+	elapsed := status.Elapsed
+	if status.State == "playing" && !status.ElapsedUpdatedAt.IsZero() {
+		if delta := time.Since(status.ElapsedUpdatedAt); delta >= 0 && delta < 10*time.Minute {
+			elapsed += delta
+		}
+	}
+	return elapsed, true
+}
+
 type eventSubscriber struct {
 	sid        string
 	callback   string
@@ -88,6 +194,7 @@ type Handler struct {
 	ssdpCancel        context.CancelFunc
 	deviceUUID        string
 	subscribers       map[string]*eventSubscriber
+	posCache          posCache
 }
 
 func NewHandler(cfg *config.Config, sessionMgr *session.Manager, maAdapter maadapter.PlayerClient) *Handler {
@@ -245,6 +352,15 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 					continue
 				}
 
+				if cur.State == session.StatePaused {
+					if state == "playing" {
+						if h.sessionMgr.MarkPlayingIfGeneration(sessionID, genID) {
+							h.notifyCurrentSession(sessionID, avTransportLastChange("PLAYING"))
+						}
+					}
+					continue
+				}
+
 				now := time.Now()
 				_, event := debounce.update(state, now)
 
@@ -268,6 +384,7 @@ func (h *Handler) startPlaybackMonitor(sessionID string, genID uint64) {
 				case "STOPPED":
 					slog.Info("Playback monitor detected playback ended", "target", h.maAdapter.Target(), "state", state, "session_id", sessionID)
 					if h.sessionMgr.StopIfGeneration(sessionID, genID) {
+						h.posCache.reset()
 						h.notifyCurrentSession(sessionID, avTransportLastChange("STOPPED"))
 					}
 					return
@@ -325,12 +442,50 @@ func (h *Handler) syncCurrentSessionFromBackend() {
 			h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
 		}
 	case "idle":
+		if active.State == session.StatePaused {
+			return
+		}
 		if active.State == session.StatePlaying || active.State == session.StatePaused {
 			if h.sessionMgr.StopIfGeneration(active.ID, 0) {
+				h.posCache.reset()
 				h.notifyCurrentSession(active.ID, avTransportLastChange("STOPPED"))
 			}
 		}
 	}
+}
+
+func (h *Handler) playbackPositionForSession(active *session.Session) time.Duration {
+	elapsed := h.sessionMgr.Elapsed(active.ID)
+	running := active.State == session.StatePlaying
+	if active.State == session.StateStarting {
+		if pos, ok := h.posCache.estimate(active.ID, false); ok {
+			return pos
+		}
+		return elapsed
+	}
+	switch active.State {
+	case session.StatePlaying, session.StatePaused:
+		status, err := h.maAdapter.GetStatus()
+		if err == nil {
+			if pos, ok := correctedPlaybackPosition(status); ok {
+				if status.State == "idle" && pos <= 2*time.Second {
+					if cached, ok := h.posCache.estimate(active.ID, running); ok && cached > 2*time.Second {
+						return cached
+					}
+				}
+				if cached, ok := h.posCache.guardedZero(active.ID, pos, running); ok {
+					return cached
+				}
+				return h.posCache.set(active.ID, pos, running)
+			}
+		} else if err != nil {
+			slog.Debug("Playback position poll failed", "target", h.maAdapter.Target(), "error", err)
+		}
+	}
+	if pos, ok := h.posCache.estimate(active.ID, running); ok {
+		return pos
+	}
+	return elapsed
 }
 
 func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
@@ -1271,6 +1426,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		}
 		h.stopPlaybackMonitor()
 		s := h.sessionMgr.CreateWithBase(uri, metadata, streamBase)
+		h.posCache.set(s.ID, 0, false)
 		h.notifyCurrentSession(s.ID, avTransportLastChange("STOPPED"))
 		response = avTransportResponse(action, fmt.Sprintf(`
 <u:SetAVTransportURIResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1299,6 +1455,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		wasPaused := active.State == session.StatePaused
+		if wasPaused {
+			h.posCache.guardZero(active.ID, 10*time.Second)
+		}
 		h.sessionMgr.Play(active.ID)
 		var playGen uint64
 		sessionID := active.ID
@@ -1353,6 +1512,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		if active != nil {
 			h.stopPlaybackMonitor()
 			h.sessionMgr.Stop(active.ID)
+			h.posCache.reset()
 			if err := h.maAdapter.Stop(); err != nil {
 				slog.Error("Stop failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
 				h.sessionMgr.SetError(active.ID, err.Error())
@@ -1382,7 +1542,9 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
+		h.playbackPositionForSession(active)
 		h.sessionMgr.Pause(active.ID)
+		h.posCache.estimate(active.ID, false)
 		if err := h.maAdapter.Pause(); err != nil {
 			slog.Error("Pause failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
 			h.sessionMgr.Stop(active.ID)
@@ -1433,14 +1595,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		metadata := ""
 		if h.sessionMgr != nil {
 			if active := h.activeSession(); active != nil {
-				elapsed := h.sessionMgr.Elapsed(active.ID)
-				if active.State == session.StatePlaying || active.State == session.StatePaused {
-					if pos, ok, err := h.maAdapter.PlaybackPosition(); err == nil && ok {
-						elapsed = pos
-					} else if err != nil {
-						slog.Debug("Playback position poll failed", "target", h.maAdapter.Target(), "error", err)
-					}
-				}
+				elapsed := h.playbackPositionForSession(active)
 				relTime = formatDurationUPnP(elapsed)
 				uri = escapeXML(active.SourceURI)
 				metadata = escapeXML(active.MetadataRaw)
@@ -1532,6 +1687,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
 			return
 		}
+		h.posCache.set(active.ID, offset, active.State != session.StatePaused)
 		response = avTransportResponse(action, fmt.Sprintf(`
 	<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 

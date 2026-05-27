@@ -265,6 +265,80 @@ func TestGetPositionInfoUsesMusicAssistantPosition(t *testing.T) {
 	}
 }
 
+func TestGetPositionInfoDoesNotRewindWhenPausedMusicAssistantReportsIdleZero(t *testing.T) {
+	player := newFakePlayerClient()
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+	player.setStatus("playing", 15*time.Second)
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:15" {
+		t.Fatalf("expected initial RelTime 00:00:15, got %s", got)
+	}
+
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	player.setStatus("idle", 0)
+
+	posXML = postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:15" {
+		t.Fatalf("paused RelTime should keep last known position, got %s", got)
+	}
+
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.setStatus("playing", 0)
+
+	posXML = postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:15" {
+		t.Fatalf("resumed RelTime should keep cached position, got %s", got)
+	}
+}
+
+func TestGetPositionInfoAcceptsExternalBackwardSeekFromMusicAssistant(t *testing.T) {
+	player := newFakePlayerClient()
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+	player.setStatus("playing", 2*time.Minute)
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:02:00" {
+		t.Fatalf("expected initial RelTime 00:02:00, got %s", got)
+	}
+
+	player.setStatus("playing", 30*time.Second)
+
+	posXML = postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:30" {
+		t.Fatalf("expected external backward seek to be reflected, got %s", got)
+	}
+}
+
+func TestGetPositionInfoDuringFreshStartIgnoresStaleMusicAssistantPosition(t *testing.T) {
+	player := newFakePlayerClient()
+	block := make(chan struct{})
+	player.playBlock = block
+	defer close(block)
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	player.setStatus("playing", 10*time.Minute)
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/new-song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:00" {
+		t.Fatalf("fresh starting session should not use stale MA position, got %s", got)
+	}
+}
+
 func TestGetTransportInfoSyncsExternalPauseFromMusicAssistant(t *testing.T) {
 	player := newFakePlayerClient()
 	ts, _, _ := startMAOnlyTestServer(t, player)
@@ -282,6 +356,25 @@ func TestGetTransportInfoSyncsExternalPauseFromMusicAssistant(t *testing.T) {
 	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
 	if got := extractXMLField(posXML, "RelTime"); got != "00:00:07" {
 		t.Fatalf("expected paused MA position 00:00:07, got %s", got)
+	}
+}
+
+func TestGetTransportInfoKeepsPausedWhenMusicAssistantReportsIdle(t *testing.T) {
+	player := newFakePlayerClient()
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>http://192.168.1.10/song.mp3</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+	player.setStatus("playing", 15*time.Second)
+
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	player.setStatus("idle", 0)
+
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PAUSED_PLAYBACK" {
+		t.Fatalf("expected paused session to remain PAUSED_PLAYBACK when MA reports idle, got %s", got)
 	}
 }
 

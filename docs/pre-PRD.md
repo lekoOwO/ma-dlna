@@ -138,7 +138,7 @@ Required commands:
 * `player_queues/get_active_queue`
 * `player_queues/get`
 * `player_queues/play_media`
-* `player_queues/play`
+* `player_queues/resume`
 * `player_queues/pause`
 * `player_queues/stop`
 * `player_queues/seek`

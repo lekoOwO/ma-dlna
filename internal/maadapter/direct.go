@@ -158,7 +158,7 @@ func (a *DirectAdapter) Resume() error {
 	if err != nil {
 		return err
 	}
-	return a.callMA("player_queues/play", map[string]any{
+	return a.callMA("player_queues/resume", map[string]any{
 		"queue_id": qid,
 	})
 }
