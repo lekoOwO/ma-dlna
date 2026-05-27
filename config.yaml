@@ -2,9 +2,6 @@ server:
   bind_host: "0.0.0.0"
   http_port: 8787
   public_base_url: "http://192.168.1.10:8787"
-  # Set stream_public_base_url if HA/MA cannot reach the auto-detected
-  # controller interface (multi-NIC, Docker, VLAN deployments).
-  # stream_public_base_url: "http://10.0.0.5:8787"
 
 upnp:
   friendly_name: "Music Assistant Whole Home"
@@ -14,48 +11,12 @@ upnp:
   advertise_interval_seconds: 1800
   auto_base_url: true
 
-ha:
-  url: "http://homeassistant.local:8123"
-  token: "${HA_TOKEN}"
-  target_entity_id: "media_player.whole_home"
-
-ma_adapter:
-  mode: "ha_service"
-  play_service: "music_assistant.play_media"
-  fallback_play_service: "media_player.play_media"
-  stop_service: "media_player.media_stop"
-  pause_service: "media_player.media_pause"
-  volume_service: "media_player.volume_set"
-
-# Direct Music Assistant API mode bypasses Home Assistant and ffmpeg /live streams.
-# To use it, set ma_adapter.mode to "direct" and configure this block.
 music_assistant:
   url: "http://musicassistant.local:8095"
   token: "${MA_TOKEN}"
   target_player_id: "whole_home"
 
-ffmpeg:
-  binary: "ffmpeg"
-  output_format: "opus"
-  codec: "libopus"
-  bitrate: "192k"
-  sample_rate: 48000
-  channels: 2
-  reconnect: true
-  extra_input_args: []
-  extra_output_args: []
-
-stream:
-  prebuffer_bytes: 32768
-  ring_buffer_bytes: 8388608
-  init_segment_bytes: 32768
-  max_replay_bytes: 65536
-  max_clients_per_session: 16
-  no_client_grace_seconds: 10
-  startup_timeout_seconds: 30
-
 security:
-  require_stream_token: true
   allowed_source_cidrs:
     - "192.168.0.0/16"
     - "10.0.0.0/8"

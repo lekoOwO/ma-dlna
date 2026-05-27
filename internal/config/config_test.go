@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+const validMusicAssistantYAML = `
+music_assistant:
+  url: "http://music-assistant.local:8095"
+  token: "test-token"
+  target_player_id: "living_room"
+`
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -35,7 +42,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfigFile(t *testing.T) {
-	yaml := `
+	yaml := validMusicAssistantYAML + `
 server:
   bind_host: "127.0.0.1"
   http_port: 9999
@@ -77,7 +84,7 @@ ffmpeg:
 }
 
 func TestUUIDAutoGeneration(t *testing.T) {
-	cfg, err := LoadConfig(`
+	cfg, err := LoadConfig(validMusicAssistantYAML + `
 upnp:
   uuid: "auto"
 `)
@@ -127,73 +134,47 @@ func TestStreamDefaults(t *testing.T) {
 	}
 }
 
-func TestDirectMusicAssistantConfigValidation(t *testing.T) {
-	cfg, err := LoadConfig(`
-ma_adapter:
-  mode: "direct"
-music_assistant:
-  url: "http://music-assistant.local:8095"
-  token: "test-token"
-  target_player_id: "living_room"
-`)
+func TestMusicAssistantConfigValidation(t *testing.T) {
+	cfg, err := LoadConfig(validMusicAssistantYAML)
 	if err != nil {
-		t.Fatalf("direct Music Assistant config should validate: %v", err)
-	}
-	if cfg.MAAdapter.Mode != "direct" {
-		t.Errorf("expected direct mode, got %q", cfg.MAAdapter.Mode)
+		t.Fatalf("Music Assistant config should validate: %v", err)
 	}
 	if cfg.MusicAssistant.URL != "http://music-assistant.local:8095" {
 		t.Errorf("unexpected Music Assistant URL: %q", cfg.MusicAssistant.URL)
+	}
+	if cfg.MusicAssistant.Token != "test-token" {
+		t.Errorf("unexpected Music Assistant token: %q", cfg.MusicAssistant.Token)
 	}
 	if cfg.MusicAssistant.TargetPlayerID != "living_room" {
 		t.Errorf("unexpected target player id: %q", cfg.MusicAssistant.TargetPlayerID)
 	}
 }
 
-func TestDirectMusicAssistantConfigRequiresURLAndTarget(t *testing.T) {
+func TestMusicAssistantConfigRequiresURLTokenAndTarget(t *testing.T) {
 	if _, err := LoadConfig(`
-ma_adapter:
-  mode: "direct"
 music_assistant:
+  url: ""
+  token: "test-token"
   target_player_id: "living_room"
 `); err == nil {
-		t.Fatal("direct mode without music_assistant.url should fail")
+		t.Fatal("config without music_assistant.url should fail")
 	}
 
 	if _, err := LoadConfig(`
-ma_adapter:
-  mode: "direct"
-music_assistant:
-  url: "http://music-assistant.local:8095"
-`); err == nil {
-		t.Fatal("direct mode without music_assistant.target_player_id should fail")
-	}
-}
-
-func TestDirectModeDoesNotValidateUnusedHAURL(t *testing.T) {
-	cfg, err := LoadConfig(`
-ha:
-  url: "not-a-valid-url"
-ma_adapter:
-  mode: "direct"
 music_assistant:
   url: "http://music-assistant.local:8095"
   target_player_id: "living_room"
-`)
-	if err != nil {
-		t.Fatalf("direct mode should ignore unused HA URL validation: %v", err)
-	}
-	if cfg.HA.URL != "not-a-valid-url" {
-		t.Errorf("unexpected HA URL: %q", cfg.HA.URL)
-	}
-}
-
-func TestMAAdapterModeValidation(t *testing.T) {
-	if _, err := LoadConfig(`
-ma_adapter:
-  mode: "invalid"
 `); err == nil {
-		t.Fatal("invalid ma_adapter.mode should fail")
+		t.Fatal("config without music_assistant.token should fail")
+	}
+
+	if _, err := LoadConfig(`
+music_assistant:
+  url: "http://music-assistant.local:8095"
+  token: "test-token"
+  target_player_id: ""
+`); err == nil {
+		t.Fatal("config without music_assistant.target_player_id should fail")
 	}
 }
 

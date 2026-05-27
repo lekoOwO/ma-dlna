@@ -35,8 +35,7 @@ func main() {
 	setupLogging(cfg)
 
 	slog.Info("Starting dlna-ma-bridge", "version", version.Version, "commit", version.Commit)
-	slog.Debug("Config", "adapter_mode", cfg.MAAdapter.Mode, "ha_url", cfg.HA.URL, "ha_target", cfg.HA.TargetEntityID, "ma_url", cfg.MusicAssistant.URL, "ma_target", cfg.MusicAssistant.TargetPlayerID,
-		"output", cfg.FFmpeg.OutputFormat, "codec", cfg.FFmpeg.Codec, "bitrate", cfg.FFmpeg.Bitrate,
+	slog.Debug("Config", "ma_url", cfg.MusicAssistant.URL, "ma_target", cfg.MusicAssistant.TargetPlayerID,
 		"auto_base_url", cfg.UPnP.AutoBaseURL, "public_base_url", cfg.Server.PublicBaseURL)
 
 	streamer := stream.NewStreamer(cfg)
@@ -128,15 +127,16 @@ func statusHandler(cfg *config.Config, mgr *session.Manager, streamer *stream.St
 	return func(w http.ResponseWriter, r *http.Request) {
 		active := mgr.StatusSession()
 		resp := map[string]any{
-			"status":             "ok",
-			"upnp_friendly_name": cfg.UPnP.FriendlyName,
-			"http_base_url":      cfg.Server.PublicBaseURL,
-			"sessions":           mgr.Count(),
-			"clients":            streamer.TotalClients(),
+			"status":                 "ok",
+			"upnp_friendly_name":     cfg.UPnP.FriendlyName,
+			"http_base_url":          cfg.Server.PublicBaseURL,
+			"music_assistant_target": cfg.MusicAssistant.TargetPlayerID,
+			"sessions":               mgr.Count(),
+			"stream_clients":         streamer.TotalClients(),
 		}
 		if active != nil {
 			resp["active_session_id"] = active.ID
-			resp["ffmpeg_running"] = streamer.IsRunning(active.ID)
+			resp["stream_running"] = streamer.IsRunning(active.ID)
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}

@@ -291,13 +291,46 @@ func (h *Handler) stopPlaybackMonitor() {
 }
 
 // NotifyDeliveryEnded is a no-op hook for ffmpeg EOF.
-// Playback-ended (STOPPED) is driven by the HA/MA playback monitor, not by
-// stream EOF, because HA/MA may still be playing buffered audio after
+// Playback-ended (STOPPED) is driven by the Music Assistant playback monitor, not by
+// stream EOF, because the selected player may still be playing buffered audio after
 // ffmpeg finishes delivering the stream.
 func (h *Handler) NotifyDeliveryEnded(sessionID string) {}
 
 func (h *Handler) activeSession() *session.Session {
 	return h.sessionMgr.CurrentSession()
+}
+
+func (h *Handler) syncCurrentSessionFromBackend() {
+	active := h.activeSession()
+	if active == nil {
+		return
+	}
+	switch active.State {
+	case session.StatePlaying, session.StatePaused:
+	default:
+		return
+	}
+	status, err := h.maAdapter.GetStatus()
+	if err != nil {
+		slog.Debug("Backend status sync failed", "target", h.maAdapter.Target(), "error", err)
+		return
+	}
+	switch status.State {
+	case "playing":
+		if h.sessionMgr.MarkPlayingIfGeneration(active.ID, 0) {
+			h.notifyCurrentSession(active.ID, avTransportLastChange("PLAYING"))
+		}
+	case "paused":
+		if h.sessionMgr.MarkPausedIfGeneration(active.ID, 0) {
+			h.notifyCurrentSession(active.ID, avTransportLastChange("PAUSED_PLAYBACK"))
+		}
+	case "idle":
+		if active.State == session.StatePlaying || active.State == session.StatePaused {
+			if h.sessionMgr.StopIfGeneration(active.ID, 0) {
+				h.notifyCurrentSession(active.ID, avTransportLastChange("STOPPED"))
+			}
+		}
+	}
 }
 
 func (h *Handler) RegisterUPnPEndpoints(mux *http.ServeMux) {
@@ -1254,7 +1287,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
-		slog.Info("Play requested, calling MA", "target", h.maAdapter.Target(), "source_url", safeURL(active.SourceURI), "stream_url", safeURL(active.StreamURL), "bridge_stream", h.maAdapter.RequiresBridgeStream())
+		slog.Info("Play requested, calling MA", "target", h.maAdapter.Target(), "source_url", safeURL(active.SourceURI))
 		if active.State == session.StatePlaying {
 			response = avTransportResponse(action, fmt.Sprintf(`
 	<u:PlayResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -1267,12 +1300,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		}
 		wasPaused := active.State == session.StatePaused
 		h.sessionMgr.Play(active.ID)
-		requiresBridge := h.maAdapter.RequiresBridgeStream()
 		var playGen uint64
-		if requiresBridge {
-			h.sessionMgr.StartStream(active.ID, active.SourceURI)
-			playGen = h.sessionMgr.CurrentGenID(active.ID)
-		}
 		sessionID := active.ID
 		streamURL := active.StreamURL
 		sourceURI := active.SourceURI
@@ -1291,7 +1319,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				req.Duration = meta.Duration
 			}
 			var err error
-			if wasPaused && !requiresBridge {
+			if wasPaused {
 				err = h.maAdapter.Resume()
 			} else {
 				err = h.maAdapter.PlayMedia(req)
@@ -1308,11 +1336,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			accepted := false
-			if requiresBridge {
-				accepted = h.sessionMgr.AcceptPlaybackIfGeneration(sessionID, playGen)
-			} else {
-				accepted = h.sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, 0)
-			}
+			accepted = h.sessionMgr.SetPlayingAcceptedIfGeneration(sessionID, 0)
 			if accepted {
 				h.NotifyPlaying(sessionID, playGen)
 			} else {
@@ -1374,6 +1398,7 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 		_ = instanceID
 
 	case "GetTransportInfo":
+		h.syncCurrentSessionFromBackend()
 		state := "STOPPED"
 		status := "OK"
 		active := h.activeSession()
@@ -1492,73 +1517,20 @@ func (h *Handler) serveAVTransport(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(soapFaultResponse("701", "Transition not available")))
 			return
 		}
-		elapsed := h.sessionMgr.Elapsed(active.ID)
-		if h.maAdapter.RequiresBridgeStream() && (active.State == session.StateStarting || active.State == session.StatePlaying) && offset == 0 && elapsed < 1*time.Second {
-			slog.Debug("Seek ignored: no-op startup seek to 00:00:00", "session_id", active.ID, "elapsed", elapsed)
+		if offset == 0 && active.State == session.StateStarting && time.Since(active.UpdatedAt) < time.Second {
+			slog.Debug("Seek ignored: no-op startup seek to 00:00:00", "session_id", active.ID)
 			response = avTransportResponse(action, fmt.Sprintf(`
 		<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
 			break
 		}
 		slog.Info("Seek requested", "session_id", active.ID, "to", offset.Round(time.Second))
-		if !h.maAdapter.RequiresBridgeStream() {
-			if err := h.maAdapter.Seek(offset); err != nil {
-				slog.Error("Seek failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
-				h.sessionMgr.SetError(active.ID, err.Error())
-				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(soapFaultResponse("501", "Action Failed")))
-				return
-			}
-			response = avTransportResponse(action, fmt.Sprintf(`
-		<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
-			break
-		}
-		wasPaused := active.State == session.StatePaused
-		h.sessionMgr.Seek(active.ID, offset)
-		if !wasPaused {
-			h.sessionMgr.Resume(active.ID)
-			seekGen := h.sessionMgr.CurrentGenID(active.ID)
-			if seekGen == 0 {
-				slog.Warn("Seek aborted, stream generation is zero", "session_id", active.ID)
-				h.sessionMgr.SetErrorIfNoGeneration(active.ID, "seek did not create a stream generation")
-				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(soapFaultResponse("701", "Transition not available")))
-				return
-			}
-			seekStreamURL := active.StreamURL
-			seekSourceURI := active.SourceURI
-			seekMeta := active.Metadata
-			go func() {
-				req := maadapter.PlayRequest{
-					StreamURL:   seekStreamURL,
-					SourceURL:   seekSourceURI,
-					ContentType: contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat),
-				}
-				if seekMeta != nil {
-					req.Title = seekMeta.Title
-					req.Artist = seekMeta.Artist
-					req.Album = seekMeta.Album
-					req.AlbumArtURI = seekMeta.AlbumArtURI
-					req.Duration = seekMeta.Duration
-				}
-				if err := h.maAdapter.PlayMedia(req); err != nil {
-					slog.Error("Seek PlayMedia failed", "session_id", active.ID, "gen_id", seekGen, "error", err)
-					if !h.sessionMgr.IsCurrentGenerationActive(active.ID, seekGen) {
-						slog.Debug("Seek PlayMedia late error ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
-						return
-					}
-					if !h.sessionMgr.StopWithErrorIfGenerationActive(active.ID, seekGen, err.Error()) {
-						slog.Debug("Seek PlayMedia error ignored after active generation check", "session_id", active.ID, "gen_id", seekGen)
-					}
-					return
-				}
-				if h.sessionMgr.AcceptPlaybackIfGeneration(active.ID, seekGen) {
-					h.NotifyPlaying(active.ID, seekGen)
-				} else {
-					slog.Debug("Seek PlayMedia success ignored, session not current/active", "session_id", active.ID, "gen_id", seekGen)
-				}
-			}()
+		if err := h.maAdapter.Seek(offset); err != nil {
+			slog.Error("Seek failed", "target", h.maAdapter.Target(), "session_id", active.ID, "error", err)
+			h.sessionMgr.SetError(active.ID, err.Error())
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(soapFaultResponse("501", "Action Failed")))
+			return
 		}
 		response = avTransportResponse(action, fmt.Sprintf(`
 	<u:SeekResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>`))
@@ -2031,9 +2003,6 @@ func contentTypeForUPnP(format string) string {
 }
 
 func (h *Handler) playRequestContentType(md *session.Metadata) string {
-	if h.maAdapter.RequiresBridgeStream() {
-		return contentTypeForUPnP(h.cfg.FFmpeg.OutputFormat)
-	}
 	if md != nil && md.ContentType != "" {
 		return md.ContentType
 	}

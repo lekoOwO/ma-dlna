@@ -8,10 +8,10 @@ import (
 )
 
 // ValidateSourceURI performs a preflight validation of the source URL.
-// NOTE: This is a preflight check only — the actual fetch is done by ffmpeg which
-// may follow redirects, resolve DNS differently, or support protocols that this
-// check does not. In untrusted-LAN deployments, the bridge should proxy source
-// fetches and validate each redirect hop.
+// NOTE: This is a preflight check only — the actual fetch is done by Music
+// Assistant and/or the selected player, which may follow redirects and resolve
+// DNS from a different host. In untrusted-LAN deployments, source fetching needs
+// a proxy that validates each redirect hop from the fetcher's network context.
 func (c *SecurityConfig) ValidateSourceURI(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {

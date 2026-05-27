@@ -846,7 +846,7 @@ func (st *stream) run(gen *streamGeneration) {
 	close(gen.started)
 
 	// If no client connects before the startup timeout, stop ffmpeg to avoid
-	// resource leak (e.g. HA/MA accepted play_media but never hits /live).
+	// resource leak (e.g. Music Assistant accepted playback but never hits /live).
 	go func() {
 		timer := time.NewTimer(st.startupTimeout)
 		defer timer.Stop()

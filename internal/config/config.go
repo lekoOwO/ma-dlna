@@ -15,9 +15,7 @@ import (
 type Config struct {
 	Server         ServerConfig         `yaml:"server"`
 	UPnP           UPnPConfig           `yaml:"upnp"`
-	HA             HAConfig             `yaml:"ha"`
 	MusicAssistant MusicAssistantConfig `yaml:"music_assistant"`
-	MAAdapter      MAAdapterConfig      `yaml:"ma_adapter"`
 	FFmpeg         FFmpegConfig         `yaml:"ffmpeg"`
 	Stream         StreamConfig         `yaml:"stream"`
 	Security       SecurityConfig       `yaml:"security"`
@@ -40,25 +38,10 @@ type UPnPConfig struct {
 	AutoBaseURL           bool   `yaml:"auto_base_url"`
 }
 
-type HAConfig struct {
-	URL            string `yaml:"url"`
-	Token          string `yaml:"token"`
-	TargetEntityID string `yaml:"target_entity_id"`
-}
-
 type MusicAssistantConfig struct {
 	URL            string `yaml:"url"`
 	Token          string `yaml:"token"`
 	TargetPlayerID string `yaml:"target_player_id"`
-}
-
-type MAAdapterConfig struct {
-	Mode                string `yaml:"mode"`
-	PlayService         string `yaml:"play_service"`
-	FallbackPlayService string `yaml:"fallback_play_service"`
-	StopService         string `yaml:"stop_service"`
-	PauseService        string `yaml:"pause_service"`
-	VolumeService       string `yaml:"volume_service"`
 }
 
 type FFmpegConfig struct {
@@ -74,9 +57,10 @@ type FFmpegConfig struct {
 	ExtraOutputArgs []string `yaml:"extra_output_args"`
 }
 
-// For multi-NIC, Docker, or VLAN deployments where HA/MA cannot reach the
-// auto-detected controller interface, set server.stream_public_base_url to
-// the URL that HA/MA should use to connect to /live streams.
+// For multi-NIC, Docker, or VLAN deployments where the selected Music Assistant
+// player cannot reach the auto-detected controller interface, set
+// server.stream_public_base_url to the URL it should use to connect to /live
+// streams if stream bridging is enabled.
 type StreamConfig struct {
 	PrebufferBytes        int `yaml:"prebuffer_bytes"`
 	RingBufferBytes       int `yaml:"ring_buffer_bytes"`
@@ -121,7 +105,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("public_base_url resolves to 0.0.0.0; set public_base_url to the bridge's LAN IP or enable auto_base_url")
 	}
 	if strings.Contains(cfg.Server.PublicBaseURL, "0.0.0.0") {
-		slog.Warn("public_base_url resolves to 0.0.0.0 — stream URLs will use auto-detected LAN IP; verify HA/MA can reach it")
+		slog.Warn("public_base_url resolves to 0.0.0.0 — stream URLs will use auto-detected LAN IP; verify Music Assistant can reach it")
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -185,32 +169,21 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("server.stream_public_base_url scheme must be http or https, got %q", u.Scheme)
 		}
 	}
-	if c.MAAdapter.Mode != "ha_service" && c.MAAdapter.Mode != "direct" {
-		return fmt.Errorf("ma_adapter.mode must be 'ha_service' or 'direct', got %q", c.MAAdapter.Mode)
+	if c.MusicAssistant.URL == "" {
+		return fmt.Errorf("music_assistant.url is required")
 	}
-	if c.MAAdapter.Mode == "direct" {
-		if c.MusicAssistant.URL == "" {
-			return fmt.Errorf("music_assistant.url is required in direct mode")
-		}
-		u, err := url.Parse(c.MusicAssistant.URL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("music_assistant.url must have a scheme and host, got %q", c.MusicAssistant.URL)
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("music_assistant.url scheme must be http or https, got %q", u.Scheme)
-		}
-		if c.MusicAssistant.TargetPlayerID == "" {
-			return fmt.Errorf("music_assistant.target_player_id is required in direct mode")
-		}
+	u, err := url.Parse(c.MusicAssistant.URL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("music_assistant.url must have a scheme and host, got %q", c.MusicAssistant.URL)
 	}
-	if c.MAAdapter.Mode == "ha_service" && c.HA.URL != "" {
-		u, err := url.Parse(c.HA.URL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("ha.url must have a scheme and host, got %q", c.HA.URL)
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("ha.url scheme must be http or https, got %q", u.Scheme)
-		}
+	if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "ws" && u.Scheme != "wss" {
+		return fmt.Errorf("music_assistant.url scheme must be http, https, ws, or wss, got %q", u.Scheme)
+	}
+	if c.MusicAssistant.Token == "" {
+		return fmt.Errorf("music_assistant.token is required")
+	}
+	if c.MusicAssistant.TargetPlayerID == "" {
+		return fmt.Errorf("music_assistant.target_player_id is required")
 	}
 	return nil
 }
@@ -229,17 +202,9 @@ func DefaultConfig() Config {
 			AdvertiseIntervalSecs: 1800,
 			AutoBaseURL:           true,
 		},
-		HA: HAConfig{
-			URL:            "http://homeassistant.local:8123",
-			TargetEntityID: "media_player.whole_home",
-		},
-		MAAdapter: MAAdapterConfig{
-			Mode:                "ha_service",
-			PlayService:         "music_assistant.play_media",
-			FallbackPlayService: "media_player.play_media",
-			StopService:         "media_player.media_stop",
-			PauseService:        "media_player.media_pause",
-			VolumeService:       "media_player.volume_set",
+		MusicAssistant: MusicAssistantConfig{
+			URL:            "http://musicassistant.local:8095",
+			TargetPlayerID: "whole_home",
 		},
 		FFmpeg: FFmpegConfig{
 			Binary:       "ffmpeg",
@@ -292,10 +257,3 @@ func generateUUID() string {
 		hex.EncodeToString(b[10:16]),
 	)
 }
-
-// expandEnv replaces ${VAR} with the value of environment variable VAR.
-func (c *Config) expandEnv() {
-	c.HA.Token = os.ExpandEnv(c.HA.Token)
-}
-
-var _ = strings.TrimSpace

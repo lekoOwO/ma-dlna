@@ -6,7 +6,7 @@ services:
     container_name: dlna-ma-bridge
     network_mode: host
     environment:
-      HA_TOKEN: "${HA_TOKEN:-}"
+      MA_TOKEN: "${MA_TOKEN:-}"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
     restart: unless-stopped

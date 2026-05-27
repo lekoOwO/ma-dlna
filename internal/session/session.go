@@ -359,6 +359,23 @@ func (m *Manager) SetPlayingAcceptedIfGeneration(sessionID string, genID uint64)
 	return false
 }
 
+func (m *Manager) MarkPlayingIfGeneration(sessionID string, genID uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		if genID != 0 && m.sessionGenID[sessionID] != genID {
+			return false
+		}
+		if s.State == StatePlaying || s.State == StateStopped || s.State == StateError {
+			return false
+		}
+		s.State = StatePlaying
+		s.UpdatedAt = time.Now()
+		return true
+	}
+	return false
+}
+
 func (m *Manager) SetError(sessionID string, errMsg string) {
 	m.SetErrorIfGeneration(sessionID, 0, errMsg)
 }

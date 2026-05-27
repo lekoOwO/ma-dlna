@@ -21,12 +21,9 @@ RUN go build \
     -ldflags="-s -w -X github.com/leko/ma-dlna/internal/version.Version=${VERSION} -X github.com/leko/ma-dlna/internal/version.Commit=${COMMIT}" \
     -o /dlna-ma-bridge ./cmd/dlna-ma-bridge
 
-FROM alpine:3.20
+FROM scratch
 
-RUN apk add --no-cache \
-    ffmpeg \
-    ca-certificates
-
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /dlna-ma-bridge /dlna-ma-bridge
 
 EXPOSE 8787
