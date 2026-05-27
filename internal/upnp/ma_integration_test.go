@@ -18,19 +18,26 @@ import (
 )
 
 type fakePlayerClient struct {
-	mu              sync.Mutex
-	status          maadapter.PlayerStatus
-	playReqs        []maadapter.PlayRequest
-	resume          int
-	stop            int
-	pause           int
-	volume          []int
-	seek            []time.Duration
-	playBlock       <-chan struct{}
-	pauseBlock      <-chan struct{}
-	playSetsPlaying bool
-	pauseSetsPaused bool
-	playErr         error
+	mu                sync.Mutex
+	status            maadapter.PlayerStatus
+	playReqs          []maadapter.PlayRequest
+	resume            int
+	stop              int
+	pause             int
+	volume            []int
+	seek              []time.Duration
+	playBlock         <-chan struct{}
+	pauseBlock        <-chan struct{}
+	resumeBlock       <-chan struct{}
+	seekBlock         <-chan struct{}
+	playSetsPlaying   bool
+	pauseSetsPaused   bool
+	pauseSetsElapsed  bool
+	pauseElapsed      time.Duration
+	resumeSetsElapsed bool
+	resumeElapsed     time.Duration
+	playErr           error
+	resumeErr         error
 }
 
 func newFakePlayerClient() *fakePlayerClient {
@@ -69,9 +76,22 @@ func (f *fakePlayerClient) PlayMedia(req maadapter.PlayRequest) error {
 
 func (f *fakePlayerClient) Resume() error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.resume++
+	block := f.resumeBlock
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resumeErr != nil {
+		return f.resumeErr
+	}
 	f.status.State = "playing"
+	if f.resumeSetsElapsed {
+		f.status.Elapsed = f.resumeElapsed
+		f.status.HasElapsed = true
+	}
 	f.status.ElapsedUpdatedAt = time.Now()
 	return nil
 }
@@ -97,10 +117,21 @@ func (f *fakePlayerClient) Pause() error {
 	if f.pauseSetsPaused {
 		f.status.State = "paused"
 	}
+	if f.pauseSetsElapsed {
+		f.status.Elapsed = f.pauseElapsed
+		f.status.HasElapsed = true
+		f.status.ElapsedUpdatedAt = time.Now()
+	}
 	return nil
 }
 
 func (f *fakePlayerClient) Seek(position time.Duration) error {
+	f.mu.Lock()
+	block := f.seekBlock
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seek = append(f.seek, position)
@@ -181,14 +212,26 @@ func (f *fakePlayerClient) lastPlayRequest() (maadapter.PlayRequest, bool) {
 
 func (f *fakePlayerClient) waitForPlay(t *testing.T) maadapter.PlayRequest {
 	t.Helper()
+	return f.waitForPlayRequests(t, 1)
+}
+
+func (f *fakePlayerClient) waitForPlayRequests(t *testing.T, count int) maadapter.PlayRequest {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if req, ok := f.lastPlayRequest(); ok {
+		f.mu.Lock()
+		playReqs := len(f.playReqs)
+		var req maadapter.PlayRequest
+		if playReqs > 0 {
+			req = f.playReqs[playReqs-1]
+		}
+		f.mu.Unlock()
+		if playReqs >= count {
 			return req
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for PlayMedia")
+	t.Fatalf("timed out waiting for %d PlayMedia calls", count)
 	return maadapter.PlayRequest{}
 }
 
@@ -205,6 +248,21 @@ func (f *fakePlayerClient) waitForPause(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for Pause")
+}
+
+func (f *fakePlayerClient) waitForResume(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		resumeCalls := f.resume
+		f.mu.Unlock()
+		if resumeCalls > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for Resume")
 }
 
 func startMAOnlyTestServer(t *testing.T, player *fakePlayerClient) (*httptest.Server, *session.Manager, *stream.Streamer) {
@@ -537,6 +595,348 @@ func TestPauseFailsWhenMusicAssistantKeepsPlaying(t *testing.T) {
 	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
 	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PLAYING" {
 		t.Fatalf("failed Pause should leave transport PLAYING, got %s", got)
+	}
+}
+
+func TestMAResumeAfterPauseSeeksToCachedPosition(t *testing.T) {
+	player := newFakePlayerClient()
+	player.resumeSetsElapsed = true
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:42" {
+		t.Fatalf("expected paused RelTime 00:00:42, got %s", got)
+	}
+
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	var lastSeek time.Duration
+	if seekCalls > 0 {
+		lastSeek = player.seek[seekCalls-1]
+	}
+	player.mu.Unlock()
+
+	if seekCalls == 0 {
+		t.Fatal("expected Seek to be called after Resume to restore cached pause position, but no Seek was called")
+	}
+	if lastSeek != 42*time.Second {
+		t.Fatalf("expected Seek to 42s after Resume, got %v", lastSeek)
+	}
+
+	posXML = postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:42" {
+		t.Fatalf("resumed RelTime should stay at restored pause position, got %s", got)
+	}
+}
+
+func TestExternalMusicAssistantPauseFreezesBackendPosition(t *testing.T) {
+	player := newFakePlayerClient()
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 10*time.Second)
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:10" {
+		t.Fatalf("expected initial RelTime 00:00:10, got %s", got)
+	}
+
+	player.setStatus("paused", 25*time.Second)
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PAUSED_PLAYBACK" {
+		t.Fatalf("expected backend pause to sync PAUSED_PLAYBACK, got %s", got)
+	}
+
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	var lastSeek time.Duration
+	if seekCalls > 0 {
+		lastSeek = player.seek[seekCalls-1]
+	}
+	player.mu.Unlock()
+
+	if seekCalls == 0 {
+		t.Fatal("expected Seek to be called after resuming backend-paused session")
+	}
+	if lastSeek != 25*time.Second {
+		t.Fatalf("expected external pause position to be frozen at 25s, got resume seek %v", lastSeek)
+	}
+}
+
+func TestPauseConfirmationUpdatesCachedResumePosition(t *testing.T) {
+	player := newFakePlayerClient()
+	player.pauseSetsElapsed = true
+	player.pauseElapsed = 13 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 10*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	var lastSeek time.Duration
+	if seekCalls > 0 {
+		lastSeek = player.seek[seekCalls-1]
+	}
+	player.mu.Unlock()
+
+	if seekCalls == 0 {
+		t.Fatal("expected resume to seek to confirmed paused position")
+	}
+	if lastSeek != 13*time.Second {
+		t.Fatalf("expected resume seek to confirmed 13s pause position, got %v", lastSeek)
+	}
+}
+
+func TestPauseIdleZeroConfirmationKeepsCachedResumePosition(t *testing.T) {
+	player := newFakePlayerClient()
+	player.pauseSetsPaused = false
+	player.pauseSetsElapsed = true
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 18*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+
+	player.mu.Lock()
+	player.status.State = "idle"
+	player.status.Elapsed = 0
+	player.status.HasElapsed = true
+	player.status.ElapsedUpdatedAt = time.Now()
+	player.mu.Unlock()
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	var lastSeek time.Duration
+	if seekCalls > 0 {
+		lastSeek = player.seek[seekCalls-1]
+	}
+	player.mu.Unlock()
+
+	if seekCalls == 0 {
+		t.Fatal("expected resume to seek to cached pre-pause position after idle zero confirmation")
+	}
+	if lastSeek.Round(time.Second) != 18*time.Second {
+		t.Fatalf("expected idle zero pause confirmation to preserve 18s resume seek, got %v", lastSeek)
+	}
+}
+
+func TestStoppedSessionDoesNotSeekAfterLateResume(t *testing.T) {
+	player := newFakePlayerClient()
+	resumeBlock := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseResume := func() { releaseOnce.Do(func() { close(resumeBlock) }) }
+	player.resumeBlock = resumeBlock
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	t.Cleanup(ts.Close)
+	t.Cleanup(releaseResume)
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	playResult := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForResume(t)
+
+	postSOAP(t, ts.URL, "AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	releaseResume()
+	awaitSOAP(t, playResult, 2*time.Second)
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	stopCalls := player.stop
+	backendState := player.status.State
+	player.mu.Unlock()
+	if seekCalls != 0 {
+		t.Fatalf("late resume should not seek after session stopped, seek calls=%d", seekCalls)
+	}
+	if stopCalls != 2 || backendState != "idle" {
+		t.Fatalf("late resume after stop should be stopped again, stop calls=%d backend state=%s", stopCalls, backendState)
+	}
+
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "STOPPED" {
+		t.Fatalf("expected stopped session to remain STOPPED, got %s", got)
+	}
+}
+
+func TestStaleResumeDoesNotSeekDuringSameSessionReplay(t *testing.T) {
+	player := newFakePlayerClient()
+	resumeBlock := make(chan struct{})
+	playBlock := make(chan struct{})
+	var releaseResumeOnce sync.Once
+	var releasePlayOnce sync.Once
+	releaseResume := func() { releaseResumeOnce.Do(func() { close(resumeBlock) }) }
+	releasePlay := func() { releasePlayOnce.Do(func() { close(playBlock) }) }
+	player.resumeBlock = resumeBlock
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	t.Cleanup(ts.Close)
+	t.Cleanup(releaseResume)
+	t.Cleanup(releasePlay)
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	stalePlay := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForResume(t)
+
+	postSOAP(t, ts.URL, "AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	player.mu.Lock()
+	player.playBlock = playBlock
+	player.mu.Unlock()
+	currentPlay := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlayRequests(t, 2)
+
+	releaseResume()
+	awaitSOAP(t, stalePlay, 2*time.Second)
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	player.mu.Unlock()
+	if seekCalls != 0 {
+		t.Fatalf("stale resume should not seek during newer same-session play, seek calls=%d", seekCalls)
+	}
+
+	releasePlay()
+	awaitSOAP(t, currentPlay, 2*time.Second)
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PLAYING" {
+		t.Fatalf("expected newer same-session play to remain PLAYING, got %s", got)
+	}
+}
+
+func TestStaleResumeErrorDoesNotFailSameSessionReplay(t *testing.T) {
+	player := newFakePlayerClient()
+	resumeBlock := make(chan struct{})
+	playBlock := make(chan struct{})
+	var releaseResumeOnce sync.Once
+	var releasePlayOnce sync.Once
+	releaseResume := func() { releaseResumeOnce.Do(func() { close(resumeBlock) }) }
+	releasePlay := func() { releasePlayOnce.Do(func() { close(playBlock) }) }
+	player.resumeBlock = resumeBlock
+	player.resumeErr = errors.New("resume failed")
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	t.Cleanup(ts.Close)
+	t.Cleanup(releaseResume)
+	t.Cleanup(releasePlay)
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	stalePlay := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForResume(t)
+
+	postSOAP(t, ts.URL, "AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+	player.mu.Lock()
+	player.playBlock = playBlock
+	player.mu.Unlock()
+	currentPlay := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlayRequests(t, 2)
+
+	releaseResume()
+	awaitSOAP(t, stalePlay, 2*time.Second)
+	releasePlay()
+	awaitSOAP(t, currentPlay, 2*time.Second)
+
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PLAYING" {
+		t.Fatalf("stale resume error should not fail newer same-session play, got %s", got)
+	}
+}
+
+func TestExplicitSeekDuringResumePreventsStaleResumeSeek(t *testing.T) {
+	player := newFakePlayerClient()
+	resumeBlock := make(chan struct{})
+	seekBlock := make(chan struct{})
+	var releaseResumeOnce sync.Once
+	var releaseSeekOnce sync.Once
+	releaseResume := func() { releaseResumeOnce.Do(func() { close(resumeBlock) }) }
+	releaseSeek := func() { releaseSeekOnce.Do(func() { close(seekBlock) }) }
+	player.resumeBlock = resumeBlock
+	player.seekBlock = seekBlock
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	t.Cleanup(ts.Close)
+	t.Cleanup(releaseResume)
+	t.Cleanup(releaseSeek)
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+
+	resumeResult := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForResume(t)
+
+	seekResult := postSOAPAsync(t, ts.URL, "AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:01:40</Target>")
+	time.Sleep(20 * time.Millisecond)
+	releaseResume()
+	awaitSOAP(t, resumeResult, 2*time.Second)
+
+	player.mu.Lock()
+	seekCallsWhileExplicitSeekBlocked := len(player.seek)
+	player.mu.Unlock()
+	if seekCallsWhileExplicitSeekBlocked != 0 {
+		t.Fatalf("stale resume should not issue auto-seek while explicit seek is in flight, seek calls=%d", seekCallsWhileExplicitSeekBlocked)
+	}
+
+	releaseSeek()
+	awaitSOAP(t, seekResult, 2*time.Second)
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	lastSeek := player.seek[seekCalls-1]
+	player.mu.Unlock()
+	if seekCalls != 1 || lastSeek != 100*time.Second {
+		t.Fatalf("expected only explicit seek to 100s, calls=%d last=%v", seekCalls, lastSeek)
 	}
 }
 
