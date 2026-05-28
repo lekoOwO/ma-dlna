@@ -30,7 +30,10 @@ type fakePlayerClient struct {
 	pauseBlock        <-chan struct{}
 	resumeBlock       <-chan struct{}
 	seekBlock         <-chan struct{}
+	seekStarted       chan time.Duration
 	playSetsPlaying   bool
+	playSetsElapsed   bool
+	playElapsed       time.Duration
 	pauseSetsPaused   bool
 	pauseSetsElapsed  bool
 	pauseElapsed      time.Duration
@@ -65,7 +68,11 @@ func (f *fakePlayerClient) PlayMedia(req maadapter.PlayRequest) error {
 	defer f.mu.Unlock()
 	if f.playSetsPlaying {
 		f.status.State = "playing"
-		f.status.Elapsed = 0
+		if f.playSetsElapsed {
+			f.status.Elapsed = f.playElapsed
+		} else {
+			f.status.Elapsed = 0
+		}
 		f.status.HasElapsed = true
 		f.status.ElapsedUpdatedAt = time.Now()
 		f.status.CurrentURI = req.SourceURL
@@ -128,7 +135,11 @@ func (f *fakePlayerClient) Pause() error {
 func (f *fakePlayerClient) Seek(position time.Duration) error {
 	f.mu.Lock()
 	block := f.seekBlock
+	started := f.seekStarted
 	f.mu.Unlock()
+	if started != nil {
+		started <- position
+	}
 	if block != nil {
 		<-block
 	}
@@ -595,6 +606,197 @@ func TestPauseFailsWhenMusicAssistantKeepsPlaying(t *testing.T) {
 	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
 	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PLAYING" {
 		t.Fatalf("failed Pause should leave transport PLAYING, got %s", got)
+	}
+}
+
+func TestFreshPlayRebasesSmallInitialMusicAssistantElapsed(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 2 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	var lastSeek time.Duration
+	if seekCalls > 0 {
+		lastSeek = player.seek[seekCalls-1]
+	}
+	player.mu.Unlock()
+
+	if seekCalls == 0 {
+		t.Fatal("expected fresh Play to seek MA back to 0 when initial MA elapsed is already ahead")
+	}
+	if lastSeek != 0 {
+		t.Fatalf("expected fresh Play rebase seek to 0, got %v", lastSeek)
+	}
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:00" {
+		t.Fatalf("expected fresh Play RelTime to start at 00:00:00 after rebase, got %s", got)
+	}
+}
+
+func TestFreshPlayDoesNotRebaseTinyInitialMusicAssistantElapsed(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 100 * time.Millisecond
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	player.mu.Unlock()
+
+	if seekCalls != 0 {
+		t.Fatalf("fresh Play should not rebase tiny initial MA elapsed, seek calls=%d", seekCalls)
+	}
+}
+
+func TestFreshPlayDoesNotRebaseLargeInitialElapsed(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 5 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	player.mu.Unlock()
+
+	if seekCalls != 0 {
+		t.Fatalf("fresh Play should not rebase large initial MA elapsed > max, seek calls=%d", seekCalls)
+	}
+}
+
+func TestResumeDoesNotTriggerFreshRebaseSeek(t *testing.T) {
+	player := newFakePlayerClient()
+	player.resumeSetsElapsed = true
+	player.resumeElapsed = 1 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+	player.waitForPlay(t)
+
+	player.setStatus("playing", 42*time.Second)
+	postSOAP(t, ts.URL, "AVTransport", "Pause", "<InstanceID>0</InstanceID>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := player.seek
+	player.mu.Unlock()
+
+	for _, s := range seekCalls {
+		if s == 0 {
+			t.Fatal("resume path should not trigger fresh rebase Seek(0)")
+		}
+	}
+}
+
+func TestStaleBackendElapsedSuppressedAfterFreshRebase(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 2 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	player.mu.Lock()
+	seekCalls := len(player.seek)
+	player.mu.Unlock()
+	if seekCalls != 1 {
+		t.Fatalf("expected fresh rebase Seek(0), got %d seek calls", seekCalls)
+	}
+
+	player.setStatus("playing", 2*time.Second)
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:00" {
+		t.Fatalf("stale backend elapsed after fresh rebase should not overwrite zero, got %s", got)
+	}
+}
+
+func TestFreshRebaseHoldDoesNotLeakToNextSession(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 2 * time.Second
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	firstURL := "http://192.168.1.10/first.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+firstURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	secondURL := "http://192.168.1.10/second.mp3"
+	player.playElapsed = 5 * time.Second
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+secondURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	postSOAP(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	posXML := postSOAP(t, ts.URL, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(posXML, "RelTime"); got != "00:00:05" {
+		t.Fatalf("fresh rebase hold should not suppress next session position, got %s", got)
+	}
+}
+
+func TestExplicitSeekDuringFreshRebaseWinsAndTransportPlays(t *testing.T) {
+	player := newFakePlayerClient()
+	player.playSetsElapsed = true
+	player.playElapsed = 2 * time.Second
+	seekBlock := make(chan struct{})
+	player.seekBlock = seekBlock
+	player.seekStarted = make(chan time.Duration, 2)
+	ts, _, _ := startMAOnlyTestServer(t, player)
+	defer ts.Close()
+
+	sourceURL := "http://192.168.1.10/song.mp3"
+	postSOAP(t, ts.URL, "AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>"+sourceURL+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+	playResult := postSOAPAsync(t, ts.URL, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+	select {
+	case pos := <-player.seekStarted:
+		if pos != 0 {
+			t.Fatalf("expected fresh rebase seek to start at 0, got %v", pos)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fresh rebase seek")
+	}
+
+	seekResult := postSOAPAsync(t, ts.URL, "AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>00:00:10</Target>")
+	close(seekBlock)
+	awaitSOAP(t, playResult, 2*time.Second)
+	awaitSOAP(t, seekResult, 2*time.Second)
+
+	player.mu.Lock()
+	seekCalls := append([]time.Duration(nil), player.seek...)
+	player.mu.Unlock()
+	if len(seekCalls) != 2 {
+		t.Fatalf("expected fresh rebase and explicit seek, got %v", seekCalls)
+	}
+	if seekCalls[0] != 0 || seekCalls[1] != 10*time.Second {
+		t.Fatalf("explicit seek should run after fresh rebase and win, got %v", seekCalls)
+	}
+
+	stateXML := postSOAP(t, ts.URL, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+	if got := extractXMLField(stateXML, "CurrentTransportState"); got != "PLAYING" {
+		t.Fatalf("transport should not remain TRANSITIONING after seek/rebase race, got %s", got)
 	}
 }
 
